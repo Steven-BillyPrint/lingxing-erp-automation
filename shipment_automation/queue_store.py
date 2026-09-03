@@ -2386,9 +2386,15 @@ class ShipmentWorkflowStore:
         *,
         days: int = COMPLETED_REFRESH_WINDOW_DAYS,
         eligible_only: bool = False,
+        include_detected_reconciliation: bool = False,
         limit: int = 500,
     ) -> list[dict[str, Any]]:
-        """Return automation-completed packages due for a 15-day recheck."""
+        """Return automation-completed packages due for a 15-day recheck.
+
+        The Lingxing evidence pass may include a DETECTED cycle so it can
+        discover a manual re-mark and close that cycle.  The Alibaba pass keeps
+        the default and never queries while any re-mark cycle is active.
+        """
 
         self.initialize()
         bounded_days = max(1, min(int(days or COMPLETED_REFRESH_WINDOW_DAYS), 90))
@@ -2410,9 +2416,17 @@ class ShipmentWorkflowStore:
                         SELECT 1 FROM shipment_re_mark_cycles active_re_mark
                         WHERE active_re_mark.job_id = j.id
                           AND active_re_mark.state NOT IN (?, ?)
+                          AND (? = 0 OR active_re_mark.state <> ?)
                     )
                     AND (
-                        l.completed_refresh_next_at IS NULL
+                        (
+                            ? = 1 AND EXISTS (
+                                SELECT 1 FROM shipment_re_mark_cycles detected_re_mark
+                                WHERE detected_re_mark.job_id = j.id
+                                  AND detected_re_mark.state = ?
+                            )
+                        )
+                        OR l.completed_refresh_next_at IS NULL
                         OR l.completed_refresh_next_at = ''
                         OR l.completed_refresh_next_at <= ?
                     )
@@ -2427,6 +2441,10 @@ class ShipmentWorkflowStore:
                     cutoff,
                     REMARK_COMPLETED,
                     REMARK_CANCELLED,
+                    1 if include_detected_reconciliation else 0,
+                    REMARK_DETECTED,
+                    1 if include_detected_reconciliation else 0,
+                    REMARK_DETECTED,
                     now,
                     now,
                     bounded_limit,
@@ -2537,6 +2555,222 @@ class ShipmentWorkflowStore:
                 )
             conn.commit()
         return len(rows)
+
+    def defer_completed_refresh(
+        self,
+        *,
+        system_order_no: str,
+        platform_order_no: str,
+        logistics_no: str,
+        reason: str,
+        retry_minutes: float = 15,
+        run_id: str | None = None,
+    ) -> int:
+        """Defer one comparison when current Lingxing WMS evidence is unsafe."""
+
+        message = str(reason or "").strip() or "领星 WMS 当前运单号读取失败。"
+        now = utc_now()
+        next_at = utc_after(max(1.0, float(retry_minutes)) / 60)
+        self.initialize()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                """
+                SELECT j.id
+                FROM shipment_jobs j
+                JOIN shipment_erp e ON e.job_id = j.id
+                WHERE j.system_order_no = ? AND j.platform_order_no = ?
+                  AND j.logistics_no = ? AND j.identity_state = ?
+                  AND e.state = ? AND e.completion_source = ?
+                """,
+                (
+                    str(system_order_no or "").strip(),
+                    str(platform_order_no or "").strip(),
+                    str(logistics_no or "").strip(),
+                    IDENTITY_ACTIVE,
+                    ERP_DONE,
+                    ERP_COMPLETION_AUTOMATION,
+                ),
+            ).fetchall()
+            for row in rows:
+                conn.execute(
+                    """
+                    UPDATE shipment_logistics
+                    SET completed_refresh_checked_at = ?, completed_refresh_next_at = ?,
+                        completed_refresh_last_error = ?, updated_at = ?
+                    WHERE job_id = ?
+                    """,
+                    (now, next_at, message, now, int(row["id"])),
+                )
+                self._insert_event_conn(
+                    conn,
+                    job_id=int(row["id"]),
+                    stage="completed_refresh",
+                    event_type="COMPLETED_REFRESH_LINGXING_DEFERRED",
+                    message=message,
+                    details={"retry_minutes": max(1.0, float(retry_minutes))},
+                    run_id=run_id,
+                )
+            conn.commit()
+        return len(rows)
+
+    def reconcile_completed_refresh_lingxing_waybill(
+        self,
+        *,
+        system_order_no: str,
+        platform_order_no: str,
+        logistics_no: str,
+        current_waybill_no: str,
+        run_id: str | None = None,
+    ) -> dict[str, int]:
+        """Sync the live WMS waybill and close a manually completed DETECTED cycle."""
+
+        current_waybill = normalize_tracking_number(current_waybill_no)
+        if not current_waybill:
+            raise ValueError("领星当前运单号不能为空。")
+        now = utc_now()
+        result = {
+            "job_count": 0,
+            "waybill_changed_count": 0,
+            "resolved_cycle_count": 0,
+        }
+        self.initialize()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                """
+                SELECT j.id, l.international_tracking_no
+                FROM shipment_jobs j
+                JOIN shipment_logistics l ON l.job_id = j.id
+                JOIN shipment_erp e ON e.job_id = j.id
+                WHERE j.system_order_no = ? AND j.platform_order_no = ?
+                  AND j.logistics_no = ? AND j.identity_state = ?
+                  AND e.state = ? AND e.completion_source = ?
+                """,
+                (
+                    str(system_order_no or "").strip(),
+                    str(platform_order_no or "").strip(),
+                    str(logistics_no or "").strip(),
+                    IDENTITY_ACTIVE,
+                    ERP_DONE,
+                    ERP_COMPLETION_AUTOMATION,
+                ),
+            ).fetchall()
+            for row in rows:
+                job_id = int(row["id"])
+                result["job_count"] += 1
+                previous_waybill = normalize_tracking_number(
+                    row["international_tracking_no"]
+                )
+                if previous_waybill != current_waybill:
+                    result["waybill_changed_count"] += 1
+                conn.execute(
+                    """
+                    UPDATE shipment_logistics
+                    SET international_tracking_no = ?, completed_refresh_last_error = NULL,
+                        updated_at = ?
+                    WHERE job_id = ?
+                    """,
+                    (current_waybill, now, job_id),
+                )
+                cycle = conn.execute(
+                    """
+                    SELECT * FROM shipment_re_mark_cycles
+                    WHERE job_id = ? AND state = ?
+                    ORDER BY id DESC LIMIT 1
+                    """,
+                    (job_id, REMARK_DETECTED),
+                ).fetchone()
+                if cycle is None:
+                    continue
+                cycle_id = int(cycle["id"])
+                new_waybill = normalize_tracking_number(cycle["new_waybill_no"])
+                if new_waybill != current_waybill:
+                    old_waybill = normalize_tracking_number(cycle["old_waybill_no"])
+                    if old_waybill != current_waybill:
+                        conn.execute(
+                            """
+                            UPDATE shipment_re_mark_cycles
+                            SET old_waybill_no = ?, updated_at = ?
+                            WHERE id = ? AND state = ?
+                            """,
+                            (current_waybill, now, cycle_id, REMARK_DETECTED),
+                        )
+                        self._insert_event_conn(
+                            conn,
+                            job_id=job_id,
+                            stage="re_mark",
+                            event_type="RE_MARK_LINGXING_BASELINE_UPDATED",
+                            old_state=old_waybill,
+                            new_state=current_waybill,
+                            message="领星当前运单号已变化，更新未开始外部写入的重标发基线。",
+                            details={"cycle_id": cycle_id},
+                            run_id=run_id,
+                        )
+                    continue
+
+                kg = format(
+                    Decimal(str(cycle["new_fee_weight_g"])) / Decimal("1000"),
+                    "f",
+                )
+                conn.execute(
+                    """
+                    UPDATE shipment_logistics
+                    SET service_line = COALESCE(NULLIF(?, ''), service_line),
+                        carrier_raw = ?, carrier_normalized = ?,
+                        international_tracking_no = ?, currency = ?, fee_amount = ?,
+                        chargeable_weight_kg = ?, completed_refresh_last_error = NULL,
+                        completed_refresh_next_at = ?, updated_at = ?
+                    WHERE job_id = ?
+                    """,
+                    (
+                        cycle["new_service_line"],
+                        cycle["new_carrier"],
+                        cycle["new_carrier"],
+                        current_waybill,
+                        cycle["new_currency"],
+                        cycle["new_freight"],
+                        kg,
+                        utc_after(),
+                        now,
+                        job_id,
+                    ),
+                )
+                conn.execute(
+                    """
+                    UPDATE shipment_re_mark_cycles
+                    SET state = ?, checkpoint = ?,
+                        platform_marked_at = COALESCE(platform_marked_at, ?),
+                        last_error = NULL, lease_owner = NULL, lease_until = NULL,
+                        updated_at = ?
+                    WHERE id = ? AND state = ?
+                    """,
+                    (
+                        REMARK_COMPLETED,
+                        REMARK_COMPLETED,
+                        now,
+                        now,
+                        cycle_id,
+                        REMARK_DETECTED,
+                    ),
+                )
+                self._insert_event_conn(
+                    conn,
+                    job_id=job_id,
+                    stage="re_mark",
+                    event_type="RE_MARK_COMPLETED_EXTERNALLY",
+                    old_state=REMARK_DETECTED,
+                    new_state=REMARK_COMPLETED,
+                    message=(
+                        "领星当前运单号已等于阿里最新单号，判定人工重标发完成；"
+                        "未执行撤销或写入。"
+                    ),
+                    details={"cycle_id": cycle_id, "waybill_no": current_waybill},
+                    run_id=run_id,
+                )
+                result["resolved_cycle_count"] += 1
+            conn.commit()
+        return result
 
     def record_completed_refresh_observation(
         self,

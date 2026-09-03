@@ -19,6 +19,7 @@ from shipment_automation.models import (
     ERP_CHECKPOINT_OUTBOUNDED,
     LOGISTICS_READY,
     REMARK_COMPLETED,
+    REMARK_DETECTED,
     REMARK_MANUAL_REVIEW,
     LogisticsDetail,
     ShipmentCandidate,
@@ -27,6 +28,7 @@ from shipment_automation.queue_store import ShipmentQueueStore
 from shipment_automation.re_mark_domain import (
     completed_re_mark_eligibility,
     completed_refresh_snapshot,
+    current_lingxing_waybill_from_wms_rows,
 )
 
 
@@ -172,6 +174,75 @@ def test_completed_refresh_snapshot_requires_all_reoutbound_values() -> None:
     assert "计费重量" in invalid.validation_error
 
 
+def test_current_lingxing_waybill_uses_only_unique_active_outbounded_als_row() -> None:
+    rows = [
+        {
+            "order_number": SYSTEM_ORDER_NO,
+            "platform_order_no": [PLATFORM_ORDER_NO],
+            "status": 4,
+            "tracking_no": LOGISTICS_NO,
+            "waybill_no": OLD_WAYBILL_NO,
+        },
+        {
+            "order_number": SYSTEM_ORDER_NO,
+            "platform_order_no": [PLATFORM_ORDER_NO],
+            "status": 3,
+            "tracking_no": LOGISTICS_NO.lower(),
+            "waybill_no": "1lsd-01r 0018agmd",
+        },
+    ]
+
+    assert current_lingxing_waybill_from_wms_rows(
+        rows,
+        system_order_no=SYSTEM_ORDER_NO,
+        platform_order_no=PLATFORM_ORDER_NO,
+        logistics_no=LOGISTICS_NO,
+    ) == NEW_WAYBILL_NO
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        [],
+        [
+            {
+                "order_number": SYSTEM_ORDER_NO,
+                "platform_order_no": [PLATFORM_ORDER_NO],
+                "status": 2,
+                "tracking_no": LOGISTICS_NO,
+                "waybill_no": OLD_WAYBILL_NO,
+            }
+        ],
+        [
+            {
+                "order_number": SYSTEM_ORDER_NO,
+                "platform_order_no": [PLATFORM_ORDER_NO],
+                "status": 3,
+                "tracking_no": LOGISTICS_NO,
+                "waybill_no": OLD_WAYBILL_NO,
+            },
+            {
+                "order_number": SYSTEM_ORDER_NO,
+                "platform_order_no": [PLATFORM_ORDER_NO],
+                "status": 3,
+                "tracking_no": LOGISTICS_NO,
+                "waybill_no": NEW_WAYBILL_NO,
+            },
+        ],
+    ],
+)
+def test_current_lingxing_waybill_fails_closed_for_incomplete_or_ambiguous_rows(
+    rows,
+) -> None:
+    with pytest.raises(ValueError):
+        current_lingxing_waybill_from_wms_rows(
+            rows,
+            system_order_no=SYSTEM_ORDER_NO,
+            platform_order_no=PLATFORM_ORDER_NO,
+            logistics_no=LOGISTICS_NO,
+        )
+
+
 def test_only_recent_automation_completed_orders_are_refresh_targets(tmp_path) -> None:
     recent = _completed_store(tmp_path)
     targets = recent.list_completed_refresh_targets(eligible_only=True)
@@ -210,6 +281,86 @@ def test_changed_valid_waybill_creates_one_idempotent_re_mark_cycle(tmp_path) ->
     assert first.new_freight == "136.03"
     assert first.new_fee_weight_g == "2000"
     assert len(store.list_re_mark_cycles(actionable_only=False)) == 1
+
+
+def test_detected_cycle_is_available_only_to_lingxing_reconciliation(tmp_path) -> None:
+    store = _completed_store(tmp_path)
+    cycle = store.record_completed_refresh_observation(LOGISTICS_NO, _new_detail())
+    assert cycle is not None
+
+    assert store.list_completed_refresh_targets(eligible_only=True) == []
+    targets = store.list_completed_refresh_targets(
+        eligible_only=True,
+        include_detected_reconciliation=True,
+    )
+
+    assert [row["system_order_no"] for row in targets] == [SYSTEM_ORDER_NO]
+
+
+def test_failed_live_lingxing_read_defers_stale_alibaba_comparison(tmp_path) -> None:
+    store = _completed_store(tmp_path)
+    assert store.list_completed_refresh_targets(eligible_only=True)
+
+    assert store.defer_completed_refresh(
+        system_order_no=SYSTEM_ORDER_NO,
+        platform_order_no=PLATFORM_ORDER_NO,
+        logistics_no=LOGISTICS_NO,
+        reason="WMS evidence unavailable",
+        retry_minutes=15,
+    ) == 1
+
+    assert store.list_completed_refresh_targets(eligible_only=True) == []
+    row = store.get_by_logistics_no(LOGISTICS_NO)
+    assert row is not None
+    assert row["completed_refresh_last_error"] == "WMS evidence unavailable"
+
+
+def test_live_lingxing_new_waybill_closes_detected_cycle_without_external_write(
+    tmp_path,
+) -> None:
+    store = _completed_store(tmp_path)
+    cycle = store.record_completed_refresh_observation(LOGISTICS_NO, _new_detail())
+    assert cycle is not None and cycle.state == REMARK_DETECTED
+
+    result = store.reconcile_completed_refresh_lingxing_waybill(
+        system_order_no=SYSTEM_ORDER_NO,
+        platform_order_no=PLATFORM_ORDER_NO,
+        logistics_no=LOGISTICS_NO,
+        current_waybill_no="1lsd-01r 0018agmd",
+        run_id="manual-reconcile-test",
+    )
+
+    assert result == {
+        "job_count": 1,
+        "waybill_changed_count": 1,
+        "resolved_cycle_count": 1,
+    }
+    completed = store.get_re_mark_cycle(cycle.id)
+    assert completed is not None and completed.state == REMARK_COMPLETED
+    row = store.get_by_logistics_no(LOGISTICS_NO)
+    assert row is not None
+    assert row["international_tracking_no"] == NEW_WAYBILL_NO
+    assert row["carrier"] == "ONTRAC"
+    assert row["service_line"] == "OnTrac"
+    assert row["fee_amount"] == "136.03"
+    assert row["chargeable_weight_kg"] == "2"
+
+
+def test_live_lingxing_old_waybill_keeps_detected_cycle_actionable(tmp_path) -> None:
+    store = _completed_store(tmp_path)
+    cycle = store.record_completed_refresh_observation(LOGISTICS_NO, _new_detail())
+    assert cycle is not None
+
+    result = store.reconcile_completed_refresh_lingxing_waybill(
+        system_order_no=SYSTEM_ORDER_NO,
+        platform_order_no=PLATFORM_ORDER_NO,
+        logistics_no=LOGISTICS_NO,
+        current_waybill_no=OLD_WAYBILL_NO,
+    )
+
+    assert result["resolved_cycle_count"] == 0
+    pending = store.get_re_mark_cycle(cycle.id)
+    assert pending is not None and pending.state == REMARK_DETECTED
 
 
 def test_ineligible_or_unchanged_completed_order_does_not_create_cycle(tmp_path) -> None:
@@ -394,6 +545,31 @@ def test_re_mark_workflow_uses_dom_withdraw_openapi_and_post_submit_dom_evidence
     assert row["fee_amount"] == "136.03"
     assert row["chargeable_weight_kg"] == "2"
     assert store.list_email_batches(platform_order_no=PLATFORM_ORDER_NO) == email_batches_before
+
+
+def test_re_mark_workflow_stops_before_browser_write_when_lingxing_is_already_new(
+    tmp_path,
+) -> None:
+    store, cycle, gateway, events, workflow = _workflow_fixture(tmp_path)
+    gateway.old_status = 4
+    gateway.new_row_present = True
+
+    async def confirm(_prompt: str) -> bool:
+        raise AssertionError("already-completed reconciliation must not ask to write")
+
+    result = asyncio.run(
+        workflow.execute(
+            object(),
+            cycle.id,
+            lease_owner="desktop-test",
+            confirm_func=confirm,
+            run_id="preflight-reconcile-test",
+        )
+    )
+
+    assert result.state == REMARK_COMPLETED
+    assert "未执行撤销或写入" in result.message
+    assert events == []
 
 
 def test_mark_intent_without_post_submit_dom_evidence_requires_manual_review(
