@@ -61,10 +61,9 @@ PRODUCT_TYPE_TENSION_BACKDROPS = "tension_backdrops"
 # change so unresolved historical orders are queried again without repeatedly
 # re-reading every old order each scan.
 # Bump whenever identity evidence semantics change, not only when ASIN rows do.
-# This release lets the complete customer-notification sibling snapshot repair
-# blank shipment identities, so every still-blank identity is reconsidered
-# under the shared evidence path.
-PRODUCT_IDENTITY_CATALOG_VERSION = "2026-08-19.1"
+# Registering the B0H5Q8N8NV tent family changes ASIN identity evidence, so
+# unresolved historical orders must be reconsidered against the new catalogue.
+PRODUCT_IDENTITY_CATALOG_VERSION = "2026-09-03.1"
 
 
 @dataclass(frozen=True)

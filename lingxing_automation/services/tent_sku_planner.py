@@ -24,6 +24,7 @@ from .tent_sku_rules import (
     SANDBAG_SKU,
     component_to_sku_items,
     detect_tent_size_key,
+    is_directional_half_wall_component,
     roller_bag_sku,
     tent_accessory_component_to_sku_items,
     tent_top_sku,
@@ -1545,6 +1546,10 @@ def _group_requires_frame_rail(size_key: str, components: list[str]) -> bool:
     for component in components:
         text = re.sub(r"\s+", "", str(component or ""))
         if "横杆" in text and ("半高侧墙" in text or "半围" in text):
+            return True
+        # 新父体只有 M 套餐使用方向半墙，且其三片半墙固定带横杆。
+        # 旧式半墙仍由显式“横杆”文字判断，因此不会改变旧 ASIN 的行为。
+        if is_directional_half_wall_component(component):
             return True
     return False
 

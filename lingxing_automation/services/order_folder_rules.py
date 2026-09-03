@@ -22,6 +22,28 @@ TITLE_SANDBAGS_6PCS = "Sandbags (6 piece set)"
 TITLE_FITTED_TABLE_CLOTH = "Custom Fitted Table Cloth with Your Logo"
 TITLE_TABLE_CLOTH = "Custom Table Cloth with Your Logo"
 TITLE_FLAG = "Custom Feather/Teardrop Flag"
+TITLE_TEARDROP_FLAG = "Custom Teardrop Flag"
+TITLE_FEATHER_FLAG = "Custom Feather Flag"
+TITLE_FRONT_WALL = "Front Wall Options"
+TITLE_BACK_WALL = "Back Wall Options"
+TITLE_LEFT_WALL = "Left Wall Options"
+TITLE_RIGHT_WALL = "Right Wall Options"
+TITLE_BACK_HALF_WALL_DOUBLE_SIDE = "Double-sided Printing Options - Back Half Wall"
+TITLE_LEFT_HALF_WALL_DOUBLE_SIDE = "Double-sided Printing Options - Left Half Wall"
+TITLE_RIGHT_HALF_WALL_DOUBLE_SIDE = "Double-sided Printing Options - Right Half Wall"
+# 新父体的固定套餐标题只参与 tooltip 文本分段。固定组成以子 ASIN 目录为准，
+# 因而这些标题不会被映射成通用 Side Wall 选项。
+TENT_PACKAGE_FIXED_TITLES = (
+    "Custom Canopy Tent 10x10 with Logo 1 Full 2 Half Walls with Rails",
+    "Custom pop up tent with logo 10x10 1 Full Wall",
+    "Custom canopy tent 10x10 1Full 2Half Walls with Rails",
+    "Custom canopy tent 10x10 4 Full Walls",
+    "Custom canopy tent 10x10 3 Full Walls",
+    "Custom canopy tent 10x10 1 Full 2 Half Walls with Rails",
+    "Custom tent10x10 with logo Only Canopy top",
+    "Custom Canopy Tent 10x10 with Logo 1 Half Wall With Rail",
+    "Custom Canopy Tent 10x10 with Logo 3 Half Walls with Rails",
+)
 TITLE_RAIL_ADAPTER = "Add Half Wall Rail & Frame Adapter?"
 TITLE_FULL_WALL_ATTACHMENT = "Does Your Canopy Topper Have Velcro on the Bottom? Affects Full Wall attachment to Topper."
 TITLE_FULL_WALL_ATTACHMENT_NO_PERIOD = "Does Your Canopy Topper Have Velcro on the Bottom? Affects Full Wall attachment to Topper"
@@ -57,6 +79,16 @@ ORDER_FOLDER_TITLES = (
     TITLE_FITTED_TABLE_CLOTH,
     TITLE_TABLE_CLOTH,
     TITLE_FLAG,
+    TITLE_TEARDROP_FLAG,
+    TITLE_FEATHER_FLAG,
+    TITLE_FRONT_WALL,
+    TITLE_BACK_WALL,
+    TITLE_LEFT_WALL,
+    TITLE_RIGHT_WALL,
+    TITLE_BACK_HALF_WALL_DOUBLE_SIDE,
+    TITLE_LEFT_HALF_WALL_DOUBLE_SIDE,
+    TITLE_RIGHT_HALF_WALL_DOUBLE_SIDE,
+    *TENT_PACKAGE_FIXED_TITLES,
     TITLE_RAIL_ADAPTER,
     TITLE_FULL_WALL_ATTACHMENT,
     TITLE_FULL_WALL_ATTACHMENT_NO_PERIOD,
@@ -81,6 +113,8 @@ ORDER_FOLDER_TITLE_ALIASES = {
     TITLE_DOUBLE_SIDE_SINGULAR: TITLE_DOUBLE_SIDE,
     TITLE_DOUBLE_SIDE_ONLY_SIDE_WALL: TITLE_DOUBLE_SIDE,
     TITLE_DOUBLE_SIDE_ONLY_SIDE_WALL_SPACED: TITLE_DOUBLE_SIDE,
+    TITLE_TEARDROP_FLAG: TITLE_FLAG,
+    TITLE_FEATHER_FLAG: TITLE_FLAG,
     TITLE_FULL_WALL_ATTACHMENT_NO_PERIOD: TITLE_FULL_WALL_ATTACHMENT,
 }
 
@@ -208,6 +242,7 @@ def load_default_order_folder_rules() -> OrderFolderRules:
             ("full_wall", "1全高背墙"),
             ("half_wall", "3半高侧墙(带横杆)"),
         ),
+        normalize_rule_key("1 Half Wall With Rail"): _wall(("half_wall", "1半高侧墙(带横杆)")),
         normalize_rule_key("3 Full Walls"): _wall(("full_wall", "3全高背墙")),
         normalize_rule_key("3 Full and 1 Half Wall without Rail"): _wall(
             ("full_wall", "3全高背墙"),

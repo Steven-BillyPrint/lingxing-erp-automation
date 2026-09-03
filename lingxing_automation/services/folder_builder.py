@@ -95,7 +95,16 @@ from ..products.table_runners import (
     is_table_runner_asin,
     normalize_table_runner_option_value,
 )
-from ..products.tents import find_tent_parent_asin, get_tent_top_size, get_wall_only_asin_kind, is_default_expedited_tent_asin
+from ..products.tents import (
+    TENT_WALL_STRATEGY_DIRECTIONAL,
+    TENT_WALL_STRATEGY_LEGACY,
+    TENT_WALL_STRATEGY_NONE,
+    find_tent_parent_asin,
+    get_tent_package_rule,
+    get_tent_top_size,
+    get_wall_only_asin_kind,
+    is_default_expedited_tent_asin,
+)
 from ..products.vinyl_banners import (
     PRODUCT_TYPE_VINYL_BANNERS,
     VINYL_BANNER_TITLE_ALIASES,
@@ -838,6 +847,57 @@ def _wall_components(pairs: dict[str, str], rules: OrderFolderRules) -> list[str
     return _apply_double_side_wall_counts(lookup.value, double_value)
 
 
+def _is_single_sided_option(value: str | None) -> bool:
+    """判断选项是否明确要求单面打印。"""
+
+    text = normalize_rule_key(value)
+    return bool(
+        re.search(
+            r"\b1\s*-\s*sided\b|\b1\s+sided\b|single\s*-\s*sided|single\s+sided",
+            text,
+        )
+    )
+
+
+def _directional_tent_wall_components(asin: str | None, pairs: dict[str, str]) -> list[str]:
+    """按套餐目录逐面生成“方向+单双面+墙型”组件。"""
+
+    package_rule = get_tent_package_rule(asin)
+    if package_rule is None or package_rule.wall_strategy != TENT_WALL_STRATEGY_DIRECTIONAL:
+        return []
+
+    components: list[str] = []
+    for wall in package_rule.directional_walls:
+        value = pairs.get(wall.option_title)
+        if value is None:
+            raise FolderRuleMissingError(wall.option_title, "")
+        if _is_double_sided_option(value):
+            double_sided = True
+        elif _is_single_sided_option(value):
+            double_sided = False
+        else:
+            raise FolderRuleMissingError(wall.option_title, value)
+        components.append(wall.component(double_sided=double_sided))
+    return components
+
+
+def _tent_wall_components(asin: str | None, pairs: dict[str, str], rules: OrderFolderRules) -> list[str]:
+    """选择子 ASIN 专属墙体策略；未登记的旧 ASIN 继续走原规则。"""
+
+    package_rule = get_tent_package_rule(asin)
+    if package_rule is None:
+        return _wall_components(pairs, rules)
+    if package_rule.wall_strategy == TENT_WALL_STRATEGY_NONE:
+        return []
+    if package_rule.wall_strategy == TENT_WALL_STRATEGY_DIRECTIONAL:
+        return _directional_tent_wall_components(asin, pairs)
+    if package_rule.wall_strategy == TENT_WALL_STRATEGY_LEGACY:
+        legacy_pairs = dict(pairs)
+        legacy_pairs[TITLE_SIDE_WALL] = package_rule.legacy_wall_value or ""
+        return _wall_components(legacy_pairs, rules)
+    raise FolderRuleMissingError("Tent wall strategy", package_rule.wall_strategy)
+
+
 def _table_cloth_component(pairs: dict[str, str], rules: OrderFolderRules) -> str:
     """生成桌布组件文件夹名组件。"""
     pair = _find_first_pair(pairs, TABLE_CLOTH_TITLES)
@@ -876,6 +936,31 @@ def _flag_component(value: str | None) -> str:
         else "全纤维杆+连接件+夹具"
     )
     return f"{count}套（{size_text}{shape_text}+{mount_text}）"
+
+
+def _normalize_tent_bundled_flag_value(value: str | None) -> str:
+    """规范化套餐旗帜选项，并移除 Amazon 展示用加价后缀。"""
+
+    text = re.sub(r",?\s*\+\s*\$[\d,]+(?:\.\d+)?\s*$", "", str(value or ""), flags=re.I)
+    return normalize_rule_key(text)
+
+
+def _tent_flag_component(asin: str | None, pairs: dict[str, str]) -> str:
+    """生成帐篷套餐旗帜；旧 ASIN 继续使用通用旧格式。"""
+
+    package_rule = get_tent_package_rule(asin)
+    flag_rule = package_rule.bundled_flag if package_rule else None
+    if flag_rule is None:
+        return _flag_component(pairs.get(TITLE_FLAG))
+
+    value = pairs.get(flag_rule.option_title)
+    if value is None:
+        raise FolderRuleMissingError(flag_rule.option_title, "")
+    normalized = _normalize_tent_bundled_flag_value(value)
+    for option, component in flag_rule.option_components:
+        if normalized == _normalize_tent_bundled_flag_value(option):
+            return component
+    raise FolderRuleMissingError(flag_rule.option_title, value)
 
 
 def _accessory_component(title: str, pairs: dict[str, str], rules: OrderFolderRules) -> str:
@@ -2020,6 +2105,7 @@ def _tent_package_components(
     pairs: dict[str, str],
     rules: OrderFolderRules,
     *,
+    asin: str | None = None,
     destination_category: str = "",
 ) -> list[str]:
     """生成单套帐篷顶套餐的配置片段，不包含平台单号、数量和客户名。"""
@@ -2028,7 +2114,7 @@ def _tent_package_components(
     package_components.append(_tent_same_design_component(pairs))
     package_components.append(_frame_component(pairs, rules, destination_category=destination_category))
 
-    package_components.extend(_wall_components(pairs, rules))
+    package_components.extend(_tent_wall_components(asin, pairs, rules))
 
     if TITLE_FABRIC in pairs:
         package_components.append(_lookup_required(rules.fabric_options, TITLE_FABRIC, pairs[TITLE_FABRIC]))
@@ -2038,7 +2124,7 @@ def _tent_package_components(
     package_components.append(_accessory_component(TITLE_SANDBAGS_6PCS, pairs, rules))
     package_components.append(_accessory_component(TITLE_ROPE_STAKE, pairs, rules))
     package_components.append(_table_cloth_component(pairs, rules))
-    package_components.append(_flag_component(pairs.get(TITLE_FLAG)))
+    package_components.append(_tent_flag_component(asin, pairs))
     package_components.append(_canopy_frame_size_component(pairs, rules))
     return [component for component in package_components if component]
 
@@ -2286,6 +2372,7 @@ def build_order_folder_components_from_lines(
                 top_size,
                 pairs,
                 rules,
+                asin=line.asin,
                 destination_category=destination_category,
             )
             line_entries.append(
@@ -2487,23 +2574,13 @@ def build_order_folder_components_from_pairs(
     if top_size is None:
         raise MissingSizeRuleError(str(asin or ""))
 
-    package_components: list[str] = [top_size]
-    package_components.append(_tent_same_design_component(pairs))
-
-    package_components.append(_frame_component(pairs, rules, destination_category=destination_category))
-
-    package_components.extend(_wall_components(pairs, rules))
-
-    if TITLE_FABRIC in pairs:
-        package_components.append(_lookup_required(rules.fabric_options, TITLE_FABRIC, pairs[TITLE_FABRIC]))
-
-    package_components.append(_accessory_component(TITLE_ROLLER_BAG, pairs, rules))
-    package_components.append(_accessory_component(TITLE_SANDBAGS, pairs, rules))
-    package_components.append(_accessory_component(TITLE_SANDBAGS_6PCS, pairs, rules))
-    package_components.append(_accessory_component(TITLE_ROPE_STAKE, pairs, rules))
-    package_components.append(_table_cloth_component(pairs, rules))
-    package_components.append(_flag_component(pairs.get(TITLE_FLAG)))
-    package_components.append(_canopy_frame_size_component(pairs, rules))
+    package_components = _tent_package_components(
+        top_size,
+        pairs,
+        rules,
+        asin=asin,
+        destination_category=destination_category,
+    )
 
     if tent_quantity >= 2:
         components = [platform_order_no, _wrap_tent_package_components(tent_quantity, package_components), recipient_name]
