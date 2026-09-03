@@ -7608,4 +7608,6 @@ def test_review_preview_uses_one_batched_connection_for_multiple_revisions(
     assert [item["id"] for item in previews] == [first["id"], second["id"]]
     assert all(item["review_preview_loaded"] for item in previews)
     assert all("reviews" not in item for item in previews)
+    assert all("state" not in item for item in previews)
+    assert all("last_error" not in item for item in previews)
     assert connect_calls == 1

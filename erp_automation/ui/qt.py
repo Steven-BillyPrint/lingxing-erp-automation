@@ -362,6 +362,80 @@ def _notification_has_review_preview(
     )
 
 
+_NOTIFICATION_REVIEW_PREVIEW_FIELDS = frozenset(
+    {
+        "channel",
+        "recipient_name",
+        "recipient_email",
+        "recipient_phone",
+        "subject",
+        "body",
+        "items",
+    }
+)
+
+# Queue pages are authoritative for delivery lifecycle state.  Detail and
+# review-preview requests are independent reads and may complete after a newer
+# queue page has already been rendered, so they must never roll these fields
+# back to an older value.
+_NOTIFICATION_QUEUE_RUNTIME_FIELDS = frozenset(
+    {
+        "state",
+        "approved_content_hash",
+        "provider_message_id",
+        "provider_status",
+        "provider_operator_email",
+        "receipt_next_check_at",
+        "receipt_last_checked_at",
+        "receipt_deadline_at",
+        "receipt_check_attempt_count",
+        "receipt_check_lease_owner",
+        "receipt_check_lease_until",
+        "attempt_count",
+        "last_error",
+        "approved_at",
+        "sent_at",
+        "delivered_at",
+        "erp_completed_at",
+        "state_changed_at",
+        "created_at",
+        "updated_at",
+        "is_supplemental_revision",
+    }
+)
+
+
+def _validated_notification_review_preview(
+    notification: Mapping[str, object],
+    preview: Mapping[str, object],
+) -> dict[str, object] | None:
+    """Return content-only preview values for the same live review row."""
+
+    try:
+        current_id = int(notification.get("id") or 0)
+        preview_id = int(preview.get("id") or 0)
+    except (TypeError, ValueError):
+        return None
+    if current_id <= 0 or preview_id != current_id:
+        return None
+    if str(notification.get("state") or "").strip() != "AWAITING_REVIEW":
+        return None
+    preview_state = str(preview.get("state") or "").strip()
+    if preview_state and preview_state != "AWAITING_REVIEW":
+        return None
+    current_hash = str(notification.get("content_hash") or "").strip()
+    preview_hash = str(preview.get("content_hash") or "").strip()
+    if current_hash and preview_hash != current_hash:
+        return None
+    values = {
+        field: preview[field]
+        for field in _NOTIFICATION_REVIEW_PREVIEW_FIELDS
+        if field in preview
+    }
+    values["_review_preview_loaded"] = True
+    return values
+
+
 def _scan_countdown_text(milliseconds: int) -> str:
     seconds = max(0, int(milliseconds) // 1000)
     hours, remainder = divmod(seconds, 3600)
@@ -10739,8 +10813,14 @@ if PYSIDE6_AVAILABLE:
                     cache_key
                 )
                 if cached_preview is not None:
-                    item.update(cached_preview)
-                    item["_review_preview_loaded"] = True
+                    preview_values = _validated_notification_review_preview(
+                        item,
+                        cached_preview,
+                    )
+                    if preview_values is None:
+                        self._notification_review_preview_cache.pop(cache_key, None)
+                    else:
+                        item.update(preview_values)
             self._notification_detail_failed_ids.clear()
             unchanged = self._notifications_loaded and ordered == self._notifications
             self._notifications_loaded = True
@@ -11460,7 +11540,22 @@ if PYSIDE6_AVAILABLE:
                 detail = by_id.get(notification_id)
                 if detail is None:
                     continue
+                current_hash = str(notification.get("content_hash") or "").strip()
+                detail_hash = str(detail.get("content_hash") or "").strip()
+                if current_hash and detail_hash != current_hash:
+                    continue
+                runtime_values = {
+                    field: notification[field]
+                    for field in _NOTIFICATION_QUEUE_RUNTIME_FIELDS
+                    if field in notification
+                }
+                absent_runtime_fields = (
+                    _NOTIFICATION_QUEUE_RUNTIME_FIELDS - notification.keys()
+                )
                 notification.update(detail)
+                notification.update(runtime_values)
+                for field in absent_runtime_fields:
+                    notification.pop(field, None)
                 notification["_detail_loaded"] = True
                 notification["_detail_error"] = False
                 merged_ids.add(notification_id)
@@ -11488,15 +11583,21 @@ if PYSIDE6_AVAILABLE:
                 notification = current_by_id.get(notification_id)
                 if notification is None:
                     continue
-                content_hash = str(preview.get("content_hash") or "")
-                current_hash = str(notification.get("content_hash") or "")
-                if current_hash and content_hash != current_hash:
+                preview_values = _validated_notification_review_preview(
+                    notification,
+                    preview,
+                )
+                if preview_values is None:
                     continue
-                preview["_review_preview_loaded"] = True
-                notification.update(preview)
+                notification.update(preview_values)
+                content_hash = str(notification.get("content_hash") or "")
                 cache_key = (notification_id, content_hash)
                 self._notification_review_preview_cache.pop(cache_key, None)
-                self._notification_review_preview_cache[cache_key] = preview
+                self._notification_review_preview_cache[cache_key] = {
+                    "id": notification_id,
+                    "content_hash": content_hash,
+                    **preview_values,
+                }
                 merged_ids.add(notification_id)
             while len(self._notification_review_preview_cache) > 200:
                 self._notification_review_preview_cache.pop(

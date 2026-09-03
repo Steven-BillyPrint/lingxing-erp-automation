@@ -6384,6 +6384,157 @@ def test_notification_package_preview_renders_without_detail_round_trip(app):
     page.deleteLater()
 
 
+def test_stale_review_preview_cannot_overwrite_delivered_queue_state(app):
+    page = ShipmentNotificationPage(RecordingController(), lambda _result: None)
+    delivered = {
+        "id": 131,
+        "platform_order_no": "112-DELIVERED-PREVIEW-RACE",
+        "state": "DELIVERED",
+        "content_hash": "content-131",
+        "provider_message_id": "provider-131",
+        "provider_status": "success",
+        "attempt_count": 1,
+        "sent_at": "2026-09-03T09:31:07Z",
+        "delivered_at": "2026-09-03T09:32:20Z",
+        "state_changed_at": "2026-09-03T09:32:20Z",
+        "last_error": "",
+        "package_total": 2,
+        "package_complete": 2,
+        "package_missing": 0,
+        "preview_items": [],
+    }
+    stale_preview = {
+        "id": 131,
+        "state": "AWAITING_REVIEW",
+        "content_hash": "content-131",
+        "subject": "Shipment Update",
+        "body": "stale review body",
+        "items": [],
+        "last_error": "stale-error",
+    }
+    page._notification_review_preview_cache[(131, "content-131")] = stale_preview
+
+    page._apply_notification_reload(
+        {
+            "items": [delivered],
+            "page": 1,
+            "page_size": 50,
+            "total": 1,
+            "total_pages": 1,
+            "dataset_revision": "delivered-revision",
+            "statuses": ["DELIVERED"],
+            "product_types": [],
+        }
+    )
+
+    current = page._notifications[0]
+    assert current["state"] == "DELIVERED"
+    assert current["provider_message_id"] == "provider-131"
+    assert current["provider_status"] == "success"
+    assert current["last_error"] == ""
+    assert (131, "content-131") not in page._notification_review_preview_cache
+    display_state, _explanation, _timestamp = (
+        page._notification_status_presentation(current)
+    )
+    assert display_state == "DELIVERED"
+    page.deleteLater()
+
+
+def test_review_preview_merges_content_without_runtime_fields(app):
+    page = ShipmentNotificationPage(RecordingController(), lambda _result: None)
+    notification = {
+        "id": 132,
+        "platform_order_no": "112-LIVE-REVIEW",
+        "state": "AWAITING_REVIEW",
+        "content_hash": "content-132",
+        "provider_message_id": "",
+        "provider_status": "",
+        "attempt_count": 0,
+        "last_error": "live-error",
+        "preview_items": [],
+    }
+    page._notifications = [notification]
+
+    merged = page._merge_notification_review_previews(
+        [
+            {
+                "id": 132,
+                "content_hash": "content-132",
+                "subject": "Shipment Update",
+                "body": "review body",
+                "items": [],
+                "provider_message_id": "stale-provider-id",
+                "provider_status": "success",
+                "attempt_count": 1,
+                "last_error": "stale-error",
+            }
+        ]
+    )
+
+    assert merged == {132}
+    assert notification["state"] == "AWAITING_REVIEW"
+    assert notification["body"] == "review body"
+    assert notification["provider_message_id"] == ""
+    assert notification["provider_status"] == ""
+    assert notification["attempt_count"] == 0
+    assert notification["last_error"] == "live-error"
+    assert notification["_review_preview_loaded"] is True
+    cached = page._notification_review_preview_cache[(132, "content-132")]
+    assert "state" not in cached
+    assert "last_error" not in cached
+    assert "provider_message_id" not in cached
+    page.deleteLater()
+
+
+def test_stale_notification_detail_cannot_roll_back_delivery_state(app):
+    page = ShipmentNotificationPage(RecordingController(), lambda _result: None)
+    notification = {
+        "id": 133,
+        "platform_order_no": "112-DELIVERED-DETAIL-RACE",
+        "state": "DELIVERED",
+        "content_hash": "content-133",
+        "provider_message_id": "provider-133",
+        "provider_status": "success",
+        "attempt_count": 1,
+        "last_error": "",
+        "sent_at": "2026-09-03T09:31:07Z",
+        "delivered_at": "2026-09-03T09:32:20Z",
+        "state_changed_at": "2026-09-03T09:32:20Z",
+        "updated_at": "2026-09-03T09:32:20Z",
+        "preview_items": [],
+    }
+    page._notifications = [notification]
+
+    merged = page._merge_notification_details(
+        [
+            {
+                "id": 133,
+                "state": "AWAITING_REVIEW",
+                "content_hash": "content-133",
+                "provider_message_id": "",
+                "provider_status": "",
+                "attempt_count": 0,
+                "last_error": "stale-error",
+                "updated_at": "2026-09-03T09:30:00Z",
+                "body": "full detail body",
+                "items": [],
+                "reviews": [],
+            }
+        ]
+    )
+
+    assert merged == {133}
+    assert notification["state"] == "DELIVERED"
+    assert notification["provider_message_id"] == "provider-133"
+    assert notification["provider_status"] == "success"
+    assert notification["attempt_count"] == 1
+    assert notification["last_error"] == ""
+    assert notification["updated_at"] == "2026-09-03T09:32:20Z"
+    assert notification["body"] == "full detail body"
+    assert notification["_detail_loaded"] is True
+    page.deleteLater()
+
+
 def test_notification_review_marks_unresolved_tracking_source_for_review(app):
     controller = RecordingController()
     controller.notification_rows = [
