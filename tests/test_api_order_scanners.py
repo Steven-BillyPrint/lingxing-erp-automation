@@ -113,6 +113,36 @@ def test_completed_re_mark_evidence_reads_real_lingxing_field_names() -> None:
     }
 
 
+def test_completed_re_mark_evidence_prefers_explicit_amazon_platform() -> None:
+    evidence = completed_re_mark_evidence_from_payload(
+        {
+            "order_number": "103737963149768391",
+            # This generic field appears earlier in the live response and must
+            # not shadow the explicit marketplace value below.
+            "order_from_name": "线上订单",
+            "platform": "AMAZON",
+            "logistics_type_name": "万邦速达",
+            "logistics_provider_name": "手动",
+            "order_item": [
+                {
+                    "order_item_no": "168232385274001",
+                    "sku": "x-banner-32x71in",
+                }
+            ],
+        },
+        system_order_no="103737963149768391",
+        platform_order_no="112-7766397-5278631",
+    )
+
+    assert evidence == {
+        "sales_platform_code": "",
+        "sales_platform_name": "AMAZON",
+        "platform_order_item_ids": ("168232385274001",),
+        "logistics_provider_name": "手动",
+        "logistics_type_name": "万邦速达",
+    }
+
+
 def test_customer_shipping_service_never_falls_back_to_logistics_route() -> None:
     present, value = customer_shipping_service_from_payload(
         {"logistics": "Expedited"}
@@ -1941,6 +1971,49 @@ def test_customization_scan_detects_buyer_cancel_system_tag_while_main_status_is
         assert result.candidates == ()
         assert result.skip_counts == {"buyer_cancel_requested": 1}
         assert result.audit_decisions[0]["reason_code"] == "buyer_cancel_requested"
+
+    asyncio.run(run())
+
+
+def test_customization_scan_detects_cancelled_order_tag_while_main_status_is_pending() -> None:
+    async def run() -> None:
+        payload = _official_customization_payload(
+            "103740035921777678",
+            "111-1396630-1494609",
+            order_tag=[
+                {
+                    "tag_type": "系统处理类型",
+                    "tag_no": "3-cancelled-order",
+                    "tag_name": "订单被取消",
+                },
+                {
+                    "tag_type": "系统处理类型",
+                    "tag_no": "3-cancelled-item",
+                    "tag_name": "商品被取消",
+                },
+            ],
+        )
+        assert payload["status"] == 4
+        gateway = MockGateway(
+            _page(
+                [OrderRecord("103740035921777678", None, payload)],
+                offset=0,
+                length=20,
+                total=1,
+                request_id="cancelled-order-tag",
+            )
+        )
+
+        result = await scan_customization_candidates(
+            gateway,
+            ProcessedStore(set()),
+            page_size=20,
+        )
+
+        assert result.complete
+        assert result.candidates == ()
+        assert result.skip_counts == {"order_cancelled": 1}
+        assert result.audit_decisions[0]["reason_code"] == "order_cancelled"
 
     asyncio.run(run())
 

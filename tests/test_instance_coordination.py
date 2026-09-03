@@ -2802,6 +2802,22 @@ def test_remote_task_batch_scales_only_the_read_timeout() -> None:
         assert timeout.pool == 5.0
 
 
+def test_remote_shipment_status_mutation_extends_only_the_read_timeout() -> None:
+    client = object.__new__(RemoteBackgroundTaskController)
+    client._timeout_seconds = 5.0
+
+    timeout = client._rpc_request_timeout(
+        "change_shipment_statuses",
+        (("ALS00000000001",), "mark_manual_done"),
+    )
+
+    assert isinstance(timeout, httpx.Timeout)
+    assert timeout.read == 30.0
+    assert timeout.connect == 5.0
+    assert timeout.write == 5.0
+    assert timeout.pool == 5.0
+
+
 def test_remote_task_batch_read_timeout_is_reported_as_unconfirmed_per_item() -> None:
     class BrowserHost:
         def ensure_started(self) -> None:

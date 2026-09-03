@@ -12,6 +12,7 @@ from .diagnostics import save_page_diagnostics
 
 
 BUYER_CANCEL_REQUEST_TEXT = "买家申请取消"
+ORDER_CANCELLED_TEXT = "订单已取消"
 DIRECT_HIGH_VALUE_THRESHOLD_CURRENCIES = frozenset({"USD", "CAD"})
 
 
@@ -142,6 +143,12 @@ def _row_supported_product_debug(row: dict[str, object]) -> dict[str, object]:
 def _row_has_buyer_cancel_request(row: dict[str, object]) -> bool:
     status_text = str(row.get("status_text", "") or "")
     return BUYER_CANCEL_REQUEST_TEXT in status_text
+
+
+def _row_is_order_cancelled(row: dict[str, object]) -> bool:
+    return bool(row.get("order_cancelled")) or ORDER_CANCELLED_TEXT in str(
+        row.get("status_text", "") or ""
+    )
 
 
 def _mark_group_skip(debug: dict | None, reason: str, items: list[dict[str, object]], extra: dict | None = None) -> None:
@@ -424,6 +431,7 @@ def build_batch_candidates_from_rows(
             else None
         )
         buyer_cancel_requested = any(_row_has_buyer_cancel_request(item) for item in items)
+        order_cancelled = any(_row_is_order_cancelled(item) for item in items)
         payment_text = "\n".join(
             f"付款时间 {item.get('paid_at_text')}" if item.get("paid_at_text") else str(item.get("row_text", ""))
             for item in items
@@ -473,6 +481,7 @@ def build_batch_candidates_from_rows(
             "tag_text": combined_tag_text,
             "status_text": combined_status_text,
             "buyer_cancel_requested": buyer_cancel_requested,
+            "order_cancelled": order_cancelled,
             "sales_revenue_total": sales_revenue_total,
             "sales_revenue_currency": sales_revenue_currency,
             "sales_revenue_status": sales_revenue_status,
@@ -496,7 +505,9 @@ def build_batch_candidates_from_rows(
 
         # 安全重测会复用批量链路，但只覆盖本程序自己的已处理状态和付款窗口；
         # 自定义标签从不参与定制候选准入。
-        if buyer_cancel_requested:
+        if order_cancelled:
+            skip_reason = "order_cancelled"
+        elif buyer_cancel_requested:
             skip_reason = "buyer_cancel_requested"
         elif platform_order_no in processed_platform_orders and not ignore_processed:
             skip_reason = "already_processed_or_duplicate"
@@ -527,6 +538,7 @@ def build_batch_candidates_from_rows(
                     "tag_text": combined_tag_text,
                     "status_text": combined_status_text,
                     "buyer_cancel_requested": buyer_cancel_requested,
+                    "order_cancelled": order_cancelled,
                 },
             )
             group_logs.append(group_log)
@@ -2099,6 +2111,7 @@ async def collect_batch_order_candidates(
                             "sku": row.get("sku") or "",
                             "status_text": row.get("status_text") or "",
                             "buyer_cancel_requested": _row_has_buyer_cancel_request(row),
+                            "order_cancelled": _row_is_order_cancelled(row),
                             "tag_text": tag_text,
                             "has_tag": bool(tag_text),
                             "is_processed": already_processed,
@@ -2118,6 +2131,21 @@ async def collect_batch_order_candidates(
                             "platform_order_no": platform_order_no,
                             "system_order_no": system_order_no,
                         }
+                    continue
+                if _row_is_order_cancelled(row):
+                    if debug is not None:
+                        skip_counts = debug.setdefault("skip_counts", {})
+                        skip_counts["order_cancelled_pre_scan"] = int(skip_counts.get("order_cancelled_pre_scan", 0)) + 1
+                        for scan_row in debug.get("scan_rows", []):
+                            if (
+                                scan_row.get("platform_order_no") == platform_order_no
+                                and scan_row.get("system_order_no") == system_order_no
+                            ):
+                                scan_row["skip_reason"] = "order_cancelled_pre_scan"
+                                scan_row["status_text"] = row.get("status_text") or ""
+                                scan_row["order_cancelled"] = True
+                                scan_row.update(product_debug)
+                                break
                     continue
                 if _row_has_buyer_cancel_request(row):
                     if debug is not None:

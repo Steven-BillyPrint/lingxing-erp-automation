@@ -2849,6 +2849,18 @@ def test_shipment_page_scan_registers_local_visible_logistics_followup(app):
     assert registered == ["task-None"]
 
 
+def test_shipment_page_submits_named_completed_logistics_query(app):
+    controller = RecordingController()
+    page = ShipmentPage(controller, lambda _result: None)
+
+    page._query_logistics()
+
+    command = controller.submitted_commands[-1]
+    assert command.name == "查询已标发物流状态"
+    assert command.area is TaskArea.SHIPMENT
+    assert command.capability is Capability.ALIBABA_LOGISTICS
+
+
 def test_completed_shipment_scan_starts_local_visible_logistics_task(app):
     controller = RecordingController()
     window = DesktopMainWindow(controller)
@@ -7290,6 +7302,7 @@ def test_order_pages_use_separate_page_filter_and_batch_rows(app):
     ):
         assert shipment._page_action_row_layout.indexOf(page_action) >= 0
         assert shipment._batch_action_row_layout.indexOf(page_action) == -1
+    assert shipment.logistics_button.text() == "查询已标发物流状态"
 
     for batch_widget in (
         shipment.ready_count_label,

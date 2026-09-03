@@ -34,6 +34,7 @@ from shipment_automation.config import SHIPMENT_TAG_NAME
 from shipment_automation.models import (
     LOGISTICS_CANCELLED,
     LOGISTICS_PENDING,
+    LOGISTICS_READY,
     LogisticsDetail,
     ShipmentCandidate,
 )
@@ -301,6 +302,78 @@ def test_order_detail_lookup_enriches_direct_system_order_with_list_asin(
         }
     ]
     assert client.detail_calls == [system_order_no]
+    assert client.closed is True
+
+
+def test_completed_refresh_service_backfills_live_amazon_evidence(
+    tmp_path,
+) -> None:
+    settings = DesktopSettings(queue_path="data/completed-refresh.sqlite3")
+    store = ShipmentQueueStore(tmp_path / settings.queue_path)
+    candidate = ShipmentCandidate(
+        system_order_no="103737963149768391",
+        platform_order_no="112-7766397-5278631",
+        logistics_no="ALS01936386763",
+        shipment_tag_name=SHIPMENT_TAG_NAME,
+        tag_text=SHIPMENT_TAG_NAME,
+    )
+    store.upsert_candidate(candidate)
+    assert store.complete_logistics_attempt(
+        candidate.logistics_no,
+        LogisticsDetail(
+            logistics_no=candidate.logistics_no,
+            status_text="已出库",
+            carrier="Wanb Express",
+            international_tracking_no="WNBAA0497485012YQ",
+            actual_total="CNY 174.73",
+            chargeable_weight_kg="2.000",
+        ),
+        state=LOGISTICS_READY,
+        last_error=None,
+    )
+    assert store.mark_erp_outbounded(
+        candidate.logistics_no,
+        email_preview_enabled=True,
+    )
+    client = DetailRecordingClient(
+        [],
+        {
+            "order_number": candidate.system_order_no,
+            "order_from_name": "线上订单",
+            "platform": "AMAZON",
+            "logistics_type_name": "万邦速达",
+            "logistics_provider_name": "手动",
+            "order_item": [
+                {
+                    "order_item_no": "168232385274001",
+                    "sku": "x-banner-32x71in",
+                }
+            ],
+        },
+    )
+
+    metrics = asyncio.run(
+        _service(tmp_path, client).refresh_completed_shipment_eligibility_evidence(
+            settings,
+            {},
+            "completed-refresh-test",
+        )
+    )
+    refreshed = store.get_by_logistics_no(candidate.logistics_no)
+
+    assert metrics == {
+        "target_count": 1,
+        "checked_count": 1,
+        "eligible_count": 1,
+        "ineligible_count": 0,
+        "failed_count": 0,
+    }
+    assert refreshed is not None
+    assert refreshed["sales_platform_name"] == "AMAZON"
+    assert refreshed["platform_order_item_ids"] == ("168232385274001",)
+    assert refreshed["logistics_provider_name"] == "手动"
+    assert refreshed["logistics_type_name"] == "万邦速达"
+    assert client.detail_calls == [candidate.system_order_no]
     assert client.closed is True
 
 
@@ -1064,6 +1137,69 @@ def test_custom_scan_reconciles_queued_buyer_cancel_order_to_not_required(tmp_pa
     ]
     assert any(item["decision"] == "not_required" for item in decisions)
     assert all(item["reason_code"] == "buyer_cancel_requested" for item in decisions)
+    assert len(client.calls) == 2
+    assert client.calls[0]["order_status"] == 4
+    assert "order_status" not in client.calls[1]
+
+
+def test_custom_scan_reconciles_platform_cancelled_order_to_cancelled(tmp_path) -> None:
+    platform_order_no = "111-1396630-1494609"
+    system_order_no = "103740035921777678"
+    order = _official_order(platform_order_no=platform_order_no)
+    order["global_order_no"] = system_order_no
+    order["order_tag"] = [
+        {
+            "tag_type": "系统处理类型",
+            "tag_no": "3-cancelled-order",
+            "tag_name": "订单被取消",
+        },
+        {
+            "tag_type": "系统处理类型",
+            "tag_no": "3-cancelled-item",
+            "tag_name": "商品被取消",
+        },
+    ]
+    client = RecordingClient([order])
+    service = _service(tmp_path, client)
+    settings = DesktopSettings(
+        folder_root=str(tmp_path / "orders"),
+        custom_state_path="data/custom-platform-cancel.sqlite3",
+    )
+    store = CustomWorkflowStore(tmp_path / settings.custom_state_path)
+    store.mutate_legacy_record(
+        platform_order_no,
+        lambda _old: {
+            "platform_order_no": platform_order_no,
+            "system_order_no": system_order_no,
+            "product_type": "tent",
+            "last_seen_at": datetime.now(timezone.utc).isoformat(),
+            "workflow_status": "pending",
+        },
+        event_type="api_candidate_seen",
+        actor="api_scanner",
+    )
+
+    payload = asyncio.run(
+        service.scan_custom_orders(settings, {}, task_id="custom-platform-cancel-001")
+    )
+
+    assert payload["status"] == "completed"
+    assert payload["candidate_count"] == 0
+    assert payload["order_cancelled_detected_count"] == 1
+    assert payload["order_cancelled_reconciled_count"] == 1
+    assert "平台已取消订单改为已取消" in payload["message"]
+    workflow = store.get_workflow(platform_order_no)
+    assert workflow is not None
+    assert workflow["workflow_status"] == "cancelled"
+    assert platform_order_no in store.processed_platform_orders()
+    audit = json.loads(Path(payload["audit_log_path"]).read_text(encoding="utf-8"))
+    decisions = [
+        item
+        for item in audit["order_decisions"]
+        if item["platform_order_no"] == platform_order_no
+    ]
+    assert any(item["decision"] == "cancelled" for item in decisions)
+    assert all(item["reason_code"] == "order_cancelled" for item in decisions)
     assert len(client.calls) == 2
     assert client.calls[0]["order_status"] == 4
     assert "order_status" not in client.calls[1]

@@ -117,6 +117,7 @@ def test_scheduled_scan_log_summaries_are_compact_and_keep_task_lookup() -> None
         {
             "candidate_count": 12,
             "buyer_cancel_reconciled_count": 2,
+            "order_cancelled_reconciled_count": 1,
             "buyer_cancel_clear_observed_count": 1,
             "buyer_cancel_reactivated_count": 2,
             "folder_reconciled_completed_count": 3,
@@ -150,6 +151,7 @@ def test_scheduled_scan_log_summaries_are_compact_and_keep_task_lookup() -> None
 
     assert custom == (
         "定制订单后台扫描完成：候选 12，买家取消转不需要 2，"
+        "平台取消转已取消 1，"
         "取消撤销待再次确认 1，取消申请已撤销，订单已重新入队 2，"
         "消失候选文件夹对账：完成 3、待处理 4、保留报错 2。"
     )
@@ -2460,7 +2462,10 @@ def test_uncertain_custom_write_is_pending_with_manual_review_lock(tmp_path):
     controller.close()
 
 
-def test_desktop_snapshot_includes_customer_shipping_service_scan_error(tmp_path):
+def test_desktop_snapshot_includes_customer_shipping_service_scan_error(
+    tmp_path,
+    monkeypatch,
+):
     from shipment_automation.queue_store import ShipmentWorkflowStore
 
     controller = _controller(tmp_path)
@@ -2487,6 +2492,15 @@ def test_desktop_snapshot_includes_customer_shipping_service_scan_error(tmp_path
     assert shipment.scan_issue_key.startswith("scan-issue:")
     assert shipment.last_error == "领星订单列表未返回客选物流字段。"
 
+    original_refresh = controller._refresh_persistent_rows  # noqa: SLF001
+    refresh_calls = 0
+
+    def record_refresh(*, force: bool = False) -> None:
+        del force
+        nonlocal refresh_calls
+        refresh_calls += 1
+
+    monkeypatch.setattr(controller, "_refresh_persistent_rows", record_refresh)
     changed = controller.change_shipment_statuses(
         [shipment.scan_issue_key],
         "manual_cancel",
@@ -2494,6 +2508,8 @@ def test_desktop_snapshot_includes_customer_shipping_service_scan_error(tmp_path
     )
     assert changed.accepted
     assert changed.details["changed_logistics_nos"] == (shipment.scan_issue_key,)
+    assert refresh_calls == 0
+    monkeypatch.setattr(controller, "_refresh_persistent_rows", original_refresh)
     managed = controller.snapshot().shipments[0]
     assert managed.scan_issue_state == "MANUALLY_CANCELLED"
     assert managed.scan_issue_reason == "业务确认该订单不再自动标发"

@@ -312,6 +312,43 @@ def test_order_processing_status_reads_terminal_cancel_without_buyer_request() -
     asyncio.run(run())
 
 
+def test_order_processing_status_reads_terminal_cancel_system_tag() -> None:
+    async def run() -> None:
+        platform_order_no = "111-1396630-1494609"
+        system_order_no = "103740035921777678"
+        gateway = FakeGateway(
+            _page(
+                _record(
+                    system_order_no,
+                    platform_order_no,
+                    [_item("item-1", "168744105004241", "M1", "L1", 1, platform_order_no)],
+                    status=4,
+                    order_tag=[
+                        {
+                            "tag_type": "系统处理类型",
+                            "tag_name": "订单被取消",
+                        },
+                        {
+                            "tag_type": "系统处理类型",
+                            "tag_name": "商品被取消",
+                        },
+                    ],
+                )
+            )
+        )
+
+        status = await LingxingCustomOrderApiOperations(gateway).get_order_processing_status(
+            platform_order_no=platform_order_no,
+            system_order_no=system_order_no,
+        )
+
+        assert status.order_cancelled is True
+        assert status.buyer_cancel_requested is False
+        assert status.status_text == "订单已取消"
+
+    asyncio.run(run())
+
+
 def _line(quantity: int = 3) -> OrderFolderLine:
     return OrderFolderLine(
         asin="B0CRRGTPFH",
