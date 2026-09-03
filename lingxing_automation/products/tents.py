@@ -7,6 +7,198 @@ from typing import Iterable
 EMAIL_PROMPT = "Please provide an email address to confirm customization design and details or for emergencies."
 PHONE_PROMPT = "Please provide a texting number to confirm customization design and details or for emergencies."
 
+NEW_TENT_PARENT_ASIN = "B0H5Q8N8NV"
+
+TENT_WALL_STRATEGY_LEGACY = "legacy"
+TENT_WALL_STRATEGY_DIRECTIONAL = "directional"
+TENT_WALL_STRATEGY_NONE = "none"
+
+
+@dataclass(frozen=True)
+class TentDirectionalWallSpec:
+    """一个由独立 Amazon 选项控制的方向墙。"""
+
+    option_title: str
+    direction: str
+    wall_kind: str
+
+    def component(self, *, double_sided: bool) -> str:
+        printing = "双面" if double_sided else "单面"
+        wall = "全墙" if self.wall_kind == "full_wall" else "半墙"
+        return f"{self.direction}{printing}{wall}"
+
+
+@dataclass(frozen=True)
+class TentBundledFlagSpec:
+    """帐篷套餐内固定数量旗帜的选项映射。"""
+
+    option_title: str
+    option_components: tuple[tuple[str, str], ...]
+
+
+@dataclass(frozen=True)
+class TentPackageRule:
+    """单个帐篷子 ASIN 的固定套餐事实。
+
+    墙体策略和捆绑旗帜都集中在产品目录中，文件夹和 SKU
+    流程只消费这些事实，避免为每个新 ASIN 增加分散的条件分支。
+    """
+
+    package_code: str
+    top_size: str
+    wall_strategy: str
+    legacy_wall_value: str | None = None
+    directional_walls: tuple[TentDirectionalWallSpec, ...] = ()
+    bundled_flag: TentBundledFlagSpec | None = None
+
+    def __post_init__(self) -> None:
+        if self.wall_strategy not in {
+            TENT_WALL_STRATEGY_LEGACY,
+            TENT_WALL_STRATEGY_DIRECTIONAL,
+            TENT_WALL_STRATEGY_NONE,
+        }:
+            raise ValueError(f"unknown tent wall strategy: {self.wall_strategy}")
+        if self.wall_strategy == TENT_WALL_STRATEGY_LEGACY and not self.legacy_wall_value:
+            raise ValueError("legacy tent wall strategy requires legacy_wall_value")
+        if self.wall_strategy == TENT_WALL_STRATEGY_DIRECTIONAL and not self.directional_walls:
+            raise ValueError("directional tent wall strategy requires directional_walls")
+
+
+_BACK_FULL_WALL = TentDirectionalWallSpec("Back Wall Options", "背", "full_wall")
+_THREE_DIRECTIONAL_FULL_WALLS = (
+    TentDirectionalWallSpec("Left Wall Options", "左", "full_wall"),
+    TentDirectionalWallSpec("Right Wall Options", "右", "full_wall"),
+    _BACK_FULL_WALL,
+)
+_FOUR_DIRECTIONAL_FULL_WALLS = (
+    TentDirectionalWallSpec("Front Wall Options", "前", "full_wall"),
+    *_THREE_DIRECTIONAL_FULL_WALLS,
+)
+_THREE_DIRECTIONAL_HALF_WALLS = (
+    TentDirectionalWallSpec("Double-sided Printing Options - Left Half Wall", "左", "half_wall"),
+    TentDirectionalWallSpec("Double-sided Printing Options - Right Half Wall", "右", "half_wall"),
+    TentDirectionalWallSpec("Double-sided Printing Options - Back Half Wall", "背", "half_wall"),
+)
+
+_TEARDROP_FLAG_SPEC = TentBundledFlagSpec(
+    option_title="Custom Feather/Teardrop Flag",
+    option_components=(
+        (
+            "2-Sided Printing: 6.9ft Same Design both Sides",
+            "2套（0.75x1.65m双面水滴旗+相同设计+全玻璃纤维杆+连接件+夹具）",
+        ),
+        (
+            "2-Sided Printing: 6.9ft Different Design",
+            "2套（0.75x1.65m双面水滴旗+不同设计+全玻璃纤维杆+连接件+夹具）",
+        ),
+        (
+            "2-Sided Printing: 9.8ft Same Design both Sides",
+            "2套（0.95x2.3m双面水滴旗+相同设计+全玻璃纤维杆+连接件+夹具）",
+        ),
+        (
+            "2-Sided Printing: 9.8ft Different Design",
+            "2套（0.95x2.3m双面水滴旗+不同设计+全玻璃纤维杆+连接件+夹具）",
+        ),
+    ),
+)
+
+_FEATHER_FLAG_SPEC = TentBundledFlagSpec(
+    option_title="Custom Feather/Teardrop Flag",
+    option_components=(
+        (
+            "2-Sided Printing: 1.64x6.56ft",
+            "2套（0.5x2m双面刀旗+全玻璃纤维杆+扁铁十字底座+水袋）",
+        ),
+        (
+            "2-Sided Printing: 1.97x7.8ft",
+            "2套（0.6x2.5m双面刀旗+全玻璃纤维杆+扁铁十字底座+水袋）",
+        ),
+        (
+            "2-Sided Printing: 2.3x11.15ft",
+            "2套（0.7x3.4m双面刀旗+全玻璃纤维杆+扁铁十字底座+水袋）",
+        ),
+        (
+            "2-Sided Printing: 2.62x13.45ft",
+            "2套（0.8x4.1m双面刀旗+全玻璃纤维杆+扁铁十字底座+水袋）",
+        ),
+    ),
+)
+
+# 新父体的 13 个套餐均以子 ASIN 作为固定组成的唯一权威来源。
+# 新增子 ASIN 时只需扩展此表以及父子关系，无需在文件夹流程中增加 ASIN if/else。
+TENT_PACKAGE_RULES_BY_ASIN: dict[str, TentPackageRule] = {
+    "B0H5TV9LXK": TentPackageRule(
+        "A",
+        "3x3m帐篷顶",
+        TENT_WALL_STRATEGY_LEGACY,
+        legacy_wall_value="1 Full and 2 Half Walls with Rails",
+    ),
+    "B0H6PW43V1": TentPackageRule(
+        "B",
+        "3x3m帐篷顶",
+        TENT_WALL_STRATEGY_DIRECTIONAL,
+        directional_walls=(_BACK_FULL_WALL,),
+    ),
+    "B0H6PN5HTB": TentPackageRule(
+        "C",
+        "3x3m帐篷顶",
+        TENT_WALL_STRATEGY_LEGACY,
+        legacy_wall_value="1 Full and 2 Half Walls with Rails",
+        bundled_flag=_TEARDROP_FLAG_SPEC,
+    ),
+    "B0H6PSSCVM": TentPackageRule(
+        "D",
+        "3x3m帐篷顶",
+        TENT_WALL_STRATEGY_DIRECTIONAL,
+        directional_walls=_FOUR_DIRECTIONAL_FULL_WALLS,
+    ),
+    "B0H6PQMPSW": TentPackageRule(
+        "E",
+        "3x3m帐篷顶",
+        TENT_WALL_STRATEGY_DIRECTIONAL,
+        directional_walls=_THREE_DIRECTIONAL_FULL_WALLS,
+    ),
+    "B0H6PNN62J": TentPackageRule(
+        "F",
+        "3x3m帐篷顶",
+        TENT_WALL_STRATEGY_LEGACY,
+        legacy_wall_value="1 Full and 2 Half Walls with Rails",
+        bundled_flag=_FEATHER_FLAG_SPEC,
+    ),
+    "B0H6PNRVV6": TentPackageRule("G", "3x3m帐篷顶", TENT_WALL_STRATEGY_NONE),
+    "B0H6PML9SS": TentPackageRule(
+        "H",
+        "3x3m帐篷顶",
+        TENT_WALL_STRATEGY_DIRECTIONAL,
+        directional_walls=(_BACK_FULL_WALL,),
+    ),
+    "B0H6PLYKY4": TentPackageRule(
+        "I",
+        "3x3m帐篷顶",
+        TENT_WALL_STRATEGY_LEGACY,
+        legacy_wall_value="1 Full and 2 Half Walls with Rails",
+    ),
+    "B0H6PS9BT5": TentPackageRule(
+        "J",
+        "3x3m帐篷顶",
+        TENT_WALL_STRATEGY_DIRECTIONAL,
+        directional_walls=_THREE_DIRECTIONAL_FULL_WALLS,
+    ),
+    "B0H6PXWBCH": TentPackageRule(
+        "K",
+        "3x3m帐篷顶",
+        TENT_WALL_STRATEGY_LEGACY,
+        legacy_wall_value="1 Half Wall With Rail",
+    ),
+    "B0H6PNDK4K": TentPackageRule("L", "3x3m帐篷顶", TENT_WALL_STRATEGY_NONE),
+    "B0H6PTLMZ1": TentPackageRule(
+        "M",
+        "3x3m帐篷顶",
+        TENT_WALL_STRATEGY_DIRECTIONAL,
+        directional_walls=_THREE_DIRECTIONAL_HALF_WALLS,
+    ),
+}
+
 ASIN_RE = re.compile(r"\bB0[A-Z0-9]{8}\b", re.I)
 
 TENT_PARENT_TO_CHILD_ASINS: dict[str, tuple[str, ...]] = {
@@ -24,6 +216,7 @@ TENT_PARENT_TO_CHILD_ASINS: dict[str, tuple[str, ...]] = {
     ),
     "B0F5CTQXG1": ("B0F5CCG9T5", "B0F5CKNVYJ", "B0CRRGTPFH"),
     "B0D6XW7V9T": ("B0D7DMK75P", "B0D6XWP8YN", "B0D6KZ7G88"),
+    NEW_TENT_PARENT_ASIN: tuple(TENT_PACKAGE_RULES_BY_ASIN),
 }
 
 TENT_CONTACT_PROMPTS_BY_PARENT: dict[str, tuple[str, str]] = {
@@ -31,6 +224,7 @@ TENT_CONTACT_PROMPTS_BY_PARENT: dict[str, tuple[str, str]] = {
     "B0CZNZVG26": (PHONE_PROMPT, EMAIL_PROMPT),
     "B0F5CTQXG1": (EMAIL_PROMPT, PHONE_PROMPT),
     "B0D6XW7V9T": (EMAIL_PROMPT, PHONE_PROMPT),
+    NEW_TENT_PARENT_ASIN: (EMAIL_PROMPT, PHONE_PROMPT),
 }
 
 TENT_ASIN_TO_PARENT_ASIN: dict[str, str] = {}
@@ -58,6 +252,7 @@ TENT_ASIN_TO_TOP_SIZE: dict[str, str] = {
     "B0D47YNR5Y": "3x6m帐篷顶",
     "B0D47X986N": "3x6m帐篷顶",
     "B0D1TSTBDW": "3x6m帐篷顶",
+    **{asin: rule.top_size for asin, rule in TENT_PACKAGE_RULES_BY_ASIN.items()},
 }
 
 WALL_ONLY_ASIN_KIND: dict[str, str] = {
@@ -121,6 +316,15 @@ def get_tent_top_size(asin: str | None) -> str | None:
     if not normalized:
         return None
     return TENT_ASIN_TO_TOP_SIZE.get(normalized)
+
+
+def get_tent_package_rule(asin: str | None) -> TentPackageRule | None:
+    """返回只对特定子 ASIN 生效的固定套餐规则。"""
+
+    normalized = normalize_asin(asin)
+    if not normalized:
+        return None
+    return TENT_PACKAGE_RULES_BY_ASIN.get(normalized)
 
 
 def get_wall_only_asin_kind(asin: str | None) -> str | None:

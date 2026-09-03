@@ -141,6 +141,15 @@ def wall_sku_for_component(size_key: str, component: str) -> TentSkuRuleItem | N
     prefix = wall_prefix(size_key)
     quantity = _leading_quantity(text)
     double_sided_suffix = "-Double-Sided" if "双面" in compact else ""
+    directional_match = re.fullmatch(r"(?:前|左|右|背)(?:单面|双面)(全墙|半墙)", compact)
+    if directional_match:
+        wall_kind = directional_match.group(1)
+        sku_kind = "Full-Wall" if wall_kind == "全墙" else "Half-Wall"
+        return TentSkuRuleItem(
+            sku=f"{prefix}-{sku_kind}{double_sided_suffix}",
+            quantity=1,
+            reason=component,
+        )
     # 文件夹里常写“全高背墙/半高侧墙”，SKU 表里对应“全围/半围”。
     if "全高背墙" in compact or "全围" in compact:
         return TentSkuRuleItem(sku=f"{prefix}-Full-Wall{double_sided_suffix}", quantity=quantity, reason=component)
@@ -161,17 +170,28 @@ def tablecloth_sku_for_component(component: str) -> TentSkuRuleItem | None:
 def flag_sku_for_component(component: str) -> TentSkuRuleItem | None:
     """把旗帜组件转换为对应的 SKU 规则项。"""
     text = _compact(component)
+    quantity = _leading_quantity(component)
     if "刀旗" in text or "feather" in text:
+        if "0.8x4.1m" in text or "0.8×4.1m" in text:
+            return TentSkuRuleItem(sku="Feather-Flag-0.8x4.1m", quantity=quantity, reason=component)
+        if "0.7x3.4m" in text or "0.7×3.4m" in text:
+            return TentSkuRuleItem(sku="Feather-Flag-0.7x3.4m", quantity=quantity, reason=component)
         if "0.6x2.5m" in text or "0.6×2.5m" in text:
-            return TentSkuRuleItem(sku="Feather-Flag-0.6x2.5m", reason=component)
+            return TentSkuRuleItem(sku="Feather-Flag-0.6x2.5m", quantity=quantity, reason=component)
         if "0.5x2m" in text or "0.5×2m" in text:
-            return TentSkuRuleItem(sku="Feather-Flag-0.5x2m", reason=component)
+            return TentSkuRuleItem(sku="Feather-Flag-0.5x2m", quantity=quantity, reason=component)
     if "水滴旗" in text or "teardrop" in text:
         if "0.95x2.3m" in text or "0.95×2.3m" in text:
-            return TentSkuRuleItem(sku="Teardrop-Flag-0.95x2.3m", reason=component)
+            return TentSkuRuleItem(sku="Teardrop-Flag-0.95x2.3m", quantity=quantity, reason=component)
         if "0.75x1.65m" in text or "0.75×1.65m" in text:
-            return TentSkuRuleItem(sku="Teardrop-Flag-0.75x1.65m", reason=component)
+            return TentSkuRuleItem(sku="Teardrop-Flag-0.75x1.65m", quantity=quantity, reason=component)
     return None
+
+
+def is_directional_half_wall_component(component: str) -> bool:
+    """判断新套餐的逐墙组件是否为方向半墙。"""
+
+    return bool(re.fullmatch(r"(?:左|右|背)(?:单面|双面)半墙", _compact(component)))
 
 
 def tent_accessory_component_to_sku_items(component: str) -> list[TentSkuRuleItem]:
