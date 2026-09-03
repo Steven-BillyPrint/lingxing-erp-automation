@@ -39,7 +39,10 @@ from shipment_automation.alibaba_ordering import (
 )
 from shipment_automation.candidate_scanner import build_shipment_scan_report
 from shipment_automation.queue_store import ShipmentQueueStore
-from shipment_automation.re_mark_domain import completed_re_mark_eligibility
+from shipment_automation.re_mark_domain import (
+    completed_re_mark_eligibility,
+    current_lingxing_waybill_from_wms_rows,
+)
 from lingxing_automation.services.folder_builder import find_platform_order_folders
 from lingxing_automation.products.catalog import PRODUCT_IDENTITY_CATALOG_VERSION
 
@@ -2095,10 +2098,11 @@ class DesktopApiServices:
         *,
         run_id: str,
     ) -> dict[str, int]:
-        """Backfill the three eligibility facts through exact OpenAPI details."""
+        """Backfill eligibility and the authoritative current WMS waybill."""
 
         targets = queue.list_completed_refresh_targets(
             eligible_only=False,
+            include_detected_reconciliation=True,
             limit=500,
         )
         metrics = {
@@ -2107,12 +2111,15 @@ class DesktopApiServices:
             "eligible_count": 0,
             "ineligible_count": 0,
             "failed_count": 0,
+            "waybill_synced_count": 0,
+            "externally_resolved_count": 0,
         }
-        seen: set[tuple[str, str]] = set()
+        seen: set[tuple[str, str, str]] = set()
         for target in targets:
             system_order_no = str(target.get("system_order_no") or "").strip()
             platform_order_no = str(target.get("platform_order_no") or "").strip()
-            identity = (system_order_no, platform_order_no)
+            logistics_no = str(target.get("logistics_no") or "").strip()
+            identity = (system_order_no, platform_order_no, logistics_no)
             if not all(identity) or identity in seen:
                 continue
             seen.add(identity)
@@ -2123,11 +2130,42 @@ class DesktopApiServices:
                     system_order_no=system_order_no,
                     platform_order_no=platform_order_no,
                 )
+                wms_page = await gateway.list_wms_orders(
+                    filters={
+                        "page": 1,
+                        "page_size": 200,
+                        "order_number_arr": [system_order_no],
+                    },
+                    offset=0,
+                    length=200,
+                    browser=None,
+                )
+                current_waybill = current_lingxing_waybill_from_wms_rows(
+                    wms_page.items,
+                    system_order_no=system_order_no,
+                    platform_order_no=platform_order_no,
+                    logistics_no=logistics_no,
+                )
                 changed = queue.update_completed_refresh_evidence(
                     system_order_no=system_order_no,
                     platform_order_no=platform_order_no,
                     run_id=run_id,
                     **evidence,
+                )
+                reconciliation = (
+                    queue.reconcile_completed_refresh_lingxing_waybill(
+                        system_order_no=system_order_no,
+                        platform_order_no=platform_order_no,
+                        logistics_no=logistics_no,
+                        current_waybill_no=current_waybill,
+                        run_id=run_id,
+                    )
+                )
+                metrics["waybill_synced_count"] += int(
+                    reconciliation["waybill_changed_count"]
+                )
+                metrics["externally_resolved_count"] += int(
+                    reconciliation["resolved_cycle_count"]
                 )
                 metrics["checked_count"] += 1
                 if changed:
@@ -2146,7 +2184,17 @@ class DesktopApiServices:
                     ] += 1
                 else:
                     metrics["ineligible_count"] += 1
-            except Exception:
+            except Exception as exc:
+                queue.defer_completed_refresh(
+                    system_order_no=system_order_no,
+                    platform_order_no=platform_order_no,
+                    logistics_no=logistics_no,
+                    reason=(
+                        "领星 OpenAPI 当前运单号证据不完整，已延后比对："
+                        f"{type(exc).__name__}: {str(exc).strip()}"
+                    ),
+                    run_id=run_id,
+                )
                 metrics["failed_count"] += 1
         return metrics
 

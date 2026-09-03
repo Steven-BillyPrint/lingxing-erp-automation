@@ -55,6 +55,9 @@ from shipment_automation.models import (
     ReMarkCycle,
 )
 from shipment_automation.queue_store import ShipmentQueueStore
+from shipment_automation.re_mark_domain import (
+    current_lingxing_waybill_from_wms_rows,
+)
 
 from .api_erp_mark import (
     ApiErpMarkAdapter,
@@ -81,6 +84,7 @@ class ReMarkWorkflowStore(Protocol):
     def update_re_mark_checkpoint(self, cycle_id: int, **values: Any) -> bool: ...
     def require_re_mark_manual_review(self, cycle_id: int, reason: str, **values: Any) -> bool: ...
     def complete_re_mark_cycle(self, cycle_id: int, *, run_id: str | None = None) -> bool: ...
+    def reconcile_completed_refresh_lingxing_waybill(self, **values: Any) -> dict[str, int]: ...
 
 
 @dataclass(frozen=True)
@@ -187,6 +191,38 @@ class ShipmentReMarkWorkflow:
                 raise ErpMarkManualReview(cycle.last_error or "该重新标发周期需要人工复核。")
             if cycle.state in {REMARK_COMPLETED, REMARK_CANCELLED}:
                 raise ErpMarkUserAbort("重新标发周期已经结束。")
+            if cycle.state == REMARK_DETECTED:
+                self._progress(progress_func, "正在通过领星 OpenAPI 复核当前运单号。", 8)
+                current_waybill = await self._current_lingxing_waybill(cycle)
+                reconciliation = (
+                    self.store.reconcile_completed_refresh_lingxing_waybill(
+                        system_order_no=cycle.system_order_no,
+                        platform_order_no=cycle.platform_order_no,
+                        logistics_no=cycle.logistics_no,
+                        current_waybill_no=current_waybill,
+                        run_id=run_id,
+                    )
+                )
+                if int(reconciliation.get("resolved_cycle_count") or 0) == 1:
+                    completed = self._required_cycle(cycle.id)
+                    self._progress(
+                        progress_func,
+                        "领星当前运单号已是阿里最新单号，无需重复撤销标发。",
+                        96,
+                    )
+                    return ShipmentReMarkResult(
+                        cycle_id=completed.id,
+                        system_order_no=completed.system_order_no,
+                        platform_order_no=completed.platform_order_no,
+                        old_waybill_no=completed.old_waybill_no,
+                        new_waybill_no=completed.new_waybill_no,
+                        state=completed.state,
+                        message=(
+                            "领星当前运单号已等于阿里最新单号，"
+                            "已判定人工重标发完成；未执行撤销或写入。"
+                        ),
+                    )
+                cycle = self._required_cycle(cycle.id)
             self._progress(progress_func, "正在通过领星 OpenAPI 核对原已发货包裹。", 12)
             cycle = await self._withdraw_if_needed(
                 page,
@@ -685,6 +721,22 @@ class ShipmentReMarkWorkflow:
                 raise ErpMarkManualReview("销售出库单系统单号与平台单号不一致。")
             rows.append(row)
         return rows
+
+    async def _current_lingxing_waybill(self, cycle: ReMarkCycle) -> str:
+        try:
+            return current_lingxing_waybill_from_wms_rows(
+                await self._wms_rows(cycle),
+                system_order_no=cycle.system_order_no,
+                platform_order_no=cycle.platform_order_no,
+                logistics_no=cycle.logistics_no,
+            )
+        except ErpMarkManualReview:
+            raise
+        except Exception as exc:
+            raise ErpMarkUserAbort(
+                "领星 OpenAPI 未能返回唯一可信的当前运单号，"
+                "本次未执行撤销或任何外部写入。"
+            ) from exc
 
     async def _old_outbound_row(
         self,

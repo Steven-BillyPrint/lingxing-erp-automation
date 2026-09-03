@@ -11,7 +11,7 @@ import json
 import re
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
-from typing import Iterable
+from typing import Iterable, Mapping, Sequence
 
 from .alibaba_logistics import (
     normalize_carrier_name,
@@ -153,3 +153,82 @@ def normalize_order_item_ids(values: Iterable[object]) -> tuple[str, ...]:
             if str(value or "").strip()
         )
     )
+
+
+def _wms_status(row: Mapping[str, object]) -> int | None:
+    value = row.get("status")
+    if isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _wms_platform_order_numbers(value: object) -> set[str]:
+    if isinstance(value, str):
+        return {
+            part.strip()
+            for part in value.replace("；", ",").split(",")
+            if part.strip()
+        }
+    if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
+        return {
+            str(part or "").strip()
+            for part in value
+            if str(part or "").strip()
+        }
+    text = str(value or "").strip()
+    return {text} if text else set()
+
+
+def current_lingxing_waybill_from_wms_rows(
+    rows: Iterable[Mapping[str, object]],
+    *,
+    system_order_no: str,
+    platform_order_no: str,
+    logistics_no: str,
+) -> str:
+    """Return the only active, outbounded WMS waybill for one ALS package.
+
+    The WMS ``waybill_no`` is Lingxing's authoritative current international
+    waybill.  Cut-off rows are historical evidence and are ignored.  Any
+    incomplete or ambiguous active result fails closed so callers can defer
+    the Alibaba comparison instead of creating a false re-mark cycle.
+    """
+
+    expected_system = str(system_order_no or "").strip()
+    expected_platform = str(platform_order_no or "").strip()
+    expected_logistics = normalize_tracking_number(logistics_no)
+    if not all((expected_system, expected_platform, expected_logistics)):
+        raise ValueError("系统单号、平台单号和 ALS 物流单号必须完整。")
+
+    matching_rows: list[tuple[int, Mapping[str, object]]] = []
+    found_system_order = False
+    for row in rows:
+        if str(row.get("order_number") or "").strip() != expected_system:
+            continue
+        found_system_order = True
+        platform_numbers = _wms_platform_order_numbers(row.get("platform_order_no"))
+        if platform_numbers and expected_platform not in platform_numbers:
+            raise ValueError("领星 WMS 返回的系统单号与平台单号不一致。")
+        if normalize_tracking_number(row.get("tracking_no")) != expected_logistics:
+            continue
+        status = _wms_status(row)
+        if status == 4:
+            continue
+        if status not in {1, 2, 3}:
+            raise ValueError("领星 WMS 返回了无法识别的销售出库单状态。")
+        matching_rows.append((status, row))
+
+    if not found_system_order:
+        raise ValueError("领星 WMS 未返回该系统单号。")
+    if len(matching_rows) != 1:
+        raise ValueError("领星 WMS 未返回唯一且与 ALS 一致的有效销售出库单。")
+    status, row = matching_rows[0]
+    if status != 3:
+        raise ValueError("领星 WMS 当前销售出库单尚未出库。")
+    waybill_no = normalize_tracking_number(row.get("waybill_no"))
+    if not waybill_no:
+        raise ValueError("领星 WMS 当前已出库销售单缺少运单号。")
+    return waybill_no

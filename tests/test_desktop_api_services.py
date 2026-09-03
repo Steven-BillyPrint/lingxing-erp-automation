@@ -124,10 +124,18 @@ class CancellationOverlapClient(RecordingClient):
 
 
 class DetailRecordingClient(RecordingClient):
-    def __init__(self, rows: list[dict[str, Any]], detail_payload: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        rows: list[dict[str, Any]],
+        detail_payload: dict[str, Any],
+        *,
+        wms_rows: list[dict[str, Any]] | None = None,
+    ) -> None:
         super().__init__(rows)
         self.detail_payload = detail_payload
         self.detail_calls: list[str] = []
+        self.wms_rows = list(wms_rows or [])
+        self.wms_calls: list[dict[str, Any]] = []
 
     async def get_fbm_order_detail(self, order_number: str):
         self.detail_calls.append(order_number)
@@ -136,6 +144,17 @@ class DetailRecordingClient(RecordingClient):
             message="操作成功",
             data=dict(self.detail_payload),
             request_id="detail-request-safe-id",
+            response_time=None,
+            raw={},
+        )
+
+    async def list_wms_orders(self, **filters):
+        self.wms_calls.append(dict(filters))
+        return APIResponse(
+            code="0",
+            message="操作成功",
+            data={"total": len(self.wms_rows), "list": list(self.wms_rows)},
+            request_id="wms-request-safe-id",
             response_time=None,
             raw={},
         )
@@ -350,6 +369,15 @@ def test_completed_refresh_service_backfills_live_amazon_evidence(
                 }
             ],
         },
+        wms_rows=[
+            {
+                "order_number": candidate.system_order_no,
+                "platform_order_no": [candidate.platform_order_no],
+                "status": 3,
+                "waybill_no": "WNBAA0497485012YQ",
+                "tracking_no": candidate.logistics_no,
+            }
+        ],
     )
 
     metrics = asyncio.run(
@@ -367,6 +395,8 @@ def test_completed_refresh_service_backfills_live_amazon_evidence(
         "eligible_count": 1,
         "ineligible_count": 0,
         "failed_count": 0,
+        "waybill_synced_count": 0,
+        "externally_resolved_count": 0,
     }
     assert refreshed is not None
     assert refreshed["sales_platform_name"] == "AMAZON"
@@ -374,7 +404,110 @@ def test_completed_refresh_service_backfills_live_amazon_evidence(
     assert refreshed["logistics_provider_name"] == "手动"
     assert refreshed["logistics_type_name"] == "万邦速达"
     assert client.detail_calls == [candidate.system_order_no]
+    assert client.wms_calls == [
+        {
+            "page": 1,
+            "page_size": 200,
+            "order_number_arr": [candidate.system_order_no],
+        }
+    ]
     assert client.closed is True
+
+
+def test_completed_refresh_service_resolves_a_manually_updated_detected_cycle(
+    tmp_path,
+) -> None:
+    settings = DesktopSettings(queue_path="data/completed-refresh-reconcile.sqlite3")
+    store = ShipmentQueueStore(tmp_path / settings.queue_path)
+    candidate = ShipmentCandidate(
+        system_order_no="103735075688785273",
+        platform_order_no="113-1341773-1145022",
+        logistics_no="ALS01915029156",
+        shipment_tag_name=SHIPMENT_TAG_NAME,
+        tag_text=SHIPMENT_TAG_NAME,
+        sales_platform_code="Amazon",
+        sales_platform_name="Amazon",
+        platform_order_item_ids=("167540768447001",),
+        logistics_provider_name="手动",
+        logistics_type_name="万邦速达",
+    )
+    store.upsert_candidate(candidate)
+    assert store.complete_logistics_attempt(
+        candidate.logistics_no,
+        LogisticsDetail(
+            logistics_no=candidate.logistics_no,
+            status_text="运输中",
+            service_line="万邦速达",
+            carrier="万邦速达",
+            international_tracking_no="WNBAA0494424973YQ",
+            actual_total="CNY 136.03",
+            chargeable_weight_kg="2",
+        ),
+        state=LOGISTICS_READY,
+        last_error=None,
+    )
+    assert store.mark_erp_outbounded(
+        candidate.logistics_no,
+        email_preview_enabled=True,
+    )
+    cycle = store.record_completed_refresh_observation(
+        candidate.logistics_no,
+        LogisticsDetail(
+            logistics_no=candidate.logistics_no,
+            status_text="运输中",
+            service_line="OnTrac",
+            carrier="OnTrac",
+            international_tracking_no="1LSD01R0018AGMD",
+            actual_total="CNY 136.03",
+            chargeable_weight_kg="2",
+        ),
+    )
+    assert cycle is not None
+    client = DetailRecordingClient(
+        [],
+        {
+            "order_number": candidate.system_order_no,
+            "order_from_name": "线上订单",
+            "platform": "AMAZON",
+            "logistics_type_name": "万邦速达",
+            "logistics_provider_name": "手动",
+            "order_item": [{"order_item_no": "167540768447001"}],
+        },
+        wms_rows=[
+            {
+                "order_number": candidate.system_order_no,
+                "platform_order_no": [candidate.platform_order_no],
+                "status": 4,
+                "waybill_no": "WNBAA0494424973YQ",
+                "tracking_no": candidate.logistics_no,
+            },
+            {
+                "order_number": candidate.system_order_no,
+                "platform_order_no": [candidate.platform_order_no],
+                "status": 3,
+                "waybill_no": "1LSD01R0018AGMD",
+                "tracking_no": candidate.logistics_no,
+            },
+        ],
+    )
+
+    metrics = asyncio.run(
+        _service(tmp_path, client).refresh_completed_shipment_eligibility_evidence(
+            settings,
+            {},
+            "completed-refresh-reconcile-test",
+        )
+    )
+
+    assert metrics["target_count"] == 1
+    assert metrics["checked_count"] == 1
+    assert metrics["waybill_synced_count"] == 1
+    assert metrics["externally_resolved_count"] == 1
+    completed = store.get_re_mark_cycle(cycle.id)
+    assert completed is not None and completed.state == "COMPLETED"
+    refreshed = store.get_by_logistics_no(candidate.logistics_no)
+    assert refreshed is not None
+    assert refreshed["international_tracking_no"] == "1LSD01R0018AGMD"
 
 
 def test_order_detail_lookup_uses_list_amount_for_mixed_non_tent_category(
