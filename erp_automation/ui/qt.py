@@ -1191,6 +1191,7 @@ if PYSIDE6_AVAILABLE:
         page_ready = Signal(int, object, str, object)
         page_failed = Signal(int, object, str, object)
         CACHE_LIMIT = 8
+        HISTORY_LIMIT = 24
 
         def __init__(
             self,
@@ -1205,6 +1206,14 @@ if PYSIDE6_AVAILABLE:
             self._generation = 0
             self._epoch = 0
             self._cache: dict[tuple[object, ...], object] = {}
+            # Keep the last successful projection for each query even after a
+            # dataset revision changes.  It is never treated as authoritative,
+            # but lets navigation paint an already-seen page immediately while
+            # a fresh revision is verified in the background.
+            self._history: dict[
+                tuple[object, ...],
+                tuple[int, object],
+            ] = {}
             self._inflight: dict[tuple[object, ...], _ValueThread] = {}
             self._foreground_waiters: dict[
                 tuple[object, ...],
@@ -1229,6 +1238,42 @@ if PYSIDE6_AVAILABLE:
             revision: str,
         ) -> None:
             self._cache.pop(self._cache_key(request_key, revision), None)
+
+        def cached(
+            self,
+            request_key: tuple[object, ...],
+            revision: str,
+            *,
+            allow_stale: bool = False,
+        ) -> tuple[object, bool] | None:
+            """Return an LRU page and whether it matches the current revision."""
+
+            cache_key = self._cache_key(request_key, revision)
+            value = self._cache.pop(cache_key, None)
+            if value is not None:
+                self._cache[cache_key] = value
+                self._touch_history(request_key, self._epoch, value)
+                return value, True
+            if not allow_stale:
+                return None
+            historical = self._history.pop(request_key, None)
+            if historical is None:
+                return None
+            self._history[request_key] = historical
+            return historical[1], False
+
+        def seed(
+            self,
+            request_key: tuple[object, ...],
+            revision: str,
+            value: object,
+        ) -> None:
+            """Store a page already validated by its owning UI handler."""
+
+            if not isinstance(value, self._expected_type):
+                return
+            cache_key = self._cache_key(request_key, revision)
+            self._remember_value(cache_key, request_key, revision, value)
 
         def request(
             self,
@@ -1263,6 +1308,12 @@ if PYSIDE6_AVAILABLE:
                         exc,
                     )
                     return generation
+                self._remember_value(
+                    cache_key,
+                    request_key,
+                    revision,
+                    value,
+                )
                 self.page_ready.emit(
                     generation,
                     request_key,
@@ -1353,22 +1404,12 @@ if PYSIDE6_AVAILABLE:
             revision: str,
             value: object,
         ) -> None:
-            if cache_key[0] == self._epoch and isinstance(
+            self._remember_value(
+                cache_key,
+                request_key,
+                revision,
                 value,
-                self._expected_type,
-            ):
-                result_revision = str(
-                    (
-                        value.get("dataset_revision", "")
-                        if isinstance(value, Mapping)
-                        else getattr(value, "dataset_revision", "")
-                    )
-                    or ""
-                )
-                if not revision or result_revision == revision:
-                    self._cache[cache_key] = value
-                    while len(self._cache) > self.CACHE_LIMIT:
-                        self._cache.pop(next(iter(self._cache)))
+            )
             waiters = self._foreground_waiters.pop(cache_key, ())
             if self._generation in waiters:
                 self.page_ready.emit(
@@ -1377,6 +1418,51 @@ if PYSIDE6_AVAILABLE:
                     revision,
                     value,
                 )
+
+        def _remember_value(
+            self,
+            cache_key: tuple[object, ...],
+            request_key: tuple[object, ...],
+            revision: str,
+            value: object,
+        ) -> None:
+            if not isinstance(value, self._expected_type):
+                return
+            request_epoch = int(cache_key[0])
+            self._touch_history(request_key, request_epoch, value)
+            if request_epoch != self._epoch:
+                return
+            result_revision = str(
+                (
+                    value.get("dataset_revision", "")
+                    if isinstance(value, Mapping)
+                    else getattr(value, "dataset_revision", "")
+                )
+                or ""
+            )
+            if revision and result_revision != revision:
+                return
+            self._cache.pop(cache_key, None)
+            self._cache[cache_key] = value
+            self._trim_cache()
+
+        def _touch_history(
+            self,
+            request_key: tuple[object, ...],
+            epoch: int,
+            value: object,
+        ) -> None:
+            existing = self._history.get(request_key)
+            if existing is not None and existing[0] > epoch:
+                return
+            self._history.pop(request_key, None)
+            self._history[request_key] = (epoch, value)
+            while len(self._history) > self.HISTORY_LIMIT:
+                self._history.pop(next(iter(self._history)))
+
+        def _trim_cache(self) -> None:
+            while len(self._cache) > self.CACHE_LIMIT:
+                self._cache.pop(next(iter(self._cache)))
 
         def _accept_error(
             self,
@@ -9725,6 +9811,8 @@ if PYSIDE6_AVAILABLE:
 
 
     class ShipmentNotificationPage(QWidget):
+        PAGE_HISTORY_LIMIT = 24
+
         def __init__(
             self,
             controller: BackgroundTaskController,
@@ -9758,6 +9846,7 @@ if PYSIDE6_AVAILABLE:
             self._notification_dataset_revision = ""
             self._notification_loaded_revision = ""
             self._notification_page_navigation_loading = False
+            self._notification_refresh_after_navigation = False
             # Compatibility mirrors for older extensions/tests. Reads are
             # owned by ``_notification_page_loader``; these never control the
             # production request lifecycle.
@@ -10405,16 +10494,63 @@ if PYSIDE6_AVAILABLE:
                 (str, bytes),
             ):
                 return
-            cache_key = self._notification_page_loader._cache_key(
+            self._notification_page_loader.seed(
                 key,
                 self._notification_dataset_revision,
+                value,
             )
-            self._notification_page_loader._cache[cache_key] = value
+            value_revision = str(
+                (
+                    value.get("dataset_revision", "")
+                    if isinstance(value, Mapping)
+                    else ""
+                )
+                or ""
+            )
+            compatibility_key = (
+                value_revision or self._notification_dataset_revision,
+                *key,
+            )
+            self._notification_page_cache.pop(compatibility_key, None)
+            self._notification_page_cache[compatibility_key] = value
+            while (
+                len(self._notification_page_cache)
+                > self.PAGE_HISTORY_LIMIT
+            ):
+                self._notification_page_cache.pop(
+                    next(iter(self._notification_page_cache))
+                )
+
+        def _cached_notification_page(
+            self,
+            key: tuple[object, ...],
+        ) -> tuple[object, bool] | None:
+            """Return a fresh page, or the newest stale page for instant paint."""
+
+            cached = self._notification_page_loader.cached(
+                key,
+                self._notification_dataset_revision,
+                allow_stale=True,
+            )
+            if cached is not None:
+                return cached
             compatibility_key = (
                 self._notification_dataset_revision,
                 *key,
             )
-            self._notification_page_cache[compatibility_key] = value
+            value = self._notification_page_cache.pop(
+                compatibility_key,
+                None,
+            )
+            if value is not None:
+                self._notification_page_cache[compatibility_key] = value
+                return value, True
+            for historical_key in reversed(self._notification_page_cache):
+                if tuple(historical_key[1:]) != key:
+                    continue
+                value = self._notification_page_cache[historical_key]
+                return value, False
+            return None
 
         def _apply_notification_reload_for_request(
             self,
@@ -10455,7 +10591,17 @@ if PYSIDE6_AVAILABLE:
             self._cache_notification_page(request_key, value)
             self._notification_loaded_key = request_key
             self._notification_loaded_revision = str(requested_revision or "")
+            refresh_after_navigation = bool(
+                self._notification_refresh_after_navigation
+                and self._notification_page_navigation_loading
+            )
             self._apply_notification_reload(value)
+            if refresh_after_navigation:
+                self._notification_refresh_after_navigation = False
+                QTimer.singleShot(
+                    0,
+                    lambda: self._reload(navigation=False),
+                )
 
         def _notification_reload_failed_for_request(
             self,
@@ -10510,11 +10656,24 @@ if PYSIDE6_AVAILABLE:
             self._notification_page = target
             query = self._notification_page_query()
             key = self._notification_page_cache_key(query)
-            cached = self._notification_page_cache.get(
-                (self._notification_dataset_revision, *key)
+            cached = self._cached_notification_page(key)
+            if cached is None:
+                self._reload()
+                return
+            value, is_fresh = cached
+            self._notification_page_request_key = key
+            self._notification_loaded_key = key
+            self._notification_loaded_revision = (
+                self._notification_dataset_revision if is_fresh else ""
             )
-            if cached is not None:
-                self._apply_notification_reload(cached)
+            self._apply_notification_reload(value)
+            if is_fresh:
+                # Snapshot revision changes already trigger an explicit refresh.
+                # Re-reading an unchanged page here only turns a cache hit into
+                # visible latency and duplicates the table render.
+                return
+            # Stale-while-revalidate: rows are already visible, while row-level
+            # actions stay locked until the current revision arrives.
             self._reload()
 
         def _change_notification_page_size(self, page_size: int) -> None:
@@ -10665,10 +10824,8 @@ if PYSIDE6_AVAILABLE:
         def _prefetch_adjacent_notification_pages(self) -> None:
             if not getattr(self._controller, "snapshot_runs_in_background", False):
                 return
-            for target in (
-                self._notification_page + 1,
-                self._notification_page - 1,
-            ):
+            for offset in (1, 2, -1):
+                target = self._notification_page + offset
                 if target < 1 or target > self._notification_total_pages:
                     continue
                 query = self._notification_page_query(target)
@@ -12448,7 +12605,13 @@ if PYSIDE6_AVAILABLE:
                         )
                     )
             if notification_data_may_have_changed:
-                self._reload(navigation=False)
+                if self._notification_page_navigation_loading:
+                    # Periodic snapshots must not continually supersede the
+                    # user's page request while the database is busy.  Finish
+                    # that navigation first, then verify freshness silently.
+                    self._notification_refresh_after_navigation = True
+                else:
+                    self._reload(navigation=False)
 
 
     class LogsPage(QWidget):
