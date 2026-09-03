@@ -47,6 +47,7 @@ from .models import (
     ReadyToMarkItem,
 )
 from .queue_store import ShipmentQueueStore
+from .re_mark_domain import completed_refresh_snapshot
 
 
 FetchLogisticsDetail = Callable[[str], Awaitable[LogisticsDetail]]
@@ -166,8 +167,16 @@ async def run_logistics_worker(args: argparse.Namespace) -> dict[str, Any]:
     rows = store.list_logistics_check_candidates(
         limit=0 if process_all_batches else limit
     )
-    target_count = len(_dedupe_rows_by_logistics_no(rows))
-    if not rows:
+    completed_refresh_rows = store.list_completed_refresh_targets(
+        eligible_only=True,
+        limit=500,
+    )
+    normal_target_count = len(_dedupe_rows_by_logistics_no(rows))
+    completed_refresh_target_count = len(
+        _dedupe_rows_by_logistics_no(completed_refresh_rows)
+    )
+    target_count = normal_target_count + completed_refresh_target_count
+    if not rows and not completed_refresh_rows:
         report = LogisticsWorkerReport(
             status="completed",
             message="没有 NEW / NOT_READY / ERROR 物流记录需要查询。",
@@ -179,6 +188,7 @@ async def run_logistics_worker(args: argparse.Namespace) -> dict[str, Any]:
             skipped_query_records=store.list_logistics_skipped_records(limit=50),
             parser_artifact_requeued_count=len(parser_artifact_requeued),
             tracking_rule_requeued_count=len(tracking_rule_requeued),
+            completed_refresh_target_count=0,
         )
         if parser_artifact_requeued:
             report.warnings.append(
@@ -389,8 +399,19 @@ async def run_logistics_worker(args: argparse.Namespace) -> dict[str, Any]:
             report.batch_count = 1 if report.scanned_page_count else 0
             report.aborted_count = max(
                 report.aborted_count,
-                target_count - report.scanned_page_count,
+                normal_target_count - report.scanned_page_count,
             )
+        await _process_completed_refresh_rows(
+            store,
+            completed_refresh_rows,
+            fetch_detail=fetch_with_current_browser,
+            retry_fetch_detail=restart_browser_and_fetch,
+            report=report,
+            update_queue=update_queue,
+            dry_run=dry_run,
+            run_id=run_id,
+            progress_callback=progress_callback,
+        )
         report.parser_artifact_requeued_count = len(parser_artifact_requeued)
         report.tracking_rule_requeued_count = len(tracking_rule_requeued)
         if parser_artifact_requeued:
@@ -971,6 +992,68 @@ def _notify_progress(
         callback(message, max(0, min(99, int(progress_percent))))
     except Exception:
         pass
+
+
+async def _process_completed_refresh_rows(
+    store: ShipmentQueueStore,
+    rows: list[dict[str, Any]],
+    *,
+    fetch_detail: FetchLogisticsDetail,
+    retry_fetch_detail: FetchLogisticsDetail | None,
+    report: LogisticsWorkerReport,
+    update_queue: bool,
+    dry_run: bool,
+    run_id: str,
+    progress_callback: LogisticsProgressCallback | None,
+) -> None:
+    """Run the independent completed-order refresh pass in the same browser."""
+
+    unique_rows = _dedupe_rows_by_logistics_no(rows)
+    report.completed_refresh_target_count = len(unique_rows)
+    for index, row in enumerate(unique_rows, start=1):
+        logistics_no = str(row.get("logistics_no") or "").strip()
+        _notify_progress(
+            progress_callback,
+            f"正在复查近 15 天已完成物流（{index}/{len(unique_rows)}）：{logistics_no}",
+            90 + int((index / max(len(unique_rows), 1)) * 8),
+        )
+        try:
+            detail = await _fetch_detail_with_optional_retry(
+                logistics_no,
+                fetch_detail=fetch_detail,
+                retry_fetch_detail=retry_fetch_detail,
+                report=report,
+            )
+            if not detail.logistics_no:
+                detail.logistics_no = logistics_no
+            snapshot = completed_refresh_snapshot(detail)
+            readiness = logistics_readiness_decision(detail)
+            report.completed_refresh_checked_count += 1
+            old_waybill = normalize_tracking_number(
+                row.get("international_tracking_no")
+            )
+            changed = bool(
+                snapshot.waybill_no
+                and snapshot.waybill_no != old_waybill
+                and readiness.should_continue
+                and not snapshot.validation_error
+            )
+            if update_queue and not dry_run:
+                cycle = store.record_completed_refresh_observation(
+                    logistics_no,
+                    detail,
+                    run_id=run_id,
+                )
+                changed = cycle is not None
+            if changed:
+                report.completed_refresh_changed_count += 1
+            else:
+                report.completed_refresh_unchanged_count += 1
+        except Exception as exc:
+            report.completed_refresh_failed_count += 1
+            report.warnings.append(
+                f"已完成物流复查失败 {logistics_no}：{compact_exception_message(exc)}"
+            )
 
 
 def logistics_report_to_dict(report: LogisticsWorkerReport) -> dict[str, Any]:

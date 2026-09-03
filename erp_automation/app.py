@@ -10,7 +10,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import urlsplit
 
-from .application import DesktopApiServices, DesktopTaskRunner, ManagedApiErpMarkFunc
+from .application import (
+    DesktopApiServices,
+    DesktopTaskRunner,
+    ManagedApiErpMarkFunc,
+    ManagedShipmentReMarkFunc,
+)
 from .application.browser_preflight import BrowserEndpointCircuitBreaker
 from .configuration import (
     EncryptedConfigurationStore,
@@ -427,6 +432,10 @@ def create_default_controller(
         create_erp_gateway,
         controller.configuration_values,
     )
+    shipment_re_mark_func = ManagedShipmentReMarkFunc(
+        create_erp_gateway,
+        controller.configuration_values,
+    )
     task_runner = DesktopTaskRunner(
         application_home,
         settings_provider=lambda: controller.snapshot().settings,
@@ -452,6 +461,7 @@ def create_default_controller(
         custom_order_api_factory=api_services.custom_order_operations,
         custom_order_status_check=api_services.get_custom_order_processing_status,
         erp_mark_func=erp_mark_func,
+        shipment_re_mark_func=shipment_re_mark_func,
         runtime_write_guard_provider=lambda: not controller.snapshot().policy.emergency_stop_writes,
         interaction_handler=controller.request_interaction,
         cancellation_provider=controller.cancellation_requested,

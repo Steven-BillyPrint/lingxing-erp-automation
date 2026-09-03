@@ -4059,6 +4059,65 @@ def test_shipment_queue_search_and_checked_batch_cancel(app, monkeypatch):
     page.deleteLater()
 
 
+def test_re_mark_batch_action_is_enabled_only_for_detected_cycle(
+    app,
+    monkeypatch,
+) -> None:
+    controller = RecordingController()
+    results: list[ControlResult] = []
+    page = ShipmentPage(controller, results.append)
+    page.update_snapshot(
+        DesktopSnapshot(
+            shipments=[
+                ShipmentRow(
+                    platform_order_no="113-1341773-1145022",
+                    system_order_no="103735075688785273",
+                    logistics_no="ALS01915029156",
+                    identity_state="ACTIVE",
+                    logistics_state="READY",
+                    erp_state="DONE",
+                    checkpoint="OUTBOUNDED",
+                    re_mark_cycle_id=41,
+                    re_mark_state="DETECTED",
+                    re_mark_old_waybill_no="WNBAA0494424973YQ",
+                    re_mark_new_carrier="ONTRAC",
+                    re_mark_new_service_line="OnTrac",
+                    re_mark_new_waybill_no="1LSD01R0018AGMD",
+                    re_mark_new_tracking_no="ALS01915029156",
+                    re_mark_new_freight="136.03",
+                    re_mark_new_currency="CNY",
+                    re_mark_new_fee_weight_g="2000",
+                )
+            ]
+        )
+    )
+    page.table.item(0, 0).setCheckState(Qt.CheckState.Checked)
+
+    assert page.table.item(0, 7).text() == "重新标发"
+    assert page.update_tracking_numbers_action.isEnabled()
+    assert not page.execute_button.isEnabled()
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args: QMessageBox.StandardButton.Yes,
+    )
+
+    page._update_selected_tracking_numbers()
+
+    assert len(controller.submitted_commands) == 1
+    command = controller.submitted_commands[0]
+    assert command.capability is Capability.REMARK_SHIPMENT
+    assert command.payload["re_mark_cycle_id"] == 41
+    confirmation = DesktopWriteConfirmation.from_payload(command.payload)
+    assert confirmation.action is DesktopWriteAction.EXECUTE_SHIPMENT_REMARK
+    assert confirmation.order_no == "113-1341773-1145022"
+    assert confirmation.system_order_no == "103735075688785273"
+    assert confirmation.logistics_no == "ALS01915029156"
+    assert confirmation.source == "qt_checked_action"
+    assert results[-1].accepted
+    page.deleteLater()
+
+
 def test_shipment_queue_scan_errors_are_independently_manageable_but_not_executable(
     app,
     monkeypatch,
@@ -7242,6 +7301,8 @@ def test_order_pages_use_separate_page_filter_and_batch_rows(app):
     assert [
         action.text() for action in shipment.more_actions_menu.actions()
     ] == [
+        "更新物流单号",
+        "",
         "修改物流单号和承运商",
         "人工核对物流并放行",
         "修改状态",

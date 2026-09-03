@@ -81,6 +81,7 @@ NotificationContactRefreshCallable = Callable[
     Awaitable[Mapping[str, Any]],
 ]
 ErpMarkCallable = Callable[..., Awaitable[str]]
+ShipmentReMarkCallable = Callable[..., Awaitable[Mapping[str, Any]]]
 CustomOrderOperationsFactory = Callable[
     [DesktopSettings, Mapping[str, Any]],
     AbstractAsyncContextManager[CustomOrderApiOperations],
@@ -143,6 +144,7 @@ class DesktopTaskRunner:
         shipment_notification_contact_refresh: NotificationContactRefreshCallable | None = None,
         api_test: ScanCallable | None = None,
         erp_mark_func: ErpMarkCallable | None = None,
+        shipment_re_mark_func: ShipmentReMarkCallable | None = None,
         custom_order_api_factory: CustomOrderOperationsFactory | None = None,
         custom_order_status_check: CustomOrderStatusCheck | None = None,
         runtime_write_guard_provider: RuntimeWriteGuardProvider | None = None,
@@ -164,6 +166,7 @@ class DesktopTaskRunner:
         self.shipment_notification_contact_refresh = shipment_notification_contact_refresh
         self.api_test = api_test
         self.erp_mark_func = erp_mark_func
+        self.shipment_re_mark_func = shipment_re_mark_func
         self.custom_order_api_factory = custom_order_api_factory
         self.custom_order_status_check = custom_order_status_check
         self.runtime_write_guard_provider = runtime_write_guard_provider
@@ -579,6 +582,35 @@ class DesktopTaskRunner:
                 logistics_no,
                 settings,
                 configuration,
+                confirmation,
+                task_id=command.execution_id or "",
+                browser_endpoint=str(
+                    command.payload.get(DESKTOP_BROWSER_ENDPOINT_PAYLOAD_KEY) or ""
+                ),
+            )
+        if (
+            command.area is TaskArea.SHIPMENT
+            and command.capability is Capability.REMARK_SHIPMENT
+        ):
+            cycle_id = int(command.payload.get("re_mark_cycle_id") or 0)
+            system_order_no = str(
+                command.payload.get("system_order_no") or ""
+            ).strip()
+            logistics_no = str(command.payload.get("logistics_no") or "").strip()
+            if cycle_id <= 0 or not system_order_no or not logistics_no:
+                return TaskExecutionResult(False, "重新标发任务缺少周期、系统单号或 ALS。")
+            try:
+                confirmation = self._consume_confirmation(
+                    command,
+                    DesktopWriteAction.EXECUTE_SHIPMENT_REMARK,
+                    system_order_no=system_order_no,
+                    logistics_no=logistics_no,
+                )
+            except ValueError as exc:
+                return TaskExecutionResult(False, str(exc), blocked=True)
+            return await self._re_mark_shipment(
+                cycle_id,
+                settings,
                 confirmation,
                 task_id=command.execution_id or "",
                 browser_endpoint=str(
@@ -2140,6 +2172,151 @@ class DesktopTaskRunner:
         )
         payload = dict(await run_logistics_worker(args))
         return self._result(payload, success_statuses={"completed", "completed_with_skips"})
+
+    async def _re_mark_shipment(
+        self,
+        cycle_id: int,
+        settings: DesktopSettings,
+        confirmation: DesktopWriteConfirmation,
+        *,
+        task_id: str,
+        browser_endpoint: str = "",
+    ) -> TaskExecutionResult:
+        """Attach to visible Chrome and run the independent re-mark workflow."""
+
+        if self.shipment_re_mark_func is None:
+            return TaskExecutionResult(False, "重新标发执行器尚未连接。", blocked=True)
+        from lingxing_automation.browser.session import (
+            get_first_page,
+            launch_context,
+            wait_for_order_page,
+        )
+        from lingxing_automation.config import (
+            configuration_source_from_args,
+            load_login_config,
+        )
+        from lingxing_automation.constants import ORDER_MANAGEMENT_URL
+        from shipment_automation.cli import build_parser
+        from shipment_automation.erp_mark_ship import (
+            ErpMarkEmergencyStopped,
+            ErpMarkManualReview,
+            ErpMarkUserAbort,
+        )
+        from shipment_automation.queue_store import ShipmentWorkflowStore
+
+        args = build_parser().parse_args(
+            [
+                "erp-mark",
+                "--queue-path",
+                str(self._path(settings.queue_path)),
+                "--profile-dir",
+                str(self._path(settings.browser_profile)),
+            ]
+        )
+        self._common_browser_args(
+            args,
+            settings,
+            browser_endpoint=browser_endpoint,
+        )
+
+        def cancellation_requested() -> bool:
+            if self.cancellation_provider is None or not task_id:
+                return False
+            try:
+                return bool(self.cancellation_provider(task_id))
+            except Exception:
+                return True
+
+        async def runtime_guard() -> bool:
+            if cancellation_requested():
+                return False
+            if self.runtime_write_guard_provider is None:
+                return True
+            try:
+                return bool(self.runtime_write_guard_provider())
+            except Exception:
+                return False
+
+        async def confirmed_stage(prompt: str) -> bool:
+            if not await runtime_guard():
+                raise ErpMarkEmergencyStopped("重新标发已因取消或紧急停止而暂停。")
+            # The checked-row Qt dialog already authorizes the full documented
+            # sequence.  Explicitly reject the ordinary browser fallback:
+            # this workflow may write only through Lingxing OpenAPI.
+            if "改用原网页流程" in prompt:
+                return False
+            operation = next(
+                (
+                    label
+                    for marker, label in (
+                        ("设置仓库物流", "设置物流渠道"),
+                        ("审核发货", "审核发货"),
+                        ("运单填写", "写入新运单/ALS/运费/重量"),
+                        ("出库发货", "重新出库"),
+                    )
+                    if marker in prompt
+                ),
+                "领星 OpenAPI 写入",
+            )
+            self._report_progress(task_id, f"重新标发正在执行：{operation}。", 55)
+            return True
+
+        workflow_store = ShipmentWorkflowStore(self._path(settings.queue_path))
+        playwright = context = None
+        try:
+            self._report_progress(task_id, "正在连接提交电脑的可见 Chrome。", 6)
+            playwright, context = await launch_context(args)
+            page = await get_first_page(context)
+            if "mpOrderManagement" not in page.url:
+                await page.goto(ORDER_MANAGEMENT_URL, wait_until="domcontentloaded")
+            await wait_for_order_page(
+                page,
+                int(getattr(args, "login_timeout_sec", 300)),
+                load_login_config(configuration_source_from_args(args)),
+                auto_login=True,
+                debug_dir=getattr(args, "debug_log_dir", "debug/logs"),
+            )
+            payload = dict(
+                await self.shipment_re_mark_func(
+                    page,
+                    workflow_store,
+                    cycle_id,
+                    lease_owner=task_id or confirmation.confirmation_id,
+                    confirm_func=confirmed_stage,
+                    runtime_guard_func=runtime_guard,
+                    progress_func=lambda message, percent: self._report_progress(
+                        task_id, message, percent
+                    ),
+                    run_id=task_id or confirmation.confirmation_id,
+                )
+            )
+            payload["desktop_confirmation_id"] = confirmation.confirmation_id
+            return self._result(payload, success_statuses={"completed"})
+        except ErpMarkManualReview as exc:
+            return TaskExecutionResult(
+                False,
+                str(exc),
+                {"status": "blocked", "re_mark_cycle_id": cycle_id},
+                blocked=True,
+            )
+        except (ErpMarkEmergencyStopped, ErpMarkUserAbort) as exc:
+            return TaskExecutionResult(
+                False,
+                str(exc),
+                {"status": "cancelled", "re_mark_cycle_id": cycle_id},
+                cancelled=True,
+            )
+        finally:
+            if context is not None:
+                try:
+                    await context.close()
+                except Exception:
+                    pass
+            if playwright is not None:
+                try:
+                    await playwright.stop()
+                except Exception:
+                    pass
 
     async def _mark_shipment(
         self,

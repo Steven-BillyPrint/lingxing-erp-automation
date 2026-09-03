@@ -16,6 +16,7 @@ from erp_automation.ui.qt import (
     _shipment_business_status,
     _shipment_checkpoint_label,
     _shipment_execution_eligibility,
+    _shipment_progress_label,
     _shipment_status_explanation,
     _shipment_status_timestamp,
 )
@@ -125,6 +126,38 @@ def test_ready_status_fails_closed_when_required_logistics_detail_is_missing():
 
     assert _shipment_business_status(row) == "物流信息需复核"
     assert _shipment_execution_eligibility(row) == (False, "物流信息需复核")
+
+
+def test_detected_waybill_change_is_prioritized_as_re_mark_not_ordinary_mark() -> None:
+    row = _ready_row(
+        erp_state="DONE",
+        checkpoint="OUTBOUNDED",
+        re_mark_cycle_id=41,
+        re_mark_state="DETECTED",
+        re_mark_old_waybill_no="WNBAA0494424973YQ",
+        re_mark_new_waybill_no="1LSD01R0018AGMD",
+        re_mark_new_tracking_no="ALS01915029156",
+    )
+
+    assert _shipment_business_status(row) == "重新标发"
+    assert _shipment_progress_label(row) == "待更新物流"
+    assert _shipment_execution_eligibility(row) == (False, "重新标发")
+    assert "WNBAA0494424973YQ → 1LSD01R0018AGMD" in _shipment_status_explanation(
+        row,
+        "重新标发",
+    )
+
+
+def test_mark_ui_confirmed_cycle_is_safely_resumable_until_locally_closed() -> None:
+    row = _ready_row(
+        erp_state="DONE",
+        checkpoint="OUTBOUNDED",
+        re_mark_cycle_id=41,
+        re_mark_state="MARK_UI_CONFIRMED",
+    )
+
+    assert _shipment_business_status(row) == "重新标发"
+    assert _shipment_progress_label(row) == "已提交重新标发"
 
 
 def test_customer_shipping_scan_issue_is_a_non_executable_queue_error():

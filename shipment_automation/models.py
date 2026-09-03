@@ -209,6 +209,12 @@ class ShipmentCandidate:
     sales_channel: str | None = None
     customer_email_required: bool | None = None
     has_main_image: bool = False
+    # Amazon's original item-line ownership evidence.  A completed shipment
+    # may only enter the re-mark workflow when at least one non-empty value is
+    # present; ASIN/image/customization evidence is deliberately not a gate.
+    platform_order_item_ids: tuple[str, ...] = ()
+    logistics_provider_name: str | None = None
+    logistics_type_name: str | None = None
     warnings: list[str] = field(default_factory=list)
 
 @dataclass
@@ -259,6 +265,69 @@ class ReadyToMarkItem:
     sales_platform_code: str = ""
     sales_platform_name: str = ""
     has_main_image: bool = False
+
+
+REMARK_DETECTED = "DETECTED"
+REMARK_WITHDRAW_INTENT = "WITHDRAW_UI_INTENT"
+REMARK_WITHDRAW_CONFIRMED = "WITHDRAW_UI_CONFIRMED"
+REMARK_CHANNEL_INTENT = "CHANNEL_API_INTENT"
+REMARK_CHANNEL_CONFIRMED = "CHANNEL_API_CONFIRMED"
+REMARK_AUDIT_INTENT = "AUDIT_API_INTENT"
+REMARK_AUDIT_CONFIRMED = "AUDIT_API_CONFIRMED"
+REMARK_TRACKING_INTENT = "TRACKING_API_INTENT"
+REMARK_TRACKING_CONFIRMED = "TRACKING_API_CONFIRMED"
+REMARK_OUTBOUND_INTENT = "OUTBOUND_API_INTENT"
+REMARK_OUTBOUND_CONFIRMED = "OUTBOUND_API_CONFIRMED"
+REMARK_MARK_WAITING = "MARK_UI_WAITING_UPDATEABLE"
+REMARK_MARK_INTENT = "MARK_UI_INTENT"
+REMARK_MARK_CONFIRMED = "MARK_UI_CONFIRMED"
+REMARK_COMPLETED = "COMPLETED"
+REMARK_MANUAL_REVIEW = "MANUAL_REVIEW"
+REMARK_CANCELLED = "CANCELLED"
+
+REMARK_ACTIVE_STATES = frozenset(
+    {
+        REMARK_DETECTED,
+        REMARK_WITHDRAW_INTENT,
+        REMARK_WITHDRAW_CONFIRMED,
+        REMARK_CHANNEL_INTENT,
+        REMARK_CHANNEL_CONFIRMED,
+        REMARK_AUDIT_INTENT,
+        REMARK_AUDIT_CONFIRMED,
+        REMARK_TRACKING_INTENT,
+        REMARK_TRACKING_CONFIRMED,
+        REMARK_OUTBOUND_INTENT,
+        REMARK_OUTBOUND_CONFIRMED,
+        REMARK_MARK_WAITING,
+        REMARK_MARK_INTENT,
+        REMARK_MARK_CONFIRMED,
+        REMARK_MANUAL_REVIEW,
+    }
+)
+
+
+@dataclass(frozen=True)
+class ReMarkCycle:
+    id: int
+    job_id: int
+    revision_no: int
+    state: str
+    checkpoint: str
+    system_order_no: str
+    platform_order_no: str
+    logistics_no: str
+    old_carrier: str = ""
+    old_waybill_no: str = ""
+    old_tracking_no: str = ""
+    new_carrier: str = ""
+    new_service_line: str = ""
+    new_waybill_no: str = ""
+    new_tracking_no: str = ""
+    new_freight: str = ""
+    new_currency: str = ""
+    new_fee_weight_g: str = ""
+    wo_number: str = ""
+    last_error: str = ""
 
 
 @dataclass(frozen=True)
@@ -365,6 +434,11 @@ class LogisticsWorkerReport:
     aborted_count: int = 0
     parser_artifact_requeued_count: int = 0
     tracking_rule_requeued_count: int = 0
+    completed_refresh_target_count: int = 0
+    completed_refresh_checked_count: int = 0
+    completed_refresh_changed_count: int = 0
+    completed_refresh_unchanged_count: int = 0
+    completed_refresh_failed_count: int = 0
     query_results: list[LogisticsQueryResult] = field(default_factory=list)
     ready_to_mark_items: list[ReadyToMarkItem] = field(default_factory=list)
     skipped_query_records: list[QueueStatusRecord] = field(default_factory=list)

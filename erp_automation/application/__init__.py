@@ -57,6 +57,11 @@ from .api_erp_mark import (
     OutboundStrategy,
     routes_from_configuration,
 )
+from .shipment_re_mark import (
+    ManagedShipmentReMarkFunc,
+    ShipmentReMarkResult,
+    ShipmentReMarkWorkflow,
+)
 
 __all__ = [
     "ApiPageTrace",
@@ -82,6 +87,7 @@ __all__ = [
     "LingxingCustomOrderApiOperations",
     "LookupRecord",
     "ManagedApiErpMarkFunc",
+    "ManagedShipmentReMarkFunc",
     "ManualReviewRequired",
     "MutationResult",
     "MutationState",
@@ -97,6 +103,8 @@ __all__ = [
     "RollbackManager",
     "SCRIPT_BASELINE_BRANCH",
     "ShipmentApiScanResult",
+    "ShipmentReMarkResult",
+    "ShipmentReMarkWorkflow",
     "TaskExecutionResult",
     "build_capability_router",
     "VerificationHook",

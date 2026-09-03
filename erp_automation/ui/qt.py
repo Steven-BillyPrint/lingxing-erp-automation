@@ -553,6 +553,10 @@ def _queue_row_matches_search(row: object, field: str, query: str) -> bool:
 
 _SHIPMENT_STATUS_LABELS = (
     "扫描错误",
+    "重新标发",
+    "重新标发处理中",
+    "重新标发需人工复核",
+    "重新标发完成",
     "物流逾期异常",
     "待查询物流",
     "等待物流就绪",
@@ -598,8 +602,30 @@ _SHIPMENT_CHECKPOINT_LABELS = {
     "LOGISTICS_SAVED": "已保存物流单号",
     "OUTBOUNDED": "已出库完成",
 }
+_RE_MARK_PROGRESS_LABELS = {
+    "DETECTED": "待更新物流",
+    "WITHDRAW_UI_INTENT": "正在撤销发货",
+    "WITHDRAW_UI_CONFIRMED": "已撤销回待审核",
+    "CHANNEL_API_INTENT": "正在设置新物流渠道",
+    "CHANNEL_API_CONFIRMED": "已设置新物流渠道",
+    "AUDIT_API_INTENT": "正在重新审核",
+    "AUDIT_API_CONFIRMED": "已重新审核",
+    "TRACKING_API_INTENT": "正在写入新物流",
+    "TRACKING_API_CONFIRMED": "已写入新物流",
+    "OUTBOUND_API_INTENT": "正在重新出库",
+    "OUTBOUND_API_CONFIRMED": "已重新出库",
+    "MARK_UI_WAITING_UPDATEABLE": "等待可更新",
+    "MARK_UI_INTENT": "正在提交重新标发",
+    "MARK_UI_CONFIRMED": "已提交重新标发",
+    "COMPLETED": "重新标发完成",
+    "MANUAL_REVIEW": "等待人工复核",
+}
 _SHIPMENT_STATUS_PRIORITY = {
     "扫描错误": -1,
+    "重新标发": -2,
+    "重新标发处理中": -1,
+    "重新标发需人工复核": 6,
+    "重新标发完成": 7,
     "可标发": 0,
     "可继续标发": 0,
     "等待标发": 1,
@@ -669,6 +695,8 @@ def _shipment_status_timestamp(row: ShipmentRow) -> str:
             or row.updated_at
             or row.last_scanned_at
         )
+    if str(row.re_mark_state or "").strip():
+        return row.re_mark_updated_at or row.updated_at
     identity = str(row.identity_state or "").strip().upper()
     logistics = str(row.logistics_state or "").strip().upper()
     erp = str(row.erp_state or "").strip().upper()
@@ -738,6 +766,7 @@ def _email_error_label(value: object) -> str:
 def _shipment_error_messages(row: ShipmentRow) -> tuple[str, ...]:
     messages: list[str] = []
     for prefix, value in (
+        ("重新标发", row.re_mark_last_error),
         ("ERP", row.erp_last_error),
         ("物流", row.logistics_last_error),
         ("邮件", _email_error_label(row.email_last_error)),
@@ -774,6 +803,13 @@ def _shipment_checkpoint_label(value: object) -> str:
     return _SHIPMENT_CHECKPOINT_LABELS.get(raw, raw or "尚未开始")
 
 
+def _shipment_progress_label(row: ShipmentRow) -> str:
+    re_mark_state = str(row.re_mark_state or "").strip().upper()
+    if re_mark_state and re_mark_state != "CANCELLED":
+        return _RE_MARK_PROGRESS_LABELS.get(re_mark_state, re_mark_state)
+    return _shipment_checkpoint_label(row.checkpoint)
+
+
 def _shipment_business_status(row: ShipmentRow, *, now: datetime | None = None) -> str:
     if str(row.scan_issue_code or "").strip():
         scan_state = str(row.scan_issue_state or "ACTIVE").strip().upper()
@@ -784,6 +820,15 @@ def _shipment_business_status(row: ShipmentRow, *, now: datetime | None = None) 
         if scan_state == "MANUALLY_CANCELLED":
             return "已取消"
         return "扫描错误"
+    re_mark_state = str(row.re_mark_state or "").strip().upper()
+    if re_mark_state == "DETECTED":
+        return "重新标发"
+    if re_mark_state == "MANUAL_REVIEW":
+        return "重新标发需人工复核"
+    if re_mark_state == "COMPLETED":
+        return "重新标发完成"
+    if re_mark_state and re_mark_state != "CANCELLED":
+        return "重新标发"
     identity = str(row.identity_state or "").strip().upper()
     logistics = str(row.logistics_state or "").strip().upper()
     erp = str(row.erp_state or "").strip().upper()
@@ -882,6 +927,23 @@ def _shipment_status_explanation(row: ShipmentRow, status: str) -> str:
             return original_error
         reason_text = f"；原因：{reason}" if reason else ""
         return f"{prefix}{reason_text}；原扫描错误：{original_error}"
+    if status == "重新标发":
+        state = str(row.re_mark_state or "").strip().upper()
+        if state and state != "DETECTED":
+            return (
+                f"重新标发周期可从“{_shipment_progress_label(row)}”安全续作；"
+                "所有已记录写入意图都会先读回，无法证明结果时转人工复核。"
+            )
+        return (
+            f"检测到国际运单号更新：{row.re_mark_old_waybill_no or '-'} → "
+            f"{row.re_mark_new_waybill_no or '-'}；可执行“更新物流单号”。"
+        )
+    if status == "重新标发完成":
+        return "新物流已重新出库并完成订单标发；原客户发货通知不会重复发送。"
+    if status == "重新标发处理中":
+        return "正在按系统单号执行撤销、OpenAPI 重设物流、重新出库和可更新标发。"
+    if status == "重新标发需人工复核":
+        return row.re_mark_last_error or "重新标发写入结果不明确，需要人工核对。"
     if status == "已完成":
         if str(row.completion_source or "").strip().upper() == "MANUAL_DETECTED":
             return "已检测到领星订单在外部完成出库，自动标发任务已结案。"
@@ -5687,6 +5749,13 @@ if PYSIDE6_AVAILABLE:
 
             self.more_actions_button = QPushButton("更多批量操作")
             self.more_actions_menu = QMenu(self.more_actions_button)
+            self.update_tracking_numbers_action = self.more_actions_menu.addAction(
+                "更新物流单号"
+            )
+            self.update_tracking_numbers_action.triggered.connect(
+                lambda _checked=False: self._update_selected_tracking_numbers()
+            )
+            self.more_actions_menu.addSeparator()
             self.edit_tracking_action = self.more_actions_menu.addAction(
                 "修改物流单号和承运商"
             )
@@ -6033,6 +6102,157 @@ if PYSIDE6_AVAILABLE:
                 else:
                     skipped.append((row, reason))
             self._review_and_submit_shipment_rows(eligible_rows, skipped=skipped)
+
+        def _update_selected_tracking_numbers(self) -> None:
+            rows = self._checked_shipment_rows()
+            if not rows:
+                self._result_handler(ControlResult(False, "请先勾选至少一条重新标发订单。"))
+                return
+            invalid = [
+                row
+                for row in rows
+                if row.scan_issue_code
+                or _shipment_business_status(row) != "重新标发"
+                or int(row.re_mark_cycle_id or 0) <= 0
+            ]
+            if invalid:
+                self._result_handler(
+                    ControlResult(
+                        False,
+                        "“更新物流单号”只能处理状态为“重新标发”且具有有效周期的订单。",
+                    )
+                )
+                return
+            preview = "\n".join(
+                (
+                    f"• 系统单号 {row.system_order_no}（平台 {row.platform_order_no}）\n"
+                    f"  运单：{row.re_mark_old_waybill_no or '-'} → "
+                    f"{row.re_mark_new_waybill_no or '-'}；"
+                    f"ALS：{row.re_mark_new_tracking_no or row.logistics_no or '-'}；"
+                    f"承运商：{row.re_mark_new_carrier or '-'}；"
+                    f"运费：{row.re_mark_new_currency or '-'} "
+                    f"{row.re_mark_new_freight or '-'}；"
+                    f"计费重量：{row.re_mark_new_fee_weight_g or '-'} g"
+                )
+                for row in rows[:10]
+            )
+            if len(rows) > 10:
+                preview += f"\n• ……另有 {len(rows) - 10} 张"
+            answer = QMessageBox.question(
+                self,
+                "确认更新物流单号并重新标发",
+                (
+                    f"系统将按勾选顺序依次处理 {len(rows)} 张订单：\n\n{preview}\n\n"
+                    "每张订单都会在领星已发货页明确切换为“系统单号”搜索，"
+                    "撤销回待审核；随后仅通过领星 OpenAPI 重设物流渠道、"
+                    "新运单号、ALS、运费和重量并重新出库；最后在订单标发的"
+                    "“可更新”页再次按系统单号搜索并提交标发。点击“我知道了”后，"
+                    "系统只读取一次目标行“系统标发单号”；已变为新运单号即结束，"
+                    "不等待“标发中”转为“已完成”。\n\n"
+                    "此操作会改变领星订单/库存状态并向 Amazon 更新履约信息；"
+                    "不会调用 SP-API，也不会重复发送原客户发货通知。是否继续？"
+                ),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            self._submit_re_mark_rows(rows)
+
+        def _submit_re_mark_rows(self, rows: Sequence[ShipmentRow]) -> None:
+            batch_id = uuid4().hex
+            self._submission_in_progress = True
+            self._optimistic_waiting_logistics_nos.update(
+                row.logistics_no for row in rows if row.logistics_no
+            )
+            self._apply_search_filter()
+
+            def submit() -> ControlResult:
+                commands: list[TaskCommand] = []
+                for position, row in enumerate(rows, start=1):
+                    confirmation = DesktopWriteConfirmation.create(
+                        DesktopWriteAction.EXECUTE_SHIPMENT_REMARK,
+                        row.platform_order_no,
+                        system_order_no=row.system_order_no,
+                        logistics_no=row.logistics_no,
+                        source="qt_checked_action",
+                    )
+                    commands.append(
+                        TaskCommand(
+                            name=f"更新物流单号并重新标发：{row.system_order_no}",
+                            area=TaskArea.SHIPMENT,
+                            capability=Capability.REMARK_SHIPMENT,
+                            order_no=row.platform_order_no,
+                            payload={
+                                "system_order_no": row.system_order_no,
+                                "logistics_no": row.logistics_no,
+                                "re_mark_cycle_id": int(row.re_mark_cycle_id),
+                                "shipment_batch_id": batch_id,
+                                "shipment_batch_position": position,
+                                DESKTOP_CONFIRMATION_PAYLOAD_KEY: confirmation.to_payload(),
+                            },
+                        )
+                    )
+                results = _submit_task_commands(self._controller, commands)
+                submitted: list[ShipmentRow] = []
+                task_ids: list[str] = []
+                task_ids_by_logistics: dict[str, str] = {}
+                rejected: list[tuple[ShipmentRow, str]] = []
+                unknown: list[tuple[ShipmentRow, str]] = []
+                for row, result in zip(rows, results):
+                    if result.accepted:
+                        submitted.append(row)
+                        if result.task_id:
+                            task_ids.append(result.task_id)
+                            task_ids_by_logistics[row.logistics_no] = result.task_id
+                    elif bool(result.details.get("submission_outcome_unknown")):
+                        unknown.append((row, result.message))
+                    else:
+                        rejected.append((row, result.message))
+                messages = [f"已按串行浏览器通道排队 {len(submitted)} 张重新标发订单。"]
+                if rejected:
+                    messages.append(
+                        "提交失败："
+                        + "；".join(
+                            f"{row.system_order_no}（{reason}）"
+                            for row, reason in rejected[:5]
+                        )
+                    )
+                if unknown:
+                    messages.append(
+                        f"另有 {len(unknown)} 张请求等待服务器确认，请勿重复提交。"
+                    )
+                return ControlResult(
+                    bool(submitted),
+                    " ".join(messages),
+                    details={
+                        "non_modal": True,
+                        "shipment_batch_id": batch_id,
+                        "submitted_logistics_nos": tuple(
+                            row.logistics_no for row in submitted
+                        ),
+                        "submitted_task_ids": tuple(task_ids),
+                        "submitted_task_ids_by_logistics_no": tuple(
+                            task_ids_by_logistics.items()
+                        ),
+                        "unconfirmed_logistics_nos": tuple(
+                            row.logistics_no for row, _reason in unknown
+                        ),
+                        "submission_outcome_unknown": bool(unknown),
+                    },
+                )
+
+            if getattr(self._controller, "snapshot_runs_in_background", False):
+                self.execute_button.setEnabled(False)
+                self.execute_button.setText(f"正在提交 {len(rows)} 张…")
+                self._update_selection_summary()
+                thread = _ControlResultThread(submit, self)
+                thread.result_ready.connect(self._finish_shipment_submission)
+                thread.finished.connect(thread.deleteLater)
+                self._submission_thread = thread
+                thread.start()
+                return
+            self._finish_shipment_submission(submit())
 
         def _review_and_submit_shipment_rows(
             self,
@@ -6405,6 +6625,12 @@ if PYSIDE6_AVAILABLE:
                 )[0]
                 for row in selected_queue_rows
             )
+            all_selected_queue_rows_re_markable = bool(selected_queue_rows) and all(
+                _shipment_business_status(row) == "重新标发"
+                and int(row.re_mark_cycle_id or 0) > 0
+                and row.logistics_no not in active_logistics_nos
+                for row in selected_queue_rows
+            )
             self.execute_button.setEnabled(
                 all_selected_queue_rows_executable
                 and not has_scan_issues
@@ -6419,6 +6645,12 @@ if PYSIDE6_AVAILABLE:
             )
             self.edit_tracking_action.setEnabled(
                 selected_queue_count == 1
+                and not has_scan_issues
+                and not self._submission_in_progress
+                and not self._server_page_navigation_loading
+            )
+            self.update_tracking_numbers_action.setEnabled(
+                all_selected_queue_rows_re_markable
                 and not has_scan_issues
                 and not self._submission_in_progress
                 and not self._server_page_navigation_loading
@@ -6695,7 +6927,11 @@ if PYSIDE6_AVAILABLE:
 
             def shipment_sort_key(row: ShipmentRow) -> tuple[object, ...]:
                 status = self._display_business_status(row)
-                if status == "标发处理中":
+                if status == "重新标发":
+                    work_bucket = -1
+                elif status == "重新标发处理中":
+                    work_bucket = 0
+                elif status == "标发处理中":
                     work_bucket = 0
                 elif status == "等待标发":
                     work_bucket = 1
@@ -7219,7 +7455,7 @@ if PYSIDE6_AVAILABLE:
                         row.international_tracking_no or "-",
                         row.carrier or "-",
                         business_status,
-                        _shipment_checkpoint_label(row.checkpoint),
+                        _shipment_progress_label(row),
                         _format_status_timestamp(_shipment_status_timestamp(row)),
                         _format_status_timestamp(row.logistics_last_checked_at),
                         self._display_status_explanation(row, business_status),
@@ -7240,6 +7476,10 @@ if PYSIDE6_AVAILABLE:
                         )
                         if column == 7:
                             color = {
+                                "重新标发": "#B54708",
+                                "重新标发处理中": "#1D4ED8",
+                                "重新标发需人工复核": "#B42318",
+                                "重新标发完成": "#047857",
                                 "可标发": "#047857",
                                 "可继续标发": "#047857",
                                 "等待标发": "#1D4ED8",
@@ -7255,7 +7495,10 @@ if PYSIDE6_AVAILABLE:
                             }.get(business_status, "#475467")
                             item.setForeground(QColor(color))
                             font = item.font()
-                            font.setBold(business_status in {"可标发", "可继续标发"})
+                            font.setBold(
+                                business_status
+                                in {"重新标发", "可标发", "可继续标发"}
+                            )
                             item.setFont(font)
                         elif column == 12:
                             has_overdue_history = bool(
@@ -7310,6 +7553,10 @@ if PYSIDE6_AVAILABLE:
                     status_item.setForeground(
                         QColor(
                             {
+                                "重新标发": "#B54708",
+                                "重新标发处理中": "#1D4ED8",
+                                "重新标发需人工复核": "#B42318",
+                                "重新标发完成": "#047857",
                                 "可标发": "#047857",
                                 "可继续标发": "#047857",
                                 "等待标发": "#1D4ED8",
@@ -7353,7 +7600,7 @@ if PYSIDE6_AVAILABLE:
 
         def _display_business_status(self, row: ShipmentRow) -> str:
             persisted_status = _shipment_business_status(row)
-            if persisted_status == "已完成":
+            if persisted_status in {"已完成", "重新标发完成"}:
                 return persisted_status
             active_tasks = self._active_tasks_by_logistics_no.get(
                 row.logistics_no,
@@ -7361,14 +7608,24 @@ if PYSIDE6_AVAILABLE:
             )
             if active_tasks:
                 active_task = max(active_tasks, key=lambda task: task.updated_at)
+                if str(row.re_mark_state or "").strip().upper() not in {
+                    "",
+                    "CANCELLED",
+                    "COMPLETED",
+                }:
+                    return "重新标发处理中"
                 if active_task.status is TaskStatus.QUEUED:
                     return "等待标发"
                 if active_task.status is TaskStatus.WAITING_USER:
                     return "等待用户确认"
                 return "标发处理中"
             if row.logistics_no in self._active_logistics_nos:
+                if persisted_status.startswith("重新标发"):
+                    return "重新标发处理中"
                 return "等待标发"
             if row.logistics_no in self._optimistic_waiting_logistics_nos:
+                if persisted_status.startswith("重新标发"):
+                    return "重新标发处理中"
                 return "等待标发"
             return persisted_status
 
@@ -7377,7 +7634,7 @@ if PYSIDE6_AVAILABLE:
             row: ShipmentRow,
             business_status: str,
         ) -> str:
-            if business_status == "已完成":
+            if business_status in {"已完成", "重新标发完成"}:
                 return _shipment_status_explanation(row, business_status)
             active_tasks = self._active_tasks_by_logistics_no.get(
                 row.logistics_no,
@@ -7420,6 +7677,7 @@ if PYSIDE6_AVAILABLE:
                     task.capability
                     in {
                         Capability.OUTBOUND_ORDER,
+                        Capability.REMARK_SHIPMENT,
                         Capability.ALIBABA_LOGISTICS,
                     }
                     or (
@@ -7436,7 +7694,8 @@ if PYSIDE6_AVAILABLE:
                 str(task.payload.get("logistics_no") or "").strip()
                 for task in snapshot.tasks
                 if task.area is TaskArea.SHIPMENT
-                and task.capability is Capability.OUTBOUND_ORDER
+                and task.capability
+                in {Capability.OUTBOUND_ORDER, Capability.REMARK_SHIPMENT}
                 and not task.status.terminal
                 and str(task.payload.get("logistics_no") or "").strip()
             }
@@ -7452,7 +7711,8 @@ if PYSIDE6_AVAILABLE:
                 logistics_no = str(task.payload.get("logistics_no") or "").strip()
                 if (
                     task.area is TaskArea.SHIPMENT
-                    and task.capability is Capability.OUTBOUND_ORDER
+                    and task.capability
+                    in {Capability.OUTBOUND_ORDER, Capability.REMARK_SHIPMENT}
                     and not task.status.terminal
                     and logistics_no
                 ):
@@ -13229,7 +13489,8 @@ if PYSIDE6_AVAILABLE:
                 task
                 for task in local_tasks
                 if task.area is TaskArea.SHIPMENT
-                and task.capability is Capability.OUTBOUND_ORDER
+                and task.capability
+                in {Capability.OUTBOUND_ORDER, Capability.REMARK_SHIPMENT}
             ]
             tasks_by_id = {task.task_id: task for task in shipment_tasks}
             discovered_batches: dict[str, list[TaskRecord]] = {}

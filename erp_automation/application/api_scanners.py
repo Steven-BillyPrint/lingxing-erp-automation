@@ -3423,6 +3423,12 @@ def _normalize_order(
     remark_present, remark_value = _lookup((payload,), _CUSTOMER_REMARK_ALIASES)
     status_present, status_value = _lookup(mappings, _STATUS_ALIASES)
     logistics_present, logistics_value = _lookup(mappings, _LOGISTICS_ALIASES)
+    _, logistics_provider_value = _lookup(
+        (payload,), _LOGISTICS_PROVIDER_ALIASES
+    )
+    _, logistics_type_name_value = _lookup(
+        (payload,), _LOGISTICS_TYPE_NAME_ALIASES
+    )
     customer_shipping_service_present, customer_shipping_service_value = (
         _lookup_documented_customer_shipping_list(mappings)
     )
@@ -3448,6 +3454,8 @@ def _normalize_order(
             value for value in (status_text, BUYER_CANCEL_REQUEST_TEXT) if value
         )
     logistics = _structured_text(logistics_value)
+    logistics_provider_name = _optional_text(logistics_provider_value) or ""
+    logistics_type_name = _optional_text(logistics_type_name_value) or ""
     customer_shipping_service = _structured_text(customer_shipping_service_value)
     (
         estimated_actual_weight_raw,
@@ -3497,6 +3505,7 @@ def _normalize_order(
     all_asins: list[str] = []
     audit_items: list[dict[str, Any]] = []
     item_platform_order_nos: list[str] = []
+    platform_order_item_ids: list[str] = []
     has_main_image = False
     for raw_item in item_mappings:
         item_only_tree = _mapping_tree(dict(raw_item))
@@ -3515,6 +3524,7 @@ def _normalize_order(
                 _PREFERRED_ASIN_ALIASES,
             )
         _, sku_value = _lookup(item_tree, _SKU_ALIASES)
+        _, order_item_id_value = _lookup(item_only_tree, _ORDER_ITEM_ID_ALIASES)
         _, quantity_value = _lookup(item_tree, _QUANTITY_ALIASES)
         revenue_present, revenue_value = _lookup(item_only_tree, _SALES_REVENUE_ALIASES)
         item_currency_present, item_currency_value = _lookup(
@@ -3529,6 +3539,9 @@ def _normalize_order(
         )
         asin = _optional_text(asin_value) or ""
         sku = _optional_text(sku_value) or ""
+        order_item_id = _optional_text(order_item_id_value) or ""
+        if order_item_id and order_item_id not in platform_order_item_ids:
+            platform_order_item_ids.append(order_item_id)
         item_has_main_image = _item_has_main_image(raw_item)
         has_main_image = has_main_image or item_has_main_image
         item_platform_order_no = _optional_text(item_platform_value) or platform_order_no
@@ -3621,6 +3634,7 @@ def _normalize_order(
                     estimated_package_dimensions_status
                 ),
                 "has_main_image": item_has_main_image,
+                "order_item_id": order_item_id,
             }
         )
         row_text = _safe_business_row_text(
@@ -3711,6 +3725,7 @@ def _normalize_order(
         "customization_tag_text": customization_tag_text,
         "audit_items": audit_items,
         "has_main_image": has_main_image,
+        "platform_order_item_ids": tuple(platform_order_item_ids),
         "customer_remark": customer_remark,
         "customer_shipping_service": customer_shipping_service,
         "receiver_name": _optional_text(receiver_name_value) or "",
@@ -3722,6 +3737,8 @@ def _normalize_order(
         "site_name": _optional_text(site_name_value) or "",
         "paid_at_text": paid_at_text,
         "logistics": logistics,
+        "logistics_provider_name": logistics_provider_name,
+        "logistics_type_name": logistics_type_name,
         "source_page": source_page,
         "source_scroll_top": 0,
         "_source_order_index": source_order_index,
@@ -3754,6 +3771,40 @@ def receiver_email_from_payload(payload: Mapping[str, Any]) -> str | None:
 
     _, value = _lookup(_mapping_tree(payload), _RECEIVER_EMAIL_ALIASES)
     return _optional_text(value)
+
+
+def completed_re_mark_evidence_from_payload(
+    payload: Mapping[str, Any],
+    *,
+    system_order_no: str,
+    platform_order_no: str,
+) -> dict[str, Any]:
+    """Extract the exact three re-mark eligibility facts from order detail."""
+
+    _custom, shipment, _presence = _normalize_order(
+        OrderRecord(
+            str(system_order_no or "").strip(),
+            str(platform_order_no or "").strip(),
+            dict(payload),
+        ),
+        source_page=1,
+        source_order_index=0,
+    )
+    return {
+        "sales_platform_code": str(shipment.get("sales_platform_code") or "").strip(),
+        "sales_platform_name": str(shipment.get("sales_platform_name") or "").strip(),
+        "platform_order_item_ids": tuple(
+            str(value or "").strip()
+            for value in (shipment.get("platform_order_item_ids") or ())
+            if str(value or "").strip()
+        ),
+        "logistics_provider_name": str(
+            shipment.get("logistics_provider_name") or ""
+        ).strip(),
+        "logistics_type_name": str(
+            shipment.get("logistics_type_name") or ""
+        ).strip(),
+    }
 
 
 def receiver_phone_from_payload(payload: Mapping[str, Any]) -> str | None:
@@ -4677,6 +4728,18 @@ _LOGISTICS_ALIASES = (
     "logistics_type_name",
     "logisticsTypeName",
 )
+_LOGISTICS_PROVIDER_ALIASES = (
+    "logistics_provider_name",
+    "logisticsProviderName",
+    "provider_name",
+    "providerName",
+)
+_LOGISTICS_TYPE_NAME_ALIASES = (
+    "logistics_type_name",
+    "logisticsTypeName",
+    "logistics_name",
+    "logisticsName",
+)
 _ITEM_LIST_ALIASES = (
     "order_item",
     "orderItem",
@@ -4689,6 +4752,14 @@ _ITEM_LIST_ALIASES = (
     "items",
     "item_info",
     "itemInfo",
+)
+_ORDER_ITEM_ID_ALIASES = (
+    "order_item_no",
+    "orderItemNo",
+    "order_item_id",
+    "orderItemId",
+    "platform_order_item_id",
+    "platformOrderItemId",
 )
 _PLATFORM_INFO_LIST_ALIASES = (
     "platform_info",

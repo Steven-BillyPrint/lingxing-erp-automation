@@ -12,7 +12,10 @@ from typing import Any
 
 import pytest
 
-from erp_automation.application.desktop_tasks import DesktopTaskRunner
+from erp_automation.application.desktop_tasks import (
+    DesktopTaskRunner,
+    TaskExecutionResult,
+)
 from erp_automation.application.capabilities import CapabilityUnavailable
 from erp_automation.application.lingxing_gateway import ResolvedOrderDetail
 from erp_automation.persistence import (
@@ -2752,6 +2755,75 @@ def test_erp_routine_stage_uses_checked_action_without_opening_interaction(
     assert result.succeeded is True
     assert len(result.payload["desktop_auto_approved_prompt_hashes"]) == 1
     assert result.payload["desktop_user_confirmed_prompt_hashes"] == []
+
+
+def test_re_mark_command_consumes_exact_checked_action_confirmation(tmp_path) -> None:
+    settings = _settings(tmp_path)
+    observed: dict[str, Any] = {}
+    confirmation = DesktopWriteConfirmation.create(
+        DesktopWriteAction.EXECUTE_SHIPMENT_REMARK,
+        PLATFORM_ORDER_NO,
+        system_order_no=SYSTEM_ORDER_NO,
+        logistics_no="ALS01915029156",
+        source="qt_checked_action",
+    )
+    runner = DesktopTaskRunner(
+        tmp_path,
+        settings_provider=lambda: settings,
+        configuration_provider=lambda: {},
+        shipment_re_mark_func=lambda *_args, **_kwargs: pytest.fail(
+            "命令分派测试不应启动真实重新标发流程"
+        ),
+    )
+
+    async def fake_re_mark(
+        cycle_id,
+        received_settings,
+        received_confirmation,
+        *,
+        task_id,
+        browser_endpoint,
+    ):
+        observed.update(
+            {
+                "cycle_id": cycle_id,
+                "settings": received_settings,
+                "confirmation": received_confirmation,
+                "task_id": task_id,
+                "browser_endpoint": browser_endpoint,
+            }
+        )
+        return TaskExecutionResult(
+            True,
+            "重新标发完成",
+            {"status": "completed"},
+        )
+
+    runner._re_mark_shipment = fake_re_mark
+    command = TaskCommand(
+        "更新物流单号并重新标发",
+        TaskArea.SHIPMENT,
+        Capability.REMARK_SHIPMENT,
+        order_no=PLATFORM_ORDER_NO,
+        payload={
+            "system_order_no": SYSTEM_ORDER_NO,
+            "logistics_no": "ALS01915029156",
+            "re_mark_cycle_id": 41,
+            DESKTOP_CONFIRMATION_PAYLOAD_KEY: confirmation.to_payload(),
+        },
+        execution_id="remark-task-1",
+    )
+
+    result = runner(command)
+
+    assert result.succeeded is True
+    assert observed == {
+        "cycle_id": 41,
+        "settings": settings,
+        "confirmation": confirmation,
+        "task_id": "remark-task-1",
+        "browser_endpoint": "",
+    }
 
 
 @pytest.mark.parametrize(

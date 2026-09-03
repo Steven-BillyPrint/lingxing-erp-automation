@@ -24,6 +24,7 @@ from .alibaba_logistics import (
     is_cancelled_logistics_status,
     is_tracking_number_mismatch_reason,
     is_obvious_tracking_parser_artifact,
+    logistics_readiness_decision,
     normalize_carrier_name,
     normalize_tracking_number,
     tracking_number_matches_carrier,
@@ -72,6 +73,13 @@ from .models import (
     QueueEvent,
     QueueStatusRecord,
     ReadyToMarkItem,
+    REMARK_ACTIVE_STATES,
+    REMARK_CANCELLED,
+    REMARK_COMPLETED,
+    REMARK_DETECTED,
+    REMARK_MARK_CONFIRMED,
+    REMARK_MANUAL_REVIEW,
+    ReMarkCycle,
     SALES_CHANNEL_INDEPENDENT_SITE,
     SALES_CHANNEL_MARKETPLACE,
     ShipmentCandidate,
@@ -82,9 +90,14 @@ from .models import (
     shipment_tracking_attention_notice,
     shipment_tracking_deadline,
 )
+from .re_mark_domain import (
+    completed_re_mark_eligibility,
+    completed_refresh_snapshot,
+)
 
 
-SCHEMA_VERSION = 22
+SCHEMA_VERSION = 23
+COMPLETED_REFRESH_WINDOW_DAYS = 15
 CUSTOMER_SHIPPING_SERVICE_SCAN_ISSUE = "customer_shipping_service_unavailable"
 SCAN_ISSUE_KEY_PREFIX = "scan-issue:"
 SCAN_ISSUE_ACTIVE = "ACTIVE"
@@ -348,6 +361,7 @@ class ShipmentWorkflowStore:
         needs_v20_migration = False
         needs_v21_migration = False
         needs_v22_migration = False
+        needs_v23_migration = False
         if self.path.exists():
             with self.connect() as conn:
                 names = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
@@ -529,6 +543,27 @@ class ShipmentWorkflowStore:
                         }.issubset(job_columns)
                         or "policy_block_code" not in erp_columns
                     )
+                    needs_v23_migration = (
+                        current_version < 23
+                        or not {
+                            "platform_order_item_ids_json",
+                            "logistics_provider_name",
+                            "logistics_type_name",
+                        }.issubset(job_columns)
+                        or not {
+                            "completed_refresh_checked_at",
+                            "completed_refresh_next_at",
+                            "completed_refresh_last_error",
+                            "completed_refresh_snapshot_hash",
+                        }.issubset(logistics_columns)
+                        or "shipment_re_mark_cycles" not in names
+                        or (
+                            "shipment_re_mark_cycles" in names
+                            and "new_service_line" not in self._table_columns(
+                                conn, "shipment_re_mark_cycles"
+                            )
+                        )
+                    )
         if needs_v1_backup:
             self._backup_before_v2()
         elif needs_v3_migration:
@@ -571,6 +606,8 @@ class ShipmentWorkflowStore:
             self._backup_before_v21()
         elif needs_v22_migration:
             self._backup_before_v22()
+        elif needs_v23_migration:
+            self._backup_before_v23()
         with self.connect() as conn:
             conn.execute("PRAGMA journal_mode = WAL")
             try:
@@ -605,6 +642,7 @@ class ShipmentWorkflowStore:
                 # V20 reconciliation reads the aggregate projection, which
                 # includes the V22 structured policy column.
                 self._migrate_to_v22(conn)
+                self._migrate_to_v23(conn)
                 self._migrate_to_v20(conn)
                 self._migrate_to_v21(conn)
                 from .notification_store import initialize_notification_schema
@@ -833,6 +871,9 @@ class ShipmentWorkflowStore:
     def _backup_before_v22(self) -> Path:
         return self._backup_before_version("v22")
 
+    def _backup_before_v23(self) -> Path:
+        return self._backup_before_version("v23")
+
     def _backup_before_version(self, version: str) -> Path:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         backup_path = self.path.with_name(f"{self.path.stem}.pre_{version}_{stamp}{self.path.suffix}")
@@ -885,6 +926,9 @@ class ShipmentWorkflowStore:
                 sales_platform_code TEXT NOT NULL DEFAULT '',
                 sales_platform_name TEXT NOT NULL DEFAULT '',
                 has_main_image INTEGER NOT NULL DEFAULT 0,
+                platform_order_item_ids_json TEXT NOT NULL DEFAULT '[]',
+                logistics_provider_name TEXT NOT NULL DEFAULT '',
+                logistics_type_name TEXT NOT NULL DEFAULT '',
                 sales_channel TEXT NOT NULL DEFAULT 'MARKETPLACE',
                 customer_email_required INTEGER NOT NULL DEFAULT 1,
                 identity_state TEXT NOT NULL DEFAULT 'ACTIVE',
@@ -957,6 +1001,10 @@ class ShipmentWorkflowStore:
                 tracking_override_reason TEXT,
                 tracking_mismatch_action TEXT,
                 tracking_mismatch_reviewed_at TEXT,
+                completed_refresh_checked_at TEXT,
+                completed_refresh_next_at TEXT,
+                completed_refresh_last_error TEXT,
+                completed_refresh_snapshot_hash TEXT,
                 last_checked_at TEXT,
                 next_attempt_at TEXT,
                 attempt_count INTEGER NOT NULL DEFAULT 0,
@@ -1040,6 +1088,48 @@ class ShipmentWorkflowStore:
             );
             CREATE INDEX IF NOT EXISTS idx_shipment_events_job ON shipment_events(job_id, id);
             CREATE INDEX IF NOT EXISTS idx_shipment_events_batch ON shipment_events(batch_id, id);
+
+            CREATE TABLE IF NOT EXISTS shipment_re_mark_cycles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id INTEGER NOT NULL REFERENCES shipment_jobs(id) ON DELETE CASCADE,
+                revision_no INTEGER NOT NULL,
+                source_snapshot_hash TEXT NOT NULL,
+                state TEXT NOT NULL,
+                checkpoint TEXT NOT NULL,
+                system_order_no TEXT NOT NULL,
+                platform_order_no TEXT NOT NULL,
+                logistics_no TEXT NOT NULL,
+                wo_number TEXT,
+                old_carrier TEXT,
+                old_waybill_no TEXT,
+                old_tracking_no TEXT,
+                old_freight TEXT,
+                old_currency TEXT,
+                old_fee_weight_g TEXT,
+                new_carrier TEXT NOT NULL,
+                new_service_line TEXT NOT NULL DEFAULT '',
+                new_waybill_no TEXT NOT NULL,
+                new_tracking_no TEXT NOT NULL,
+                new_freight TEXT NOT NULL,
+                new_currency TEXT NOT NULL,
+                new_fee_weight_g TEXT NOT NULL,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at TEXT,
+                lease_owner TEXT,
+                lease_until TEXT,
+                last_error TEXT,
+                detected_at TEXT NOT NULL,
+                withdrawn_at TEXT,
+                tracking_saved_at TEXT,
+                reoutbounded_at TEXT,
+                platform_marked_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(job_id, source_snapshot_hash),
+                UNIQUE(job_id, revision_no)
+            );
+            CREATE INDEX IF NOT EXISTS idx_shipment_re_mark_due
+                ON shipment_re_mark_cycles(state, next_attempt_at, id);
             """
         )
 
@@ -1500,6 +1590,82 @@ class ShipmentWorkflowStore:
         if "policy_block_code" not in self._table_columns(conn, "shipment_erp"):
             conn.execute("ALTER TABLE shipment_erp ADD COLUMN policy_block_code TEXT")
 
+    def _migrate_to_v23(self, conn: sqlite3.Connection) -> None:
+        """Store completed-order refresh evidence and independent re-mark cycles."""
+
+        job_columns = self._table_columns(conn, "shipment_jobs")
+        for column, declaration in (
+            ("platform_order_item_ids_json", "TEXT NOT NULL DEFAULT '[]'"),
+            ("logistics_provider_name", "TEXT NOT NULL DEFAULT ''"),
+            ("logistics_type_name", "TEXT NOT NULL DEFAULT ''"),
+        ):
+            if column not in job_columns:
+                conn.execute(
+                    f"ALTER TABLE shipment_jobs ADD COLUMN {column} {declaration}"
+                )
+        logistics_columns = self._table_columns(conn, "shipment_logistics")
+        for column in (
+            "completed_refresh_checked_at",
+            "completed_refresh_next_at",
+            "completed_refresh_last_error",
+            "completed_refresh_snapshot_hash",
+        ):
+            if column not in logistics_columns:
+                conn.execute(
+                    f"ALTER TABLE shipment_logistics ADD COLUMN {column} TEXT"
+                )
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS shipment_re_mark_cycles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id INTEGER NOT NULL REFERENCES shipment_jobs(id) ON DELETE CASCADE,
+                revision_no INTEGER NOT NULL,
+                source_snapshot_hash TEXT NOT NULL,
+                state TEXT NOT NULL,
+                checkpoint TEXT NOT NULL,
+                system_order_no TEXT NOT NULL,
+                platform_order_no TEXT NOT NULL,
+                logistics_no TEXT NOT NULL,
+                wo_number TEXT,
+                old_carrier TEXT,
+                old_waybill_no TEXT,
+                old_tracking_no TEXT,
+                old_freight TEXT,
+                old_currency TEXT,
+                old_fee_weight_g TEXT,
+                new_carrier TEXT NOT NULL,
+                new_service_line TEXT NOT NULL DEFAULT '',
+                new_waybill_no TEXT NOT NULL,
+                new_tracking_no TEXT NOT NULL,
+                new_freight TEXT NOT NULL,
+                new_currency TEXT NOT NULL,
+                new_fee_weight_g TEXT NOT NULL,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at TEXT,
+                lease_owner TEXT,
+                lease_until TEXT,
+                last_error TEXT,
+                detected_at TEXT NOT NULL,
+                withdrawn_at TEXT,
+                tracking_saved_at TEXT,
+                reoutbounded_at TEXT,
+                platform_marked_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(job_id, source_snapshot_hash),
+                UNIQUE(job_id, revision_no)
+            );
+            CREATE INDEX IF NOT EXISTS idx_shipment_re_mark_due
+                ON shipment_re_mark_cycles(state, next_attempt_at, id);
+            """
+        )
+        cycle_columns = self._table_columns(conn, "shipment_re_mark_cycles")
+        if "new_service_line" not in cycle_columns:
+            conn.execute(
+                "ALTER TABLE shipment_re_mark_cycles "
+                "ADD COLUMN new_service_line TEXT NOT NULL DEFAULT ''"
+            )
+
     def _refresh_order_policy_evidence_conn(self, conn: sqlite3.Connection) -> int:
         """Backfill historical queue rows from notification snapshots when present."""
 
@@ -1835,6 +2001,9 @@ class ShipmentWorkflowStore:
                    l.source_url, l.tracking_override_carrier, l.tracking_override_no,
                    l.tracking_override_at, l.tracking_override_reason,
                    l.tracking_mismatch_action, l.tracking_mismatch_reviewed_at,
+                   l.completed_refresh_checked_at, l.completed_refresh_next_at,
+                   l.completed_refresh_last_error,
+                   l.completed_refresh_snapshot_hash,
                    l.last_checked_at,
                    l.last_checked_at AS logistics_last_checked_at,
                    l.state_changed_at AS logistics_state_changed_at,
@@ -1850,6 +2019,22 @@ class ShipmentWorkflowStore:
                    e.state_changed_at AS erp_state_changed_at,
                    e.selected_wms_wo_number, e.selected_wms_candidates_hash,
                    e.selected_wms_selected_at, e.selected_wms_selected_by,
+                   r.id AS re_mark_cycle_id,
+                   r.state AS re_mark_state,
+                   r.checkpoint AS re_mark_checkpoint,
+                   r.wo_number AS re_mark_wo_number,
+                   r.old_carrier AS re_mark_old_carrier,
+                   r.old_waybill_no AS re_mark_old_waybill_no,
+                   r.old_tracking_no AS re_mark_old_tracking_no,
+                   r.new_carrier AS re_mark_new_carrier,
+                   r.new_service_line AS re_mark_new_service_line,
+                   r.new_waybill_no AS re_mark_new_waybill_no,
+                   r.new_tracking_no AS re_mark_new_tracking_no,
+                   r.new_freight AS re_mark_new_freight,
+                   r.new_currency AS re_mark_new_currency,
+                   r.new_fee_weight_g AS re_mark_new_fee_weight_g,
+                   r.last_error AS re_mark_last_error,
+                   r.updated_at AS re_mark_updated_at,
                    CASE
                        WHEN e.selected_wms_wo_number IS NULL
                             AND e.checkpoint = 'NONE'
@@ -1916,6 +2101,11 @@ class ShipmentWorkflowStore:
             FROM shipment_jobs j
             JOIN shipment_logistics l ON l.job_id = j.id
             JOIN shipment_erp e ON e.job_id = j.id
+            LEFT JOIN shipment_re_mark_cycles r ON r.id = (
+                SELECT MAX(latest_re_mark.id)
+                FROM shipment_re_mark_cycles latest_re_mark
+                WHERE latest_re_mark.job_id = j.id
+            )
         """
 
     def _queue_index_sql(self) -> str:
@@ -1947,13 +2137,34 @@ class ShipmentWorkflowStore:
                    e.next_attempt_at AS erp_next_attempt_at,
                    e.outbounded_at, e.externally_completed_at,
                    e.completion_source, e.last_error AS erp_last_error
+                   ,r.id AS re_mark_cycle_id,
+                   r.state AS re_mark_state,
+                   r.checkpoint AS re_mark_checkpoint,
+                   r.updated_at AS re_mark_updated_at,
+                   r.last_error AS re_mark_last_error
             FROM shipment_jobs j
             JOIN shipment_logistics l ON l.job_id = j.id
             JOIN shipment_erp e ON e.job_id = j.id
+            LEFT JOIN shipment_re_mark_cycles r ON r.id = (
+                SELECT MAX(latest_re_mark.id)
+                FROM shipment_re_mark_cycles latest_re_mark
+                WHERE latest_re_mark.job_id = j.id
+            )
         """
 
     def _flatten(self, row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
         item = dict(row)
+        try:
+            raw_item_ids = json.loads(
+                str(item.get("platform_order_item_ids_json") or "[]")
+            )
+        except (TypeError, json.JSONDecodeError):
+            raw_item_ids = []
+        item["platform_order_item_ids"] = tuple(
+            str(value or "").strip()
+            for value in raw_item_ids
+            if str(value or "").strip()
+        ) if isinstance(raw_item_ids, list) else ()
         actual_total = None
         carrier = item.get("carrier_normalized") or item.get("carrier_raw")
         tracking_no = item.get("international_tracking_no")
@@ -1984,7 +2195,8 @@ class ShipmentWorkflowStore:
                     tracking_validated=tracking_validated,
                 ),
                 "last_error": (
-                    item.get("erp_last_error")
+                    item.get("re_mark_last_error")
+                    or item.get("erp_last_error")
                     or item.get("logistics_last_error")
                     or item.get("email_last_error")
                 ),
@@ -2169,6 +2381,658 @@ class ShipmentWorkflowStore:
             row = conn.execute(self._aggregate_sql() + " WHERE j.logistics_no = ?", (logistics_no,)).fetchone()
         return self._flatten(row) if row else None
 
+    def list_completed_refresh_targets(
+        self,
+        *,
+        days: int = COMPLETED_REFRESH_WINDOW_DAYS,
+        eligible_only: bool = False,
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        """Return automation-completed packages due for a 15-day recheck."""
+
+        self.initialize()
+        bounded_days = max(1, min(int(days or COMPLETED_REFRESH_WINDOW_DAYS), 90))
+        bounded_limit = max(1, min(int(limit or 500), 2000))
+        cutoff = _format_utc_timestamp(
+            datetime.now(timezone.utc) - timedelta(days=bounded_days)
+        )
+        now = utc_now()
+        with self.connect() as conn:
+            rows = conn.execute(
+                self._aggregate_sql()
+                + """
+                  WHERE j.identity_state = ?
+                    AND e.state = ?
+                    AND e.completion_source = ?
+                    AND COALESCE(e.outbounded_at, '') >= ?
+                    AND TRIM(COALESCE(j.logistics_no, '')) <> ''
+                    AND NOT EXISTS (
+                        SELECT 1 FROM shipment_re_mark_cycles active_re_mark
+                        WHERE active_re_mark.job_id = j.id
+                          AND active_re_mark.state NOT IN (?, ?)
+                    )
+                    AND (
+                        l.completed_refresh_next_at IS NULL
+                        OR l.completed_refresh_next_at = ''
+                        OR l.completed_refresh_next_at <= ?
+                    )
+                    AND (j.lease_owner IS NULL OR j.lease_owner = '' OR j.lease_until <= ?)
+                  ORDER BY COALESCE(l.completed_refresh_checked_at, ''), j.id
+                  LIMIT ?
+                """,
+                (
+                    IDENTITY_ACTIVE,
+                    ERP_DONE,
+                    ERP_COMPLETION_AUTOMATION,
+                    cutoff,
+                    REMARK_COMPLETED,
+                    REMARK_CANCELLED,
+                    now,
+                    now,
+                    bounded_limit,
+                ),
+            ).fetchall()
+        output = [self._flatten(row) for row in rows]
+        if not eligible_only:
+            return output
+        return [
+            row
+            for row in output
+            if completed_re_mark_eligibility(
+                sales_platform_code=row.get("sales_platform_code"),
+                sales_platform_name=row.get("sales_platform_name"),
+                platform_order_item_ids=row.get("platform_order_item_ids"),
+                logistics_provider_name=row.get("logistics_provider_name"),
+                logistics_type_name=row.get("logistics_type_name"),
+            ).eligible
+        ]
+
+    def update_completed_refresh_evidence(
+        self,
+        *,
+        system_order_no: str,
+        platform_order_no: str,
+        sales_platform_code: str = "",
+        sales_platform_name: str = "",
+        platform_order_item_ids: Sequence[str] = (),
+        logistics_provider_name: str = "",
+        logistics_type_name: str = "",
+        run_id: str | None = None,
+    ) -> int:
+        """Persist only exact Lingxing detail evidence for completed packages."""
+
+        self.initialize()
+        item_ids = tuple(
+            dict.fromkeys(
+                str(value or "").strip()
+                for value in platform_order_item_ids
+                if str(value or "").strip()
+            )
+        )
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                """
+                SELECT j.id
+                FROM shipment_jobs j
+                JOIN shipment_erp e ON e.job_id = j.id
+                WHERE j.system_order_no = ? AND j.platform_order_no = ?
+                  AND j.identity_state = ? AND e.state = ?
+                  AND e.completion_source = ?
+                """,
+                (
+                    str(system_order_no).strip(),
+                    str(platform_order_no).strip(),
+                    IDENTITY_ACTIVE,
+                    ERP_DONE,
+                    ERP_COMPLETION_AUTOMATION,
+                ),
+            ).fetchall()
+            for row in rows:
+                conn.execute(
+                    """
+                    UPDATE shipment_jobs
+                    SET sales_platform_code = COALESCE(NULLIF(?, ''), sales_platform_code),
+                        sales_platform_name = COALESCE(NULLIF(?, ''), sales_platform_name),
+                        platform_order_item_ids_json = ?,
+                        logistics_provider_name = ?, logistics_type_name = ?,
+                        updated_at = ?, version = version + 1
+                    WHERE id = ?
+                    """,
+                    (
+                        str(sales_platform_code or "").strip(),
+                        str(sales_platform_name or "").strip(),
+                        json.dumps(list(item_ids), ensure_ascii=False),
+                        str(logistics_provider_name or "").strip(),
+                        str(logistics_type_name or "").strip(),
+                        now,
+                        int(row["id"]),
+                    ),
+                )
+                eligibility = completed_re_mark_eligibility(
+                    sales_platform_code=sales_platform_code,
+                    sales_platform_name=sales_platform_name,
+                    platform_order_item_ids=item_ids,
+                    logistics_provider_name=logistics_provider_name,
+                    logistics_type_name=logistics_type_name,
+                )
+                self._insert_event_conn(
+                    conn,
+                    job_id=int(row["id"]),
+                    stage="completed_refresh",
+                    event_type="COMPLETED_REFRESH_ELIGIBILITY_CHECKED",
+                    message=(
+                        "符合重新标发三项准入条件。"
+                        if eligibility.eligible
+                        else "；".join(eligibility.reasons)
+                    ),
+                    details={
+                        "amazon": not any("非 Amazon" in reason for reason in eligibility.reasons),
+                        "order_item_ids": list(item_ids),
+                        "logistics_provider_name": str(logistics_provider_name or "").strip(),
+                        "logistics_type_name": str(logistics_type_name or "").strip(),
+                    },
+                    run_id=run_id,
+                )
+            conn.commit()
+        return len(rows)
+
+    def record_completed_refresh_observation(
+        self,
+        logistics_no: str,
+        detail: LogisticsDetail,
+        *,
+        run_id: str | None = None,
+        next_hours: float = 3,
+    ) -> ReMarkCycle | None:
+        """Create one idempotent cycle when a valid waybill actually changed."""
+
+        self.initialize()
+        job = self.get_by_logistics_no(str(logistics_no or "").strip())
+        if not job:
+            return None
+        now = utc_now()
+        next_at = utc_after(next_hours)
+        eligibility = completed_re_mark_eligibility(
+            sales_platform_code=job.get("sales_platform_code"),
+            sales_platform_name=job.get("sales_platform_name"),
+            platform_order_item_ids=job.get("platform_order_item_ids"),
+            logistics_provider_name=job.get("logistics_provider_name"),
+            logistics_type_name=job.get("logistics_type_name"),
+        )
+        readiness = logistics_readiness_decision(detail)
+        snapshot = completed_refresh_snapshot(detail)
+        values = {
+            "carrier": snapshot.carrier,
+            "waybill_no": snapshot.waybill_no,
+            "tracking_no": snapshot.tracking_no,
+            "freight": snapshot.freight,
+            "currency": snapshot.currency,
+                "fee_weight_g": snapshot.fee_weight_g,
+                "service_line": snapshot.service_line,
+        }
+        snapshot_hash = snapshot.snapshot_hash
+        error = ""
+        if not eligibility.eligible:
+            error = "；".join(eligibility.reasons)
+        elif not readiness.should_continue:
+            error = readiness.reason
+        elif snapshot.validation_error:
+            error = snapshot.validation_error
+
+        old_waybill = normalize_tracking_number(job.get("international_tracking_no"))
+        if not error and not old_waybill:
+            error = "本地已完成记录缺少当前已应用国际运单号，禁止自动生成重新标发周期。"
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                UPDATE shipment_logistics
+                SET completed_refresh_checked_at = ?, completed_refresh_next_at = ?,
+                    completed_refresh_last_error = ?,
+                    completed_refresh_snapshot_hash = ?, updated_at = ?
+                WHERE job_id = ?
+                """,
+                (now, next_at, error or None, snapshot_hash, now, int(job["job_id"])),
+            )
+            if error or values["waybill_no"] == old_waybill:
+                self._insert_event_conn(
+                    conn,
+                    job_id=int(job["job_id"]),
+                    stage="completed_refresh",
+                    event_type=(
+                        "COMPLETED_REFRESH_REJECTED" if error
+                        else "COMPLETED_REFRESH_UNCHANGED"
+                    ),
+                    message=error or "国际运单号未变化。",
+                    details={"snapshot_hash": snapshot_hash},
+                    run_id=run_id,
+                )
+                conn.commit()
+                return None
+            existing_cycle = conn.execute(
+                """
+                SELECT * FROM shipment_re_mark_cycles
+                WHERE job_id = ? AND source_snapshot_hash = ?
+                """,
+                (int(job["job_id"]), snapshot_hash),
+            ).fetchone()
+            if existing_cycle is None:
+                active = conn.execute(
+                    """
+                    SELECT id FROM shipment_re_mark_cycles
+                    WHERE job_id = ? AND state NOT IN (?, ?)
+                    ORDER BY id DESC LIMIT 1
+                    """,
+                    (int(job["job_id"]), REMARK_COMPLETED, REMARK_CANCELLED),
+                ).fetchone()
+                if active is not None:
+                    conn.execute(
+                        """UPDATE shipment_logistics
+                           SET completed_refresh_last_error = ? WHERE job_id = ?""",
+                        ("已有未结束的重新标发周期，新变化已保留到下次复查。", int(job["job_id"])),
+                    )
+                    conn.commit()
+                    return None
+                revision = int(
+                    conn.execute(
+                        "SELECT COALESCE(MAX(revision_no), 0) + 1 FROM shipment_re_mark_cycles WHERE job_id = ?",
+                        (int(job["job_id"]),),
+                    ).fetchone()[0]
+                )
+                old_weight_g = ""
+                if job.get("chargeable_weight_kg") not in (None, ""):
+                    old_weight_g = format(
+                        Decimal(str(job["chargeable_weight_kg"])) * Decimal("1000"),
+                        "f",
+                    )
+                conn.execute(
+                    """
+                    INSERT INTO shipment_re_mark_cycles (
+                        job_id, revision_no, source_snapshot_hash, state, checkpoint,
+                        system_order_no, platform_order_no, logistics_no,
+                        old_carrier, old_waybill_no, old_tracking_no,
+                        old_freight, old_currency, old_fee_weight_g,
+                        new_carrier, new_service_line, new_waybill_no, new_tracking_no,
+                        new_freight, new_currency, new_fee_weight_g,
+                        detected_at, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        int(job["job_id"]), revision, snapshot_hash,
+                        REMARK_DETECTED, ERP_CHECKPOINT_NONE,
+                        str(job["system_order_no"]), str(job["platform_order_no"]),
+                        str(job["logistics_no"]), str(job.get("carrier") or ""),
+                        old_waybill, str(job["logistics_no"]),
+                        str(job.get("fee_amount") or ""), str(job.get("currency") or ""),
+                        old_weight_g, values["carrier"], values["service_line"], values["waybill_no"],
+                        values["tracking_no"], values["freight"], values["currency"],
+                        values["fee_weight_g"], now, now, now,
+                    ),
+                )
+                cycle_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+                self._insert_event_conn(
+                    conn,
+                    job_id=int(job["job_id"]),
+                    stage="re_mark",
+                    event_type="RE_MARK_CHANGE_DETECTED",
+                    old_state=old_waybill,
+                    new_state=values["waybill_no"],
+                    message="近 15 天自动完成订单的国际运单号已更新，等待重新标发。",
+                    details={"cycle_id": cycle_id, "snapshot_hash": snapshot_hash},
+                    run_id=run_id,
+                )
+                existing_cycle = conn.execute(
+                    "SELECT * FROM shipment_re_mark_cycles WHERE id = ?",
+                    (cycle_id,),
+                ).fetchone()
+            conn.commit()
+        return self._re_mark_cycle(existing_cycle)
+
+    @staticmethod
+    def _re_mark_cycle(row: sqlite3.Row | Mapping[str, Any]) -> ReMarkCycle:
+        value = dict(row)
+        return ReMarkCycle(
+            id=int(value["id"]), job_id=int(value["job_id"]),
+            revision_no=int(value["revision_no"]), state=str(value["state"]),
+            checkpoint=str(value["checkpoint"]),
+            system_order_no=str(value["system_order_no"]),
+            platform_order_no=str(value["platform_order_no"]),
+            logistics_no=str(value["logistics_no"]),
+            old_carrier=str(value.get("old_carrier") or ""),
+            old_waybill_no=str(value.get("old_waybill_no") or ""),
+            old_tracking_no=str(value.get("old_tracking_no") or ""),
+            new_carrier=str(value.get("new_carrier") or ""),
+            new_service_line=str(value.get("new_service_line") or ""),
+            new_waybill_no=str(value.get("new_waybill_no") or ""),
+            new_tracking_no=str(value.get("new_tracking_no") or ""),
+            new_freight=str(value.get("new_freight") or ""),
+            new_currency=str(value.get("new_currency") or ""),
+            new_fee_weight_g=str(value.get("new_fee_weight_g") or ""),
+            wo_number=str(value.get("wo_number") or ""),
+            last_error=str(value.get("last_error") or ""),
+        )
+
+    def get_re_mark_cycle(self, cycle_id: int) -> ReMarkCycle | None:
+        self.initialize()
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM shipment_re_mark_cycles WHERE id = ?",
+                (int(cycle_id),),
+            ).fetchone()
+        return self._re_mark_cycle(row) if row is not None else None
+
+    def list_re_mark_cycles(
+        self,
+        logistics_nos: Sequence[str] = (),
+        *,
+        actionable_only: bool = True,
+    ) -> list[ReMarkCycle]:
+        self.initialize()
+        normalized = tuple(dict.fromkeys(
+            str(value or "").strip() for value in logistics_nos
+            if str(value or "").strip()
+        ))
+        conditions: list[str] = []
+        params: list[Any] = []
+        if normalized:
+            conditions.append(
+                "logistics_no IN (" + ",".join("?" for _ in normalized) + ")"
+            )
+            params.extend(normalized)
+        if actionable_only:
+            conditions.append("state NOT IN (?, ?)")
+            params.extend((REMARK_COMPLETED, REMARK_CANCELLED))
+        sql = "SELECT * FROM shipment_re_mark_cycles"
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
+        sql += " ORDER BY id"
+        with self.connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [self._re_mark_cycle(row) for row in rows]
+
+    def claim_re_mark_cycle(
+        self,
+        cycle_id: int,
+        owner: str,
+        *,
+        lease_minutes: int = 30,
+    ) -> ReMarkCycle | None:
+        """Lease one re-mark cycle so separate desktops cannot execute it twice."""
+
+        normalized_owner = str(owner or "").strip()
+        if not normalized_owner:
+            raise ValueError("重新标发租约 owner 不能为空。")
+        self.initialize()
+        now = utc_now()
+        lease_until = _format_utc_timestamp(
+            datetime.now(timezone.utc) + timedelta(minutes=max(5, lease_minutes))
+        )
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            changed = conn.execute(
+                """
+                UPDATE shipment_re_mark_cycles
+                SET lease_owner = ?, lease_until = ?, attempt_count = attempt_count + 1,
+                    last_error = NULL, updated_at = ?
+                WHERE id = ? AND state NOT IN (?, ?)
+                  AND (
+                      lease_owner IS NULL OR lease_owner = '' OR lease_owner = ?
+                      OR lease_until IS NULL OR lease_until <= ?
+                  )
+                """,
+                (
+                    normalized_owner,
+                    lease_until,
+                    now,
+                    int(cycle_id),
+                    REMARK_COMPLETED,
+                    REMARK_CANCELLED,
+                    normalized_owner,
+                    now,
+                ),
+            ).rowcount
+            row = (
+                conn.execute(
+                    "SELECT * FROM shipment_re_mark_cycles WHERE id = ?",
+                    (int(cycle_id),),
+                ).fetchone()
+                if changed
+                else None
+            )
+            conn.commit()
+        return self._re_mark_cycle(row) if row is not None else None
+
+    def release_re_mark_cycle(self, cycle_id: int, owner: str) -> bool:
+        self.initialize()
+        with self.connect() as conn:
+            changed = conn.execute(
+                """
+                UPDATE shipment_re_mark_cycles
+                SET lease_owner = NULL, lease_until = NULL, updated_at = ?
+                WHERE id = ? AND lease_owner = ?
+                """,
+                (utc_now(), int(cycle_id), str(owner or "").strip()),
+            ).rowcount
+            conn.commit()
+        return bool(changed)
+
+    def update_re_mark_checkpoint(
+        self,
+        cycle_id: int,
+        *,
+        checkpoint: str,
+        wo_number: str | None = None,
+        run_id: str | None = None,
+    ) -> bool:
+        """Persist an OpenAPI sub-checkpoint without conflating it with cycle state."""
+
+        normalized = str(checkpoint or "").strip().upper()
+        if normalized not in {
+            ERP_CHECKPOINT_NONE,
+            ERP_CHECKPOINT_CHANNEL_SET,
+            ERP_CHECKPOINT_AUDITED,
+            ERP_CHECKPOINT_LOGISTICS_SAVED,
+            ERP_CHECKPOINT_OUTBOUNDED,
+        }:
+            raise ValueError(f"未知重新标发 OpenAPI 检查点：{checkpoint}")
+        self.initialize()
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT job_id, checkpoint FROM shipment_re_mark_cycles WHERE id = ?",
+                (int(cycle_id),),
+            ).fetchone()
+            if row is None:
+                conn.rollback()
+                return False
+            changed = conn.execute(
+                """
+                UPDATE shipment_re_mark_cycles
+                SET checkpoint = ?, wo_number = COALESCE(?, wo_number), updated_at = ?
+                WHERE id = ? AND state NOT IN (?, ?)
+                """,
+                (
+                    normalized,
+                    wo_number,
+                    now,
+                    int(cycle_id),
+                    REMARK_COMPLETED,
+                    REMARK_CANCELLED,
+                ),
+            ).rowcount
+            if changed:
+                self._insert_event_conn(
+                    conn,
+                    job_id=int(row["job_id"]),
+                    stage="re_mark",
+                    event_type="RE_MARK_API_CHECKPOINT_CHANGED",
+                    old_state=str(row["checkpoint"]),
+                    new_state=normalized,
+                    details={"cycle_id": int(cycle_id), "wo_number": wo_number},
+                    run_id=run_id,
+                )
+            conn.commit()
+        return bool(changed)
+
+    def require_re_mark_manual_review(
+        self,
+        cycle_id: int,
+        reason: str,
+        *,
+        run_id: str | None = None,
+    ) -> bool:
+        """Stop automatic replay after an ambiguous external-write boundary."""
+
+        message = str(reason or "").strip()
+        if not message:
+            raise ValueError("重新标发人工复核原因不能为空。")
+        self.initialize()
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT job_id, state FROM shipment_re_mark_cycles WHERE id = ?",
+                (int(cycle_id),),
+            ).fetchone()
+            if row is None or str(row["state"]) in {REMARK_COMPLETED, REMARK_CANCELLED}:
+                conn.rollback()
+                return False
+            changed = conn.execute(
+                """
+                UPDATE shipment_re_mark_cycles
+                SET state = ?, last_error = ?, lease_owner = NULL, lease_until = NULL,
+                    updated_at = ? WHERE id = ?
+                """,
+                (REMARK_MANUAL_REVIEW, message, now, int(cycle_id)),
+            ).rowcount
+            if changed:
+                self._insert_event_conn(
+                    conn,
+                    job_id=int(row["job_id"]),
+                    stage="re_mark",
+                    event_type="RE_MARK_MANUAL_REVIEW_REQUIRED",
+                    old_state=str(row["state"]),
+                    new_state=REMARK_MANUAL_REVIEW,
+                    message=message,
+                    details={"cycle_id": int(cycle_id)},
+                    run_id=run_id,
+                )
+            conn.commit()
+        return bool(changed)
+
+    def advance_re_mark_cycle(
+        self,
+        cycle_id: int,
+        *,
+        expected_state: str,
+        new_state: str,
+        checkpoint: str | None = None,
+        wo_number: str | None = None,
+        last_error: str | None = None,
+        timestamp_column: str | None = None,
+        run_id: str | None = None,
+    ) -> bool:
+        """Advance one external-write checkpoint with compare-and-swap."""
+
+        allowed_timestamps = {
+            "withdrawn_at", "tracking_saved_at", "reoutbounded_at", "platform_marked_at"
+        }
+        if timestamp_column is not None and timestamp_column not in allowed_timestamps:
+            raise ValueError("Unsupported re-mark timestamp column")
+        self.initialize()
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute(
+                "SELECT job_id, state FROM shipment_re_mark_cycles WHERE id = ?",
+                (int(cycle_id),),
+            ).fetchone()
+            if current is None or str(current["state"]) != str(expected_state):
+                conn.rollback()
+                return False
+            fields = ["state = ?", "checkpoint = COALESCE(?, checkpoint)", "wo_number = COALESCE(?, wo_number)",
+                      "last_error = ?", "updated_at = ?"]
+            params: list[Any] = [new_state, checkpoint, wo_number, last_error, now]
+            if timestamp_column:
+                fields.append(f"{timestamp_column} = ?")
+                params.append(now)
+            params.extend((int(cycle_id), expected_state))
+            changed = conn.execute(
+                f"UPDATE shipment_re_mark_cycles SET {', '.join(fields)} WHERE id = ? AND state = ?",
+                params,
+            ).rowcount
+            if changed:
+                self._insert_event_conn(
+                    conn,
+                    job_id=int(current["job_id"]),
+                    stage="re_mark",
+                    event_type="RE_MARK_STATE_CHANGED",
+                    old_state=expected_state,
+                    new_state=new_state,
+                    message=last_error,
+                    details={"cycle_id": int(cycle_id), "checkpoint": checkpoint},
+                    run_id=run_id,
+                )
+            conn.commit()
+        return bool(changed)
+
+    def complete_re_mark_cycle(self, cycle_id: int, *, run_id: str | None = None) -> bool:
+        """Promote the new logistics snapshot only after platform marking succeeds."""
+
+        self.initialize()
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cycle = conn.execute(
+                "SELECT * FROM shipment_re_mark_cycles WHERE id = ?",
+                (int(cycle_id),),
+            ).fetchone()
+            if cycle is None or str(cycle["state"]) == REMARK_COMPLETED:
+                conn.rollback()
+                return bool(cycle is not None)
+            if str(cycle["state"]) != REMARK_MARK_CONFIRMED:
+                conn.rollback()
+                return False
+            kg = format(Decimal(str(cycle["new_fee_weight_g"])) / Decimal("1000"), "f")
+            conn.execute(
+                """
+                UPDATE shipment_logistics
+                SET service_line = COALESCE(NULLIF(?, ''), service_line),
+                    carrier_raw = ?, carrier_normalized = ?,
+                    international_tracking_no = ?, currency = ?, fee_amount = ?,
+                    chargeable_weight_kg = ?, completed_refresh_last_error = NULL,
+                    completed_refresh_next_at = ?, updated_at = ?
+                WHERE job_id = ?
+                """,
+                (
+                    cycle["new_service_line"],
+                    cycle["new_carrier"], cycle["new_carrier"],
+                    cycle["new_waybill_no"], cycle["new_currency"],
+                    cycle["new_freight"], kg, utc_after(), now, int(cycle["job_id"]),
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE shipment_re_mark_cycles
+                SET state = ?, checkpoint = ?, platform_marked_at = COALESCE(platform_marked_at, ?),
+                    last_error = NULL, updated_at = ? WHERE id = ?
+                """,
+                (REMARK_COMPLETED, REMARK_COMPLETED, now, now, int(cycle_id)),
+            )
+            self._insert_event_conn(
+                conn,
+                job_id=int(cycle["job_id"]), stage="re_mark",
+                event_type="RE_MARK_COMPLETED", old_state=str(cycle["state"]),
+                new_state=REMARK_COMPLETED,
+                message="新物流已重新出库并提交订单标发；客户普通发货通知保持不重发。",
+                details={"cycle_id": int(cycle_id)}, run_id=run_id,
+            )
+            conn.commit()
+        return True
+
     def upsert_candidate(
         self,
         candidate: ShipmentCandidate,
@@ -2188,6 +3052,16 @@ class ShipmentWorkflowStore:
             normalize_customer_shipping_service(candidate.customer_shipping_service)
             or None
         )
+        platform_order_item_ids_json = json.dumps(
+            list(dict.fromkeys(
+                str(value or "").strip()
+                for value in candidate.platform_order_item_ids
+                if str(value or "").strip()
+            )),
+            ensure_ascii=False,
+        )
+        logistics_provider_name = str(candidate.logistics_provider_name or "").strip()
+        logistics_type_name = str(candidate.logistics_type_name or "").strip()
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             managed_issue = conn.execute(
@@ -2286,6 +3160,10 @@ class ShipmentWorkflowStore:
                                 sales_platform_code = COALESCE(NULLIF(?, ''), sales_platform_code),
                                 sales_platform_name = COALESCE(NULLIF(?, ''), sales_platform_name),
                                 has_main_image = CASE WHEN ? THEN 1 ELSE has_main_image END,
+                                platform_order_item_ids_json = CASE
+                                    WHEN ? <> '[]' THEN ? ELSE platform_order_item_ids_json END,
+                                logistics_provider_name = COALESCE(NULLIF(?, ''), logistics_provider_name),
+                                logistics_type_name = COALESCE(NULLIF(?, ''), logistics_type_name),
                                 last_seen_at = ?, updated_at = ?
                             WHERE id = ?
                             """,
@@ -2303,6 +3181,10 @@ class ShipmentWorkflowStore:
                                 candidate.sales_platform_code,
                                 candidate.sales_platform_name,
                                 1 if candidate.has_main_image else 0,
+                                platform_order_item_ids_json,
+                                platform_order_item_ids_json,
+                                logistics_provider_name,
+                                logistics_type_name,
                                 now,
                                 now,
                                 identity_match["id"],
@@ -2354,6 +3236,10 @@ class ShipmentWorkflowStore:
                             sales_platform_code = COALESCE(NULLIF(?, ''), sales_platform_code),
                             sales_platform_name = COALESCE(NULLIF(?, ''), sales_platform_name),
                             has_main_image = CASE WHEN ? THEN 1 ELSE has_main_image END,
+                            platform_order_item_ids_json = CASE
+                                WHEN ? <> '[]' THEN ? ELSE platform_order_item_ids_json END,
+                            logistics_provider_name = COALESCE(NULLIF(?, ''), logistics_provider_name),
+                            logistics_type_name = COALESCE(NULLIF(?, ''), logistics_type_name),
                             sales_channel = ?, customer_email_required = ?,
                             last_seen_at = ?, updated_at = ?, version = version + 1
                         WHERE id = ?
@@ -2374,6 +3260,10 @@ class ShipmentWorkflowStore:
                             candidate.sales_platform_code,
                             candidate.sales_platform_name,
                             1 if candidate.has_main_image else 0,
+                            platform_order_item_ids_json,
+                            platform_order_item_ids_json,
+                            logistics_provider_name,
+                            logistics_type_name,
                             sales_channel,
                             1 if email_required else 0,
                             now,
@@ -2476,6 +3366,10 @@ class ShipmentWorkflowStore:
                             sales_platform_code = COALESCE(NULLIF(?, ''), sales_platform_code),
                             sales_platform_name = COALESCE(NULLIF(?, ''), sales_platform_name),
                             has_main_image = CASE WHEN ? THEN 1 ELSE has_main_image END,
+                            platform_order_item_ids_json = CASE
+                                WHEN ? <> '[]' THEN ? ELSE platform_order_item_ids_json END,
+                            logistics_provider_name = COALESCE(NULLIF(?, ''), logistics_provider_name),
+                            logistics_type_name = COALESCE(NULLIF(?, ''), logistics_type_name),
                             sales_channel = ?, customer_email_required = ?,
                             last_seen_at = ?, updated_at = ?
                         WHERE id = ?
@@ -2488,6 +3382,10 @@ class ShipmentWorkflowStore:
                             candidate.source_page, candidate.source_scroll_top, candidate.rowid,
                             candidate.sales_platform_code, candidate.sales_platform_name,
                             1 if candidate.has_main_image else 0,
+                            platform_order_item_ids_json,
+                            platform_order_item_ids_json,
+                            logistics_provider_name,
+                            logistics_type_name,
                             sales_channel, 1 if email_required else 0,
                             now, now, existing["id"],
                         ),
@@ -2651,10 +3549,12 @@ class ShipmentWorkflowStore:
                     customer_shipping_service, receiver_email,
                     source_page, source_scroll_top, source_rowid,
                     sales_platform_code, sales_platform_name, has_main_image,
+                    platform_order_item_ids_json, logistics_provider_name,
+                    logistics_type_name,
                     sales_channel, customer_email_required,
                     identity_state,
                     first_seen_at, last_seen_at, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     candidate.logistics_no, candidate.system_order_no, candidate.platform_order_no,
@@ -2666,6 +3566,9 @@ class ShipmentWorkflowStore:
                     candidate.sales_platform_code or "",
                     candidate.sales_platform_name or "",
                     1 if candidate.has_main_image else 0,
+                    platform_order_item_ids_json,
+                    logistics_provider_name,
+                    logistics_type_name,
                     sales_channel, 1 if email_required else 0,
                     IDENTITY_ACTIVE, now, now, now, now,
                 ),

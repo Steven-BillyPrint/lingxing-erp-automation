@@ -66,6 +66,7 @@ class Capability(str, Enum):
     AUDIT_ORDER = "audit_order"
     UPDATE_TRACKING = "update_tracking"
     OUTBOUND_ORDER = "outbound_order"
+    REMARK_SHIPMENT = "remark_shipment"
     ALIBABA_LOGISTICS = "alibaba_logistics"
     ALIBABA_ORDER_PREPARE = "alibaba_order_prepare"
     ALIBABA_ORDER_DRAFT = "alibaba_order_draft"
@@ -86,6 +87,7 @@ class Capability(str, Enum):
             Capability.AUDIT_ORDER: "审核订单",
             Capability.UPDATE_TRACKING: "更新物流信息",
             Capability.OUTBOUND_ORDER: "出库发货",
+            Capability.REMARK_SHIPMENT: "更新物流单号并重新标发",
             Capability.ALIBABA_LOGISTICS: "查询阿里国际物流",
             Capability.ALIBABA_ORDER_PREPARE: "准备阿里物流下单",
             Capability.ALIBABA_ORDER_DRAFT: "填写阿里物流草稿",
@@ -106,6 +108,7 @@ class Capability(str, Enum):
             Capability.ALIBABA_LOGISTICS,
             Capability.ALIBABA_ORDER_PREPARE,
             Capability.ALIBABA_ORDER_DRAFT,
+            Capability.REMARK_SHIPMENT,
         }:
             return CapabilityMode.BROWSER
         return CapabilityMode.API_FIRST
@@ -121,6 +124,7 @@ WRITE_CAPABILITIES = frozenset(
         Capability.AUDIT_ORDER,
         Capability.UPDATE_TRACKING,
         Capability.OUTBOUND_ORDER,
+        Capability.REMARK_SHIPMENT,
         Capability.ALIBABA_ORDER_DRAFT,
         Capability.SEND_NOTIFICATION,
     }
@@ -208,6 +212,7 @@ LOCAL_BROWSER_ACTION_ALIBABA_ORDER_FILL = "alibaba_order_fill"
 class DesktopWriteAction(str, Enum):
     PROCESS_CUSTOM_ORDER = "process_custom_order"
     EXECUTE_ERP_MARK = "execute_erp_mark"
+    EXECUTE_SHIPMENT_REMARK = "execute_shipment_remark"
     FILL_ALIBABA_ORDER_DRAFT = "fill_alibaba_order_draft"
     SEND_SHIPMENT_NOTIFICATION = "send_shipment_notification"
 
@@ -433,6 +438,7 @@ def task_requires_visible_browser(command: TaskCommand) -> bool:
             Capability.ALIBABA_LOGISTICS,
             Capability.ALIBABA_ORDER_PREPARE,
             Capability.ALIBABA_ORDER_DRAFT,
+            Capability.REMARK_SHIPMENT,
         }
     return False
 
@@ -525,6 +531,21 @@ class ShipmentRow:
     scan_issue_state: str = ""
     scan_issue_reason: str = ""
     scan_issue_state_changed_at: str = ""
+    re_mark_cycle_id: int = 0
+    re_mark_state: str = ""
+    re_mark_checkpoint: str = ""
+    re_mark_wo_number: str = ""
+    re_mark_old_carrier: str = ""
+    re_mark_old_waybill_no: str = ""
+    re_mark_new_carrier: str = ""
+    re_mark_new_service_line: str = ""
+    re_mark_new_waybill_no: str = ""
+    re_mark_new_tracking_no: str = ""
+    re_mark_new_freight: str = ""
+    re_mark_new_currency: str = ""
+    re_mark_new_fee_weight_g: str = ""
+    re_mark_last_error: str = ""
+    re_mark_updated_at: str = ""
 
 
 @dataclass(frozen=True)

@@ -194,6 +194,39 @@ def test_shipment_page_filters_global_status_and_preserves_total() -> None:
     assert cancelled.items[0].logistics_no == "ALS-CLOSED"
 
 
+def test_detected_re_mark_is_sorted_above_ordinary_ready_shipment() -> None:
+    rows = (
+        ShipmentRow(
+            "ORDER-READY",
+            logistics_no="ALS-READY",
+            carrier="UPS",
+            international_tracking_no="1Z999",
+            actual_total="CNY 10",
+            chargeable_weight_kg="1",
+            identity_state="ACTIVE",
+            logistics_state="READY",
+            erp_state="PENDING",
+        ),
+        ShipmentRow(
+            "ORDER-REMARK",
+            logistics_no="ALS-REMARK",
+            identity_state="ACTIVE",
+            logistics_state="READY",
+            erp_state="DONE",
+            re_mark_cycle_id=41,
+            re_mark_state="DETECTED",
+        ),
+    )
+
+    page = paginate_shipment_rows(rows)
+
+    assert [row.logistics_no for row in page.items] == [
+        "ALS-REMARK",
+        "ALS-READY",
+    ]
+    assert "重新标发" in page.facets.statuses
+
+
 def test_typed_queue_pages_are_not_misclassified_as_log_pages() -> None:
     custom = CustomOrderPage(
         items=(CustomOrderRow("ORDER-1"),),

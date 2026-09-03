@@ -1,13 +1,13 @@
 # 近 15 天已完成订单物流更新与重新标发方案
 
 日期：2026-09-01  
-状态：已按真实接口验证修订，待评审后开发
+状态：已按真实订单 DOM/OpenAPI 流程验证并实现，待代码评审
 
 ## 1. 最终结论
 
 领星公开 OpenAPI 没有以下两个能力：
 
-1. 将“订单管理 > 已发货”的自建仓销售出库单撤销回待发货；
+1. 将“订单管理 > 已发货”的自建仓销售出库单撤销回待审核；
 2. 将“订单标发 > 可更新”中的新标发单号再次提交到店铺后台。
 
 因此，这个功能不能做成纯 OpenAPI 流程。建议采用“领星 OpenAPI + 本机专用 Chrome 网页适配器”的混合流程：
@@ -18,13 +18,14 @@
   -> 发现有效的新国际物流单号
   -> 创建独立重新标发周期
   -> 【领星网页】按系统单号撤销发货
-  -> 【领星 OpenAPI】读回销售出库单已回到待发货
-  -> 【领星 OpenAPI】重填运单号、ALS 号、运费、币种和计费重量
+  -> 【领星 OpenAPI】读回订单待审核、旧销售出库单已截单
+  -> 【领星 OpenAPI】设置新物流渠道并重新审核，取得新 WO
+  -> 【领星 OpenAPI】在新 WO 重填运单号、ALS 号、运费、币种和计费重量
   -> 【领星 OpenAPI】逐字段读回
   -> 【领星 OpenAPI】重新出库并读回
   -> 等待领星订单标发进入“可更新”
-  -> 【领星网页】按平台单号提交“标发”
-  -> 【领星网页】读回线上物流包含新单号且状态回到“已完成”
+  -> 【领星网页】再次明确切换“系统单号”搜索并提交“标发”
+  -> 点击“我知道了”后一次读取“系统标发单号”列为新运单号
   -> 完成周期并保留旧值、新值和全过程证据
 ```
 
@@ -39,16 +40,18 @@
 | 业务动作 | OpenAPI | 用途 |
 | --- | --- | --- |
 | 查询销售出库单 | `/erp/sc/routing/wms/order/wmsOrderList` | 用系统单号或 `WO` 单号读回状态、单号、仓型、运费和重量 |
-| 写入物流信息 | `/basicOpen/logisticsOrdering/setTrackingNo` | 仅在撤销回待发货后写入完整新物流数据 |
+| 设置物流渠道 | 领星订单物流编辑 OpenAPI | 撤销回待审核后设置目标手动物流渠道 |
+| 重新审核 | 领星订单审核 OpenAPI | 生成新的活动销售出库单 `WO` |
+| 写入物流信息 | `/basicOpen/logisticsOrdering/setTrackingNo` | 在新 `WO` 写入完整新物流数据 |
 | 重新出库 | `/basicOpen/selfShipmentOrder/deliveryGoods` | 在新物流数据完全读回后重新出库 |
 
-`setTrackingNo` 已在真实的 `status=3 / 已出库` 单据上返回错误，不能直接覆盖已发货订单；只能在网页撤销成功且 OpenAPI 已读回待发货状态后调用。
+`setTrackingNo` 已在真实的 `status=3 / 已出库` 单据上返回错误，不能直接覆盖已发货订单；只能在网页撤销成功、OpenAPI 已读回订单待审核并重新审核生成新 `WO` 后调用。
 
 ### 2.2 不能替代目标动作的接口
 
 | 接口 | 原因 |
 | --- | --- |
-| `/basicOpen/wmsOrder/cancel` | 这是销售出库单“截单”，回退到待审核，不是“已发货撤销回待发货” |
+| `/basicOpen/wmsOrder/cancel` | 这是销售出库单“截单”，不能替代订单管理页面的“已发货撤销”业务动作 |
 | `/basicOpen/outboundOrder/outbound/setOrderRevoke` | 只接受 `OB...` 普通出库单，不接受系统单号或 `WO...` 销售出库单 |
 | `/pb/mp/order/submitFulfillment` | 真实测试返回平台履约错误，不能可靠表达目标包裹的“更新已标发单号”语义 |
 | `/pb/mp/order/editOrder` | 已发货订单不允许修改，且文档没有运单号、跟踪号字段 |
@@ -56,7 +59,7 @@
 ### 2.3 必须通过领星网页完成的动作
 
 1. `REVERSE_SHIPPED_ORDER_UI`：订单管理 > 已发货 > 精确搜索系统单号 > 勾选唯一订单 > 撤销发货；
-2. `UPDATE_MARKED_SHIPMENT_UI`：订单标发 > 可更新 > 精确搜索平台单号 > 核对系统标发单号 > 标发。
+2. `UPDATE_MARKED_SHIPMENT_UI`：订单标发 > 可更新 > 明确切换系统单号搜索 > 核对系统标发单号 > 标发。
 
 领星官方说明中，“撤销发货/撤销出库”与“截单”是两个不同动作；“可更新”页面则专门用于将新的系统标发单号更新到店铺后台。
 
@@ -131,9 +134,12 @@ reoutbounded_at, platform_marked_at, created_at, updated_at
 
 ```text
 DETECTED
-  -> WMS_PRECHECKED
   -> WITHDRAW_UI_INTENT
   -> WITHDRAW_UI_CONFIRMED
+  -> CHANNEL_API_INTENT
+  -> CHANNEL_API_CONFIRMED
+  -> AUDIT_API_INTENT
+  -> AUDIT_API_CONFIRMED
   -> TRACKING_API_INTENT
   -> TRACKING_API_CONFIRMED
   -> OUTBOUND_API_INTENT
@@ -155,14 +161,14 @@ DETECTED
 
 网页 DOM 动作建议放在现有页面适配层
 `lingxing_automation/pages/shipment_reversal.py`；周期编排放在
-`shipment_automation/lingxing_re_mark_browser.py`。这样可以复用现有
+`erp_automation/application/shipment_re_mark.py`。这样可以复用现有
 `erp_mark_ship.py` 的页面会话、确认、急停和故障恢复模式，而不在应用层新增
 Playwright 依赖。
 
 执行前：
 
 1. OpenAPI 按系统单号读取销售出库单，并要求唯一匹配一条活动 `WO`；
-2. 状态必须为 `3 / 已出库`，仓型必须是官方允许撤销的自建仓；
+2. 状态必须为 `3 / 已出库`；
 3. 系统单号、平台单号、`WO`、旧单号、运费和重量必须与周期旧快照一致；
 4. 获取订单级跨客户端租约并检查 ERP 写入急停开关。
 
@@ -174,25 +180,25 @@ Playwright 依赖。
 4. 要求表格只出现目标系统单号，并再次读取平台单号、仓库、运单号和跟踪号；
 5. 只勾选目标行；
 6. 记录 `WITHDRAW_UI_INTENT` 后点击“撤销发货”；
-7. 在确认窗口再次核对目标单号后确认；
-8. 保存操作前后页面结构摘要和截图路径，但不得保存登录凭据。
+7. 第一次警告确认后，明确选择“撤销回待审核”和原因“其他”，再提交最终确认；
+8. 只保存业务字段和检查点，不保存登录凭据。
 
 读回规则：
 
-- OpenAPI 读回待发货：推进 `WITHDRAW_UI_CONFIRMED`；
-- 仍为已出库：退避轮询，超时转人工，不重复点击；
-- 变成已截单、待审核、消失或出现多个 `WO`：立即转人工；
+- OpenAPI 同时读回订单为“待审核”且旧 `WO` 不再为状态 `3`：推进 `WITHDRAW_UI_CONFIRMED`；
+- 旧 `WO` 在真实流程中变成状态 `4 / 已截单`，这是撤销成功证据的一部分；
+- 仍为已发货或旧 `WO` 仍为已出库：转人工，不重复点击；
 - 浏览器断开或结果不明：重启后先 OpenAPI 读回，禁止重新点击。
 
 网页定位器不能依赖按钮序号、表格行号或易变 CSS 类名。应使用可见文本、列名、系统单号和确认弹窗内容组成业务定位器；必要字段缺失时失败关闭。
 
 ## 7. OpenAPI 中间步骤
 
-撤销读回成功后，调用现有 `setTrackingNo`，一次提交全部字段：
+撤销读回成功后，先用 OpenAPI 设置新物流渠道并重新审核；取得新的活动销售出库单 `WO` 后，调用现有 `setTrackingNo`，一次提交全部字段：
 
 ```text
 waybill_no = 新国际物流单号
-wo_number = 原销售出库单号
+wo_number = 重新审核生成的新销售出库单号
 tracking_no = ALS 物流订单号
 logistics_freight = 新运费
 logistics_freight_currency_code = 币种
@@ -210,55 +216,41 @@ pkg_fee_weight_unit = g
 
 网页 DOM 动作建议放在
 `lingxing_automation/pages/marked_shipment_update.py`，由同一个
-`shipment_automation/lingxing_re_mark_browser.py` 周期执行器调用。
+`erp_automation/application/shipment_re_mark.py` 周期执行器调用。
 
 执行前必须满足：同一 `WO` 再次出库成功，WMS 为已出库，并且国际运单号、ALS 号、运费、币种和计费重量全部等于周期新值。
 
 网页动作：
 
 1. 打开“订单标发 > 可更新”；
-2. 按平台单号精确搜索并要求唯一匹配；
+2. 打开搜索下拉菜单，明确选择“系统单号”，输入系统单号并要求唯一逻辑行；
 3. 系统标发单号必须等于周期新运单号；
-4. 线上物流尚不包含新单号；
-5. 记录 `MARK_UI_INTENT` 后勾选目标记录并点击“标发”；
+4. 记录 `MARK_UI_INTENT` 后勾选目标记录并点击页面主“标发”按钮；
 6. 如果页面要求选择包裹或商品，必须按系统单号和原始商品数量唯一匹配，存在歧义直接转人工；
-7. 保存页面结果证据。
+7. 确认“全部操作成功”并点击“我知道了”；随后按表头 `colid` 读取目标行“系统标发单号”。
 
 读回规则：
 
-- 轮询“可更新/标发中/已完成”页面；
-- 只有线上物流包含新单号且状态为已完成，才推进 `MARK_UI_CONFIRMED`；
-- 恢复时如果页面已包含新单号，按幂等成功处理，不重复点击；
-- 平台拒绝、数量不足、授权失效、多条包裹歧义或长时间停留标发中，转人工并保留领星原错误。
+- 点击“我知道了”后立即按系统单号读取目标行“系统标发单号”列；该列已变为本周期新运单号即结束，不再轮询“标发中/已完成”；
+- “系统标发单号”单元格包含本周期新运单号，才推进 `MARK_UI_CONFIRMED`；“标发中”是平台异步状态，不阻塞本流程结案；
+- 已记录提交意图但没有成功弹窗及上述单元格读回证据时，不自动重复点击，转人工核对；
+- 平台拒绝、数量不足、授权失效、多条包裹歧义或单元格未更新，转人工并保留领星原错误。
 
 ## 9. 调度、界面与开关
 
-- 正常新订单优先，完成后复查作为低优先级批次；
+- 每轮物流查询同时覆盖到期普通记录和近 15 天已自动完成记录；检测到变化的“重新标发”行在自动标发列表置顶；
 - 建议每 3 小时复查一次；
 - 复用现有阿里/领星本机专用浏览器、登录检查、主实例和跨客户端租约；
 - 无在线客户端、登录失效或安全验证出现时，只延后复查，不改变原 `DONE`；
-- 同一轮先只读发现变化，再由单线程执行器逐单写入，禁止并发操作领星订单页面。
+- 同一轮先只读发现变化；只有操作员勾选并确认“更新物流单号”后，才由与普通标发共享的单线程执行器逐单写入，禁止并发操作领星订单页面。
 
-新增能力：
-
-```text
-REVERSE_SHIPPED_ORDER = browser_only
-UPDATE_MARKED_SHIPMENT = browser_only
-```
-
-新增独立开关，默认关闭：
+新增桌面任务能力：
 
 ```text
-automation.completed_tracking_refresh_enabled
-automation.automatic_reverse_shipment_enabled
-automation.automatic_update_marked_shipment_enabled
+REMARK_SHIPMENT = browser_only
 ```
 
-推荐分三阶段启用：
-
-1. 只读复查，只报告变化；
-2. 自动生成周期，但两次网页写入均要求人工确认；
-3. 真实订单验收通过后，再评审是否允许无人值守网页写入。
+当前实现只自动执行 15 天只读复查并生成周期；撤销、OpenAPI 写入和重新标发始终需要操作员在列表勾选后确认批次，不做无人值守写入。
 
 急停必须在每个网页确认点击、每个 OpenAPI 写请求前立即重查。已经发出的动作只能读回，不能因急停或重启盲目重放。
 
@@ -299,8 +291,8 @@ automation.automatic_update_marked_shipment_enabled
 | `erp_automation/application/capabilities.py` | 新增两个 `browser_only` 写能力 |
 | `lingxing_automation/pages/shipment_reversal.py` | 撤销发货页面定位、核对和点击适配器 |
 | `lingxing_automation/pages/marked_shipment_update.py` | “可更新”订单标发页面定位、核对和点击适配器 |
-| `shipment_automation/lingxing_re_mark_browser.py` | 复用本机专用 Chrome，编排两个页面动作和恢复读回 |
-| `erp_automation/application/api_erp_mark.py` | 独立重新标发执行器，复用 WMS 查询、`setTrackingNo`、`deliveryGoods` 和读回 |
+| `erp_automation/application/shipment_re_mark.py` | 独立编排两个 DOM 动作、OpenAPI 写入、intent/confirmed 恢复与读回 |
+| `erp_automation/application/api_erp_mark.py` | 复用 WMS 查询、渠道设置、审核、`setTrackingNo`、`deliveryGoods` 和读回 |
 | `erp_automation/application/desktop_tasks.py` | 接入单线程任务、网页确认、急停、恢复和进度 |
 | `erp_automation/application/desktop_services.py` | 调度 15 天复查并汇总指标 |
 | `erp_automation/application/queue_queries.py`、UI | 展示新状态、旧值到新值和人工处理入口 |
@@ -315,12 +307,12 @@ automation.automatic_update_marked_shipment_enabled
 3. 新单号无效、运费缺失或重量缺失时，原 `DONE` 和已应用快照不变。
 4. 多张活动 `WO`、缺少 `WO`、第三方仓、未知仓型或未知状态全部转人工。
 5. 撤销点击后客户端崩溃：重启先读回，不重复点击。
-6. 撤销后状态不是待发货：禁止写物流和重新出库。
+6. 撤销后订单不是待审核或旧 `WO` 仍为已出库：禁止写物流和重新出库。
 7. `setTrackingNo` 请求后断线：六个字段完全读回一致后才能继续。
 8. 重新出库响应丢失：已出库且新字段一致时恢复成功，否则不重复提交。
 9. kg 到 g、运费、币种和小数比较与阿里详情一致。
-10. “可更新”已包含新系统标发单号时准确标发；线上物流已经包含新单号时幂等完成。
-11. 标发点击后断线：恢复时先查线上物流，不重复点击。
+10. “可更新”已包含新系统标发单号时准确标发；点击“我知道了”后只读取一次该列并据此完成。
+11. 标发点击后断线且缺少成功弹窗/提交后单元格证据：转人工，不重复点击。
 12. 领星页面列名、按钮或确认弹窗变化时失败关闭，不会点相邻订单。
 13. 同一包裹单号更正后不自动发送第二封普通通知；真正新增包裹逻辑不受影响。
 14. 两台客户端同时运行时，只有一个实例持有订单级租约。
@@ -333,7 +325,7 @@ automation.automatic_update_marked_shipment_enabled
 - 没有有效单号变化时，不发生任何领星网页点击或 OpenAPI 写入；
 - 同一有效变化最多创建一个重新标发周期；
 - 最终销售出库单为已出库，运单号、ALS 号、运费、币种和计费重量全部等于阿里最新值；
-- 最终订单标发线上物流包含新单号，并回到已完成；
+- 点击“我知道了”后，目标行“系统标发单号”包含新单号；允许页面仍显示“标发中”；
 - 任一步断线、客户端退出或服务重启后，不重复撤销、不重复写物流、不重复出库、不重复标发；
 - 无法确认最终状态时停在可定位的人工复核原因，不能误报完成；
 - 已发送客户通知不会因同一包裹单号修正而自动再次发送；
@@ -345,11 +337,19 @@ automation.automatic_update_marked_shipment_enabled
 2. 接入 15 天只读复查，只生成变化周期，不执行外部写入；
 3. 实现撤销发货网页适配器，并用专用测试订单验证读回和崩溃恢复；
 4. 接入 `setTrackingNo` 完整写入、逐字段读回和 `deliveryGoods` 重新出库；
-5. 实现“可更新”订单标发网页适配器和线上物流读回；
+5. 实现“可更新”订单标发网页适配器和提交后“系统标发单号”单元格读回；
 6. 补 UI、审计、通知不重发和跨客户端租约测试；
 7. 先以人工确认模式试运行，验收后再评审是否开启无人值守模式。
 
-## 15. 官方依据
+## 15. 真实订单验收记录
+
+- 平台单号：`113-1341773-1145022`；系统单号：`103735075688785273`；原 ALS：`ALS01915029156`。
+- 原手动物流：万邦速达 / `WNBAA0494424973YQ`；撤销后订单为“待审核”，原 `WO103736599299699712` 为状态 `4 / 已截单`。
+- 仅通过领星 OpenAPI 设置手动-OnTrac、重新审核并在新 `WO103739908769016832` 写入 `1LSD01R0018AGMD`、ALS、`CNY 136.03`、`2000 g`，随后读回状态 `3 / 已出库` 且各字段一致。
+- 订单标发页两次都明确打开搜索下拉并选择“系统单号”；目标逻辑行的 DOM `rowid` 会变化（实测提交后为 `row_20`），因此实现按“系统单号”表头/单元格和共享 `rowid` 锁定，不使用固定行号或坐标。
+- 点击“我知道了”后一次读取“系统标发单号”列得到 `OnTrac ： 1LSD01R0018AGMD 标发中`。新运单号已更新即完成本地周期，不再轮询平台异步状态。
+
+## 16. 官方依据
 
 - [领星销售出库单说明](https://www.lingxing.com/help/article/SalesDeliveryOrder)
 - [领星订单标发说明](https://www.lingxing.com/help/article/MarkOrderAsShipped)
