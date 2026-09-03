@@ -244,6 +244,19 @@ def build_shipment_scan_report(
             site_name=str(row.get("site_name") or "").strip() or None,
             customer_shipping_service=customer_shipping_service,
             has_main_image=bool(row.get("has_main_image")),
+            platform_order_item_ids=tuple(
+                dict.fromkeys(
+                    str(value or "").strip()
+                    for value in (row.get("platform_order_item_ids") or ())
+                    if str(value or "").strip()
+                )
+            ),
+            logistics_provider_name=(
+                str(row.get("logistics_provider_name") or "").strip() or None
+            ),
+            logistics_type_name=(
+                str(row.get("logistics_type_name") or "").strip() or None
+            ),
             warnings=extraction.warnings,
         )
         # One Alibaba logistics number represents one physical logistics
@@ -268,6 +281,16 @@ def build_shipment_scan_report(
             existing_candidate.has_main_image = (
                 existing_candidate.has_main_image or candidate.has_main_image
             )
+            existing_candidate.platform_order_item_ids = tuple(
+                dict.fromkeys(
+                    (*existing_candidate.platform_order_item_ids,
+                     *candidate.platform_order_item_ids)
+                )
+            )
+            if candidate.logistics_provider_name and not existing_candidate.logistics_provider_name:
+                existing_candidate.logistics_provider_name = candidate.logistics_provider_name
+            if candidate.logistics_type_name and not existing_candidate.logistics_type_name:
+                existing_candidate.logistics_type_name = candidate.logistics_type_name
             existing_candidate.warnings = list(
                 dict.fromkeys(
                     [

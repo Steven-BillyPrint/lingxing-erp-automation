@@ -45,6 +45,10 @@ _CUSTOM_PENDING_STATUSES = frozenset(
     }
 )
 _SHIPMENT_STATUS_PRIORITY = {
+    "重新标发": -10,
+    "重新标发处理中": -9,
+    "重新标发需人工复核": -8,
+    "重新标发完成": -7,
     "扫描错误": -1,
     "可标发": 0,
     "可继续标发": 0,
@@ -130,6 +134,7 @@ def shipment_row_from_mapping(row: Mapping[str, Any]) -> ShipmentRow:
         ),
         "product_identity_retry_count": int(row.get("product_identity_retry_count") or 0),
         "wms_selection_required": bool(row.get("wms_selection_required")),
+        "re_mark_cycle_id": int(row.get("re_mark_cycle_id") or 0),
     }
     direct_fields = (
         "logistics_no", "customer_shipping_service", "first_seen_at",
@@ -146,6 +151,13 @@ def shipment_row_from_mapping(row: Mapping[str, Any]) -> ShipmentRow:
         "product_identity_last_error", "product_identity_evidence_json",
         "scan_issue_code", "logistics_overdue_at", "scan_issue_key", "scan_issue_state",
         "scan_issue_reason", "scan_issue_state_changed_at",
+        "re_mark_state", "re_mark_checkpoint", "re_mark_wo_number",
+        "re_mark_old_carrier", "re_mark_old_waybill_no",
+        "re_mark_new_carrier", "re_mark_new_service_line",
+        "re_mark_new_waybill_no",
+        "re_mark_new_tracking_no", "re_mark_new_freight",
+        "re_mark_new_currency", "re_mark_new_fee_weight_g",
+        "re_mark_last_error", "re_mark_updated_at",
     )
     values.update({name: str(row.get(name) or "") for name in direct_fields})
     return ShipmentRow(**values)
@@ -167,6 +179,8 @@ def _timestamp_value(value: object) -> float:
 def shipment_status_timestamp(row: ShipmentRow) -> str:
     if row.scan_issue_code:
         return row.scan_issue_state_changed_at or row.updated_at or row.last_scanned_at
+    if row.re_mark_state:
+        return row.re_mark_updated_at or row.updated_at
     identity = row.identity_state.strip().upper()
     logistics = row.logistics_state.strip().upper()
     erp = row.erp_state.strip().upper()
@@ -201,6 +215,18 @@ def shipment_business_status(row: ShipmentRow, *, now: datetime | None = None) -
             "MANUALLY_COMPLETED": "已完成",
             "MANUALLY_CANCELLED": "已取消",
         }.get(row.scan_issue_state.strip().upper(), "扫描错误")
+    re_mark_state = row.re_mark_state.strip().upper()
+    if re_mark_state == "DETECTED":
+        return "重新标发"
+    if re_mark_state == "MANUAL_REVIEW":
+        return "重新标发需人工复核"
+    if re_mark_state == "COMPLETED":
+        return "重新标发完成"
+    if re_mark_state and re_mark_state != "CANCELLED":
+        # Active task overlays turn this into 重新标发处理中.  Without an
+        # active task the persisted cycle is a recoverable, user-actionable
+        # item; the state machine performs readback before any possible replay.
+        return "重新标发"
     identity = row.identity_state.strip().upper()
     logistics = row.logistics_state.strip().upper()
     erp = row.erp_state.strip().upper()
@@ -335,7 +361,7 @@ def paginate_shipment_rows(
 
     def sort_key(row: ShipmentRow) -> tuple[object, ...]:
         value = display_status(row)
-        bucket = 0 if value == "标发处理中" else 1 if value in {"等待标发", "等待用户确认"} else 2 if value in {"可标发", "可继续标发"} else 4 if value == "已完成" else 5 if value in {"已取消", "标签已移除", "本轮已取消"} else 3
+        bucket = -1 if value == "重新标发" else 0 if value in {"重新标发处理中", "标发处理中"} else 1 if value in {"等待标发", "等待用户确认"} else 2 if value in {"可标发", "可继续标发"} else 4 if value in {"已完成", "重新标发完成"} else 5 if value in {"已取消", "标签已移除", "本轮已取消"} else 3
         return bucket, _SHIPMENT_STATUS_PRIORITY.get(value, 99), -_timestamp_value(shipment_status_timestamp(row)), row.platform_order_no, row.logistics_no
 
     filtered.sort(key=sort_key)

@@ -11,6 +11,7 @@ from erp_automation.application.api_scanners import (
     ApiScanState,
     OrderPaginationResult,
     SHIPMENT_REQUIRED_FIELDS,
+    completed_re_mark_evidence_from_payload,
     customer_shipping_field_candidates_from_payload,
     customer_shipping_list_evidence_from_payload,
     customer_shipping_service_evidence_from_payload,
@@ -81,6 +82,35 @@ def test_order_detail_contact_fields_support_nested_lingxing_shapes() -> None:
 
     assert receiver_email_from_payload(payload) == "buyer@example.com"
     assert receiver_phone_from_payload(payload) == "+1 415 555 2671"
+
+
+def test_completed_re_mark_evidence_reads_real_lingxing_field_names() -> None:
+    evidence = completed_re_mark_evidence_from_payload(
+        {
+            "order_number": "103735075688785273",
+            "platform_code": "Amazon",
+            "platform_name": "Amazon",
+            "logistics_provider_name": "手动",
+            "logistics_type_name": "OnTrac",
+            "order_item": [
+                {
+                    "platform_order_id": "113-1341773-1145022",
+                    "order_item_no": "167540768447001",
+                    "MSKU": "Car-Magent-24x24in-2pcs",
+                }
+            ],
+        },
+        system_order_no="103735075688785273",
+        platform_order_no="113-1341773-1145022",
+    )
+
+    assert evidence == {
+        "sales_platform_code": "Amazon",
+        "sales_platform_name": "Amazon",
+        "platform_order_item_ids": ("167540768447001",),
+        "logistics_provider_name": "手动",
+        "logistics_type_name": "OnTrac",
+    }
 
 
 def test_customer_shipping_service_never_falls_back_to_logistics_route() -> None:

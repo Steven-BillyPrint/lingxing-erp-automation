@@ -1517,7 +1517,8 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             return "_custom_order_executor"
         if (
             command.area is TaskArea.SHIPMENT
-            and command.capability is Capability.OUTBOUND_ORDER
+            and command.capability
+            in {Capability.OUTBOUND_ORDER, Capability.REMARK_SHIPMENT}
         ):
             return "_shipment_order_executor"
         return "_executor"
@@ -1643,7 +1644,8 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                     return ControlResult(False, "该订单已有等待或运行中的任务，不能重复排队。")
             if (
                 command.area.value == "shipment"
-                and command.capability is Capability.OUTBOUND_ORDER
+                and command.capability
+                in {Capability.OUTBOUND_ORDER, Capability.REMARK_SHIPMENT}
             ):
                 logistics_no = str(command.payload.get("logistics_no") or "").strip()
                 duplicate = next(
@@ -1651,7 +1653,8 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                         task
                         for task in self._state.tasks
                         if task.area.value == "shipment"
-                        and task.capability is Capability.OUTBOUND_ORDER
+                        and task.capability
+                        in {Capability.OUTBOUND_ORDER, Capability.REMARK_SHIPMENT}
                         and str(task.payload.get("logistics_no") or "").strip()
                         == logistics_no
                         and task.status
@@ -2171,7 +2174,8 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         for task in tuple(self._state.tasks):
             if (
                 task.area is not TaskArea.SHIPMENT
-                or task.capability is not Capability.OUTBOUND_ORDER
+                or task.capability
+                not in {Capability.OUTBOUND_ORDER, Capability.REMARK_SHIPMENT}
                 or task.status.terminal
                 or str(task.payload.get("logistics_no") or "").strip() not in wanted
             ):
@@ -3059,7 +3063,9 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         with self._lock:
             return {
                 str(task.payload.get("logistics_no") or "").strip(): (
-                    "等待用户确认"
+                    "重新标发处理中"
+                    if task.capability is Capability.REMARK_SHIPMENT
+                    else "等待用户确认"
                     if task.status is TaskStatus.WAITING_USER
                     else "等待标发"
                     if task.status is TaskStatus.QUEUED
@@ -3067,7 +3073,8 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                 )
                 for task in self._state.tasks
                 if task.area is TaskArea.SHIPMENT
-                and task.capability is Capability.OUTBOUND_ORDER
+                and task.capability
+                in {Capability.OUTBOUND_ORDER, Capability.REMARK_SHIPMENT}
                 and not task.status.terminal
                 and str(task.payload.get("logistics_no") or "").strip()
             }
@@ -4512,7 +4519,8 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                 not task.status.terminal
                 and not (
                     task.area is TaskArea.SHIPMENT
-                    and task.capability is Capability.OUTBOUND_ORDER
+                    and task.capability
+                    in {Capability.OUTBOUND_ORDER, Capability.REMARK_SHIPMENT}
                     and str(task.payload.get("logistics_no") or "").strip() in normalized
                 )
                 for task in self._state.tasks

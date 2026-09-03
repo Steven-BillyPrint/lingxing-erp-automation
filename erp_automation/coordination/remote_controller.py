@@ -888,6 +888,7 @@ class RemoteBackgroundTaskController:
             return command.capability in {
                 Capability.ALIBABA_LOGISTICS,
                 Capability.OUTBOUND_ORDER,
+                Capability.REMARK_SHIPMENT,
             }
         return False
 
@@ -911,6 +912,7 @@ class RemoteBackgroundTaskController:
                     in {
                         Capability.ALIBABA_ORDER_PREPARE,
                         Capability.ALIBABA_ORDER_DRAFT,
+                        Capability.REMARK_SHIPMENT,
                     }
                 )
             ),

@@ -31,6 +31,7 @@ from shipment_automation.models import (
     TRACKING_REVIEW_AUTO_RECHECK,
     TRACKING_REVIEW_ORDER_ISSUE,
     LogisticsDetail,
+    LogisticsWorkerReport,
     ShipmentCandidate,
 )
 from shipment_automation.queue_store import ShipmentQueueStore
@@ -1374,3 +1375,71 @@ def test_run_logistics_worker_rechecks_tracking_pair_accepted_by_current_rules(
         event.event_type == "TRACKING_RULE_MATCH_REQUEUED"
         for event in store.history(candidate.logistics_no)
     )
+
+
+def test_completed_refresh_pass_creates_re_mark_cycle_from_new_valid_waybill(
+    tmp_path,
+) -> None:
+    store = ShipmentQueueStore(tmp_path / "shipment_queue.sqlite3")
+    candidate = ShipmentCandidate(
+        system_order_no="103735075688785273",
+        platform_order_no="113-1341773-1145022",
+        logistics_no="ALS01915029156",
+        shipment_tag_name="自动标发",
+        sales_platform_code="Amazon",
+        sales_platform_name="Amazon",
+        platform_order_item_ids=("167540768447001",),
+        logistics_provider_name="手动",
+        logistics_type_name="万邦速达",
+    )
+    store.upsert_candidate(candidate)
+    assert store.complete_logistics_attempt(
+        candidate.logistics_no,
+        LogisticsDetail(
+            logistics_no=candidate.logistics_no,
+            status_text="运输中",
+            service_line="万邦速达",
+            carrier="万邦速达",
+            international_tracking_no="WNBAA0494424973YQ",
+            actual_total="CNY 136.03",
+            chargeable_weight_kg="2",
+        ),
+        state=LOGISTICS_READY,
+        last_error=None,
+    )
+    assert store.mark_erp_outbounded(candidate.logistics_no)
+    rows = store.list_completed_refresh_targets(eligible_only=True)
+    report = LogisticsWorkerReport(status="completed", message="test")
+
+    async def fetch(logistics_no: str) -> LogisticsDetail:
+        assert logistics_no == candidate.logistics_no
+        return LogisticsDetail(
+            logistics_no=logistics_no,
+            status_text="运输中",
+            service_line="OnTrac",
+            carrier="OnTrac",
+            international_tracking_no="1LSD01R0018AGMD",
+            actual_total="CNY 136.03",
+            chargeable_weight_kg="2",
+        )
+
+    asyncio.run(
+        worker_module._process_completed_refresh_rows(
+            store,
+            rows,
+            fetch_detail=fetch,
+            retry_fetch_detail=None,
+            report=report,
+            update_queue=True,
+            dry_run=False,
+            run_id="completed-refresh-test",
+            progress_callback=None,
+        )
+    )
+
+    assert report.completed_refresh_target_count == 1
+    assert report.completed_refresh_checked_count == 1
+    assert report.completed_refresh_changed_count == 1
+    cycles = store.list_re_mark_cycles()
+    assert len(cycles) == 1
+    assert cycles[0].new_waybill_no == "1LSD01R0018AGMD"

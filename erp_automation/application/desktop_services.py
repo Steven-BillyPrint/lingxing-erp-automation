@@ -39,6 +39,7 @@ from shipment_automation.alibaba_ordering import (
 )
 from shipment_automation.candidate_scanner import build_shipment_scan_report
 from shipment_automation.queue_store import ShipmentQueueStore
+from shipment_automation.re_mark_domain import completed_re_mark_eligibility
 from lingxing_automation.services.folder_builder import find_platform_order_folders
 from lingxing_automation.products.catalog import PRODUCT_IDENTITY_CATALOG_VERSION
 
@@ -47,6 +48,7 @@ from .api_scanners import (
     CustomizationApiScanResult,
     ShipmentApiScanResult,
     customer_shipping_field_candidates_from_payload,
+    completed_re_mark_evidence_from_payload,
     customer_shipping_list_evidence_from_payload,
     fetch_all_order_pages,
     fetch_stable_order_snapshot,
@@ -222,6 +224,7 @@ _UI_TO_API_CAPABILITY: dict[UiCapability, tuple[ApiCapability, ...]] = {
     UiCapability.AUDIT_ORDER: (ApiCapability.REVIEW_ORDER,),
     UiCapability.UPDATE_TRACKING: (ApiCapability.UPDATE_TRACKING,),
     UiCapability.OUTBOUND_ORDER: (ApiCapability.OUTBOUND_ORDER,),
+    UiCapability.REMARK_SHIPMENT: (ApiCapability.REMARK_SHIPMENT,),
     UiCapability.ALIBABA_LOGISTICS: (ApiCapability.ALIBABA_LOGISTICS,),
     UiCapability.EMAIL_PREVIEW: (ApiCapability.SEND_EMAIL,),
     UiCapability.SEND_NOTIFICATION: (ApiCapability.SEND_EMAIL,),
@@ -253,6 +256,7 @@ def build_capability_router(
     modes[ApiCapability.UPDATE_BUYER_EMAIL] = ApiCapabilityMode.BROWSER_ONLY
     modes[ApiCapability.READ_FULL_ADDRESS] = ApiCapabilityMode.BROWSER_ONLY
     modes[ApiCapability.ALIBABA_LOGISTICS] = ApiCapabilityMode.BROWSER_ONLY
+    modes[ApiCapability.REMARK_SHIPMENT] = ApiCapabilityMode.BROWSER_ONLY
     modes[ApiCapability.SEND_EMAIL] = ApiCapabilityMode.DISABLED
     return CapabilityRouter(
         modes,
@@ -2013,6 +2017,68 @@ class DesktopApiServices:
             runtime_failed,
         )
 
+    @staticmethod
+    async def _refresh_completed_shipment_eligibility_evidence(
+        gateway: LingxingGateway,
+        queue: ShipmentQueueStore,
+        *,
+        run_id: str,
+    ) -> dict[str, int]:
+        """Backfill the three eligibility facts through exact OpenAPI details."""
+
+        targets = queue.list_completed_refresh_targets(
+            eligible_only=False,
+            limit=500,
+        )
+        metrics = {
+            "target_count": len(targets),
+            "checked_count": 0,
+            "eligible_count": 0,
+            "ineligible_count": 0,
+            "failed_count": 0,
+        }
+        seen: set[tuple[str, str]] = set()
+        for target in targets:
+            system_order_no = str(target.get("system_order_no") or "").strip()
+            platform_order_no = str(target.get("platform_order_no") or "").strip()
+            identity = (system_order_no, platform_order_no)
+            if not all(identity) or identity in seen:
+                continue
+            seen.add(identity)
+            try:
+                detail = await gateway.get_order_detail(system_order_no)
+                evidence = completed_re_mark_evidence_from_payload(
+                    detail.payload,
+                    system_order_no=system_order_no,
+                    platform_order_no=platform_order_no,
+                )
+                changed = queue.update_completed_refresh_evidence(
+                    system_order_no=system_order_no,
+                    platform_order_no=platform_order_no,
+                    run_id=run_id,
+                    **evidence,
+                )
+                metrics["checked_count"] += 1
+                if changed:
+                    refreshed = queue.get_by_logistics_no(
+                        str(target.get("logistics_no") or "")
+                    )
+                    decision = completed_re_mark_eligibility(
+                        sales_platform_code=(refreshed or {}).get("sales_platform_code"),
+                        sales_platform_name=(refreshed or {}).get("sales_platform_name"),
+                        platform_order_item_ids=(refreshed or {}).get("platform_order_item_ids"),
+                        logistics_provider_name=(refreshed or {}).get("logistics_provider_name"),
+                        logistics_type_name=(refreshed or {}).get("logistics_type_name"),
+                    )
+                    metrics[
+                        "eligible_count" if decision.eligible else "ineligible_count"
+                    ] += 1
+                else:
+                    metrics["ineligible_count"] += 1
+            except Exception:
+                metrics["failed_count"] += 1
+        return metrics
+
     async def scan_shipments(
         self,
         settings: DesktopSettings,
@@ -2071,6 +2137,13 @@ class DesktopApiServices:
         }
         cancelled_logistics_refresh_request_ids: tuple[str, ...] = ()
         cancelled_logistics_refresh_runtime_failed = False
+        completed_refresh_evidence = {
+            "target_count": 0,
+            "checked_count": 0,
+            "eligible_count": 0,
+            "ineligible_count": 0,
+            "failed_count": 0,
+        }
         email_preview_is_enabled = email_preview_enabled(configuration)
         scan_error: Exception | None = None
         try:
@@ -2089,6 +2162,13 @@ class DesktopApiServices:
                     reconcile_missing=False,
                 )
                 if result.complete:
+                    completed_refresh_evidence = (
+                        await self._refresh_completed_shipment_eligibility_evidence(
+                            gateway,
+                            queue,
+                            run_id=audit_task_id,
+                        )
+                    )
                     (
                         cancelled_logistics_refresh,
                         cancelled_logistics_refresh_request_ids,
@@ -2240,6 +2320,7 @@ class DesktopApiServices:
         payload["cancelled_logistics_refresh"] = dict(
             cancelled_logistics_refresh
         )
+        payload["completed_refresh_evidence"] = dict(completed_refresh_evidence)
         if result is None:
             status = "failed"
         elif result is not None and result.state is not ApiScanState.COMPLETE:

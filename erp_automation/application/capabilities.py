@@ -20,6 +20,7 @@ class Capability(StrEnum):
     REVIEW_ORDER = "review_order"
     UPDATE_TRACKING = "update_tracking"
     OUTBOUND_ORDER = "outbound_order"
+    REMARK_SHIPMENT = "remark_shipment"
     READ_FULL_ADDRESS = "read_full_address"
     ALIBABA_LOGISTICS = "alibaba_logistics"
     SEND_EMAIL = "send_email"
@@ -45,6 +46,7 @@ DEFAULT_CAPABILITY_MODES: dict[Capability, CapabilityMode] = {
     Capability.REVIEW_ORDER: CapabilityMode.API_PREFERRED,
     Capability.UPDATE_TRACKING: CapabilityMode.API_PREFERRED,
     Capability.OUTBOUND_ORDER: CapabilityMode.API_PREFERRED,
+    Capability.REMARK_SHIPMENT: CapabilityMode.BROWSER_ONLY,
     Capability.READ_FULL_ADDRESS: CapabilityMode.BROWSER_ONLY,
     Capability.ALIBABA_LOGISTICS: CapabilityMode.BROWSER_ONLY,
     Capability.SEND_EMAIL: CapabilityMode.DISABLED,
