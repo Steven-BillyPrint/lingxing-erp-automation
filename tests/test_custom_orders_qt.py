@@ -5579,6 +5579,36 @@ def test_notification_background_refresh_keeps_actions_but_navigation_locks_them
         page.deleteLater()
 
 
+def test_notification_snapshot_refresh_does_not_supersede_user_navigation(
+    app,
+    monkeypatch,
+) -> None:
+    page = ShipmentNotificationPage(RecordingController(), lambda _result: None)
+    page._notifications_loaded = True
+    page._notification_dataset_revision = "notification-revision-1"
+    page._notification_page_navigation_loading = True
+    reloads = 0
+
+    def counted_reload(*, navigation=True):
+        nonlocal reloads
+        reloads += 1
+
+    monkeypatch.setattr(page, "_reload", counted_reload)
+
+    page.update_snapshot(
+        DesktopSnapshot(
+            notifications_summary=DatasetSummary(
+                100,
+                "notification-revision-2",
+            )
+        )
+    )
+
+    assert reloads == 0
+    assert page._notification_refresh_after_navigation is True
+    page.deleteLater()
+
+
 def test_shipment_submission_from_later_page_moves_waiting_order_to_first_page(app):
     controller = RecordingController()
     page = ShipmentPage(controller, lambda _result: None)
@@ -5612,7 +5642,7 @@ def test_shipment_submission_from_later_page_moves_waiting_order_to_first_page(a
     page.deleteLater()
 
 
-def test_notification_cached_next_page_renders_before_background_refresh(
+def test_notification_fresh_cached_next_page_renders_without_refresh(
     app,
     monkeypatch,
 ):
@@ -5675,7 +5705,88 @@ def test_notification_cached_next_page_renders_before_background_refresh(
 
     assert page._notification_page == 2
     assert page.table.item(0, 1).text() == "PAGE-2"
-    assert refreshes == 1
+    assert refreshes == 0
+    page.deleteLater()
+
+
+def test_notification_stale_cached_page_renders_before_background_revalidation(
+    app,
+    monkeypatch,
+):
+    page = ShipmentNotificationPage(RecordingController(), lambda _result: None)
+    page._notification_dataset_revision = "notification-revision-1"
+    page._notification_total_pages = 2
+    page_two_query = page._notification_page_query(2)
+    page_two_key = page._notification_page_cache_key(page_two_query)
+    page._cache_notification_page(
+        page_two_key,
+        {
+            "items": [
+                {
+                    "id": 2,
+                    "platform_order_no": "CACHED-PAGE-2",
+                    "state": "AWAITING_REVIEW",
+                    "package_total": 1,
+                    "package_complete": 1,
+                    "package_missing": 0,
+                    "preview_items": [],
+                }
+            ],
+            "page": 2,
+            "page_size": 50,
+            "total": 100,
+            "total_pages": 2,
+            "dataset_revision": "notification-revision-1",
+            "product_types": [],
+        },
+    )
+    page._notification_page_loader.invalidate()
+    page._notification_dataset_revision = "notification-revision-2"
+    revalidations = 0
+
+    def assert_visible_then_revalidate():
+        nonlocal revalidations
+        revalidations += 1
+        assert page._notification_page == 2
+        assert page.pagination_bar.page == 2
+        assert page.table.item(0, 1).text() == "CACHED-PAGE-2"
+
+    monkeypatch.setattr(page, "_reload", assert_visible_then_revalidate)
+
+    page._show_notification_page(2)
+
+    assert revalidations == 1
+    assert page._notification_loaded_revision == ""
+    page.deleteLater()
+
+
+def test_notification_prefetch_warms_two_forward_pages_and_previous_page(
+    app,
+    monkeypatch,
+):
+    class BackgroundNotificationController(RecordingController):
+        snapshot_runs_in_background = True
+
+    page = ShipmentNotificationPage(
+        BackgroundNotificationController(),
+        lambda _result: None,
+    )
+    page._notification_page = 3
+    page._notification_total_pages = 6
+    prefetched_pages: list[int] = []
+
+    def record_prefetch(query, _key, _revision):
+        prefetched_pages.append(int(query["page"]))
+
+    monkeypatch.setattr(
+        page._notification_page_loader,
+        "prefetch",
+        record_prefetch,
+    )
+
+    page._prefetch_adjacent_notification_pages()
+
+    assert prefetched_pages == [4, 5, 2]
     page.deleteLater()
 
 
