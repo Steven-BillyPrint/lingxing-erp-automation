@@ -10,6 +10,7 @@ from erp_automation.coordination.local_alibaba_order import (
 )
 from erp_automation.ui.models import (
     LOCAL_BROWSER_ACTION_ALIBABA_ORDER_FILL,
+    LOCAL_BROWSER_ACTION_ALIBABA_ORDER_PREPARE,
     DesktopWriteAction,
     DesktopWriteConfirmation,
 )
@@ -42,6 +43,64 @@ def _frame_detail() -> dict[str, object]:
     detail = _detail()
     detail["order_item"] = [{"sku": "10X15-FRAME-38MM-SQUARE-RAIL"}]
     return detail
+
+
+def test_local_browser_only_prepare_does_not_wait_for_order_detail(
+    monkeypatch,
+) -> None:
+    old_url = "https://scm.alibaba.com/web/express/order.htm?old=1"
+    observed: dict[str, object] = {}
+
+    @asynccontextmanager
+    async def context(endpoint):
+        observed["endpoint"] = endpoint
+        yield object()
+
+    class Page:
+        async def bring_to_front(self):
+            observed["brought_to_front"] = True
+
+    class Browser:
+        def __init__(self, _context):
+            pass
+
+        async def draft_urls(self):
+            return (old_url,)
+
+        async def prepare_quote_page(self, *, login_config):
+            observed["login_account"] = login_config.account
+            return Page()
+
+    monkeypatch.setattr(
+        "shipment_automation.alibaba_order_browser.attached_alibaba_context",
+        context,
+    )
+    monkeypatch.setattr(
+        "shipment_automation.alibaba_order_browser.AlibabaOrderBrowser",
+        Browser,
+    )
+    executor = LocalAlibabaOrderActionExecutor("http://127.0.0.1:28076")
+
+    result = executor.execute(
+        LOCAL_BROWSER_ACTION_ALIBABA_ORDER_PREPARE,
+        {
+            "browser_only": True,
+            "login_config": {
+                "account": "configured@example.com",
+                "password": "configured-password",
+                "auto_login": True,
+            },
+        },
+    )
+
+    assert result["baseline_draft_urls"] == [old_url]
+    assert result["browser_prepare_elapsed_ms"] >= 0
+    assert "address" not in result
+    assert observed == {
+        "endpoint": "http://127.0.0.1:28076",
+        "login_account": "configured@example.com",
+        "brought_to_front": True,
+    }
 
 
 def test_local_fill_action_attaches_to_local_chrome_and_never_submits(

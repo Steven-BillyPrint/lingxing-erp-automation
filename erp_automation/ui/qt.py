@@ -49,6 +49,7 @@ from .models import (
     LogEntry,
     NOTIFICATION_CONTACT_REFRESH_TRIGGER,
     NOTIFICATION_REVIEW_RESCAN_TRIGGER,
+    PARALLEL_ALIBABA_ORDER_PREPARE_PAYLOAD_KEY,
     SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER,
     SHIPMENT_NOTIFICATION_SEND_TRIGGER,
     SERVER_CONFIGURED_SECRET,
@@ -5458,6 +5459,7 @@ if PYSIDE6_AVAILABLE:
             self.prepare_button.clicked.connect(self._prepare)
             self.fill_button = QPushButton("2. 填写当前阿里下单草稿")
             self.fill_button.setObjectName("primaryButton")
+            self.fill_button.setEnabled(False)
             self.fill_button.clicked.connect(self._fill_draft)
             button_row.addWidget(self.prepare_button)
             button_row.addWidget(self.fill_button)
@@ -5507,6 +5509,7 @@ if PYSIDE6_AVAILABLE:
             self.copy_postal_button.setText("复制邮编")
             self.copy_postal_button.setEnabled(False)
             self.quote_info_frame.setVisible(False)
+            self.fill_button.setEnabled(False)
 
         def apply_quote_details(self, request: DesktopInteractionRequest) -> bool:
             if request.stage != "alibaba_order:quote_details":
@@ -5565,6 +5568,9 @@ if PYSIDE6_AVAILABLE:
                 self.heavy_checkbox.setEnabled(True)
             self.copy_postal_button.setEnabled(True)
             self.quote_info_frame.setVisible(True)
+            # This interaction is emitted only after both the order data and
+            # the local quote page are ready and the draft baseline is saved.
+            self.fill_button.setEnabled(True)
             return True
 
         def _copy_postal_code(self) -> None:
@@ -5595,6 +5601,9 @@ if PYSIDE6_AVAILABLE:
                 area=TaskArea.SHIPMENT,
                 capability=Capability.ALIBABA_ORDER_PREPARE,
                 order_no=order_identifier,
+                payload={
+                    PARALLEL_ALIBABA_ORDER_PREPARE_PAYLOAD_KEY: True,
+                },
             )
             self.prepare_button.setEnabled(False)
 
@@ -5731,14 +5740,16 @@ if PYSIDE6_AVAILABLE:
             if task is None:
                 self.status_label.setText("尚未开始")
                 self.prepare_button.setEnabled(True)
-                self.fill_button.setEnabled(True)
+                self.fill_button.setEnabled(bool(self._quote_postal_code))
                 return
             self.status_label.setText(
                 f"{task.status.label} · {task.progress_percent}%\n{task.message}"
             )
             active = not task.status.terminal
             self.prepare_button.setEnabled(not active)
-            self.fill_button.setEnabled(not active)
+            self.fill_button.setEnabled(
+                not active and bool(self._quote_postal_code)
+            )
 
 
     class ShipmentPage(QWidget):

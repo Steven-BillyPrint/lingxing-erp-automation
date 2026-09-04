@@ -39,6 +39,7 @@ from erp_automation.ui.models import (
     NOTIFICATION_CONTACT_REFRESH_TRIGGER,
     NOTIFICATION_REVIEW_RESCAN_TRIGGER,
     NOTIFICATION_SYNC_INCLUDE_DEFERRED_RETRIES_KEY,
+    PARALLEL_ALIBABA_ORDER_PREPARE_PAYLOAD_KEY,
     SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER,
     SHIPMENT_NOTIFICATION_SEND_TRIGGER,
     TaskArea,
@@ -342,8 +343,12 @@ def test_prepare_alibaba_order_uses_public_order_list_address(
 
 def test_shared_prepare_delegates_browser_work_to_submitting_desktop(tmp_path) -> None:
     observed: dict[str, Any] = {}
+    order_lookup_started = asyncio.Event()
+    browser_prepare_started = asyncio.Event()
 
     async def lookup(_settings, order_identifier):
+        order_lookup_started.set()
+        await asyncio.wait_for(browser_prepare_started.wait(), timeout=1)
         return ResolvedOrderDetail(
             requested_order_no=order_identifier,
             system_order_no=SYSTEM_ORDER_NO,
@@ -354,28 +359,16 @@ def test_shared_prepare_delegates_browser_work_to_submitting_desktop(tmp_path) -
     async def interaction_handler(**kwargs):
         action = str(kwargs.get("automatic_action") or "")
         if action:
+            browser_prepare_started.set()
+            await asyncio.wait_for(order_lookup_started.wait(), timeout=1)
             observed["action"] = action
             observed["action_payload"] = kwargs["action_payload"]
             return DesktopInteractionResponse(
                 "prepare-local",
                 True,
                 result_data={
-                    "address": {
-                        "company": "Jane Smith",
-                        "recipient": "Jane Smith",
-                        "country_code": "US",
-                        "country_name": "United States",
-                        "province": "CA",
-                        "city": "Los Angeles",
-                        "address1": "123 Main Street",
-                        "address2": "",
-                        "postal_code": "90012",
-                        "dial_code": "1",
-                        "phone": "2135550188",
-                        "email": "jane@example.com",
-                    },
-                    "address_source": "lingxing_openapi",
                     "baseline_draft_urls": ["https://example.invalid/old-draft"],
+                    "browser_prepare_elapsed_ms": 25,
                 },
             )
         observed["quote_details"] = dict(kwargs.get("display_data") or {})
@@ -401,16 +394,22 @@ def test_shared_prepare_delegates_browser_work_to_submitting_desktop(tmp_path) -
             TaskArea.SHIPMENT,
             Capability.ALIBABA_ORDER_PREPARE,
             order_no=PLATFORM_ORDER_NO,
-            payload={"_desktop_instance_id": "desktop-a"},
+            payload={
+                "_desktop_instance_id": "desktop-a",
+                PARALLEL_ALIBABA_ORDER_PREPARE_PAYLOAD_KEY: True,
+            },
         )
     )
 
     assert result.succeeded is True
     assert observed["action"] == "alibaba_order_prepare"
+    assert observed["action_payload"]["browser_only"] is True
+    assert "detail" not in observed["action_payload"]
     assert observed["action_payload"]["login_config"]["password"] == (
         "configured-password"
     )
     assert observed["quote_details"]["destination_postal_code"] == "90012"
+    assert result.payload["browser_prepare_elapsed_ms"] == 25
     assert AlibabaOrderSessionStore(
         tmp_path / "data" / "alibaba_ordering.sqlite3"
     ).get(SYSTEM_ORDER_NO, instance_id="desktop-a") is not None

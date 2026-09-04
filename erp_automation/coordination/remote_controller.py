@@ -1199,7 +1199,21 @@ class RemoteBackgroundTaskController:
                             and command.capability
                             is Capability.ALIBABA_ORDER_PREPARE
                         ):
-                            browser_host.open_url(ALIBABA_QUOTE_URL)
+                            if method == "submit_task":
+                                # The user has explicitly clicked prepare, so
+                                # start Chrome now but do not make the RPC wait
+                                # for a cold browser.  The automatic local
+                                # action is queued on this same single-worker
+                                # lane and will open/validate the quote page
+                                # after startup while the server reads Lingxing.
+                                self._local_action_pool.submit(
+                                    browser_host.ensure_started,
+                                    initial_url=ALIBABA_QUOTE_URL,
+                                )
+                            else:
+                                # Keep batch submission's all-or-nothing
+                                # browser readiness contract unchanged.
+                                browser_host.open_url(ALIBABA_QUOTE_URL)
                         elif (
                             command.area is TaskArea.MAINTENANCE
                             and str(command.payload.get("trigger") or "").strip()

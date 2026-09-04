@@ -75,34 +75,51 @@ class LocalAlibabaOrderActionExecutor:
             attached_alibaba_context,
         )
 
-        detail = self._mapping(payload.get("detail"), "订单详情")
-        system_order_no = str(payload.get("system_order_no") or "").strip()
-        if not system_order_no:
-            raise ValueError("本机浏览器步骤缺少系统单号。")
+        started = time.monotonic()
+        browser_only = bool(payload.get("browser_only"))
+        detail: dict[str, Any] | None = None
+        if not browser_only:
+            detail = self._mapping(payload.get("detail"), "订单详情")
+            system_order_no = str(payload.get("system_order_no") or "").strip()
+            if not system_order_no:
+                raise ValueError("本机浏览器步骤缺少系统单号。")
         login_config = self._login_config(payload)
         async with attached_alibaba_context(self.browser_endpoint) as context:
             browser = AlibabaOrderBrowser(context)
             baseline = await browser.draft_urls()
-            address_task = asyncio.create_task(
-                self._shipping_address(detail)
-            )
-            quote_task = asyncio.create_task(
-                browser.prepare_quote_page(login_config=login_config)
-            )
-            tasks = (address_task, quote_task)
-            try:
-                (address, address_source), quote_page = await asyncio.gather(*tasks)
-            finally:
-                for task in tasks:
-                    if not task.done():
-                        task.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
+            if browser_only:
+                quote_page = await browser.prepare_quote_page(
+                    login_config=login_config
+                )
+            else:
+                assert detail is not None
+                address_task = asyncio.create_task(
+                    self._shipping_address(detail)
+                )
+                quote_task = asyncio.create_task(
+                    browser.prepare_quote_page(login_config=login_config)
+                )
+                tasks = (address_task, quote_task)
+                try:
+                    (address, address_source), quote_page = await asyncio.gather(
+                        *tasks
+                    )
+                finally:
+                    for task in tasks:
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
             await quote_page.bring_to_front()
-        return {
-            "address": asdict(address),
-            "address_source": address_source,
+        result: dict[str, Any] = {
             "baseline_draft_urls": list(baseline),
+            "browser_prepare_elapsed_ms": round(
+                (time.monotonic() - started) * 1000
+            ),
         }
+        if not browser_only:
+            result["address"] = asdict(address)
+            result["address_source"] = address_source
+        return result
 
     async def _fill(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
         from shipment_automation.alibaba_order_browser import (
