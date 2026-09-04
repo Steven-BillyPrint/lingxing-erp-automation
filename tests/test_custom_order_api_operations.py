@@ -1744,7 +1744,7 @@ def test_get_order_context_marks_dash_recipient_as_missing_placeholder() -> None
     asyncio.run(run())
 
 
-def test_get_order_context_merges_incomplete_detail_address_with_root_country() -> None:
+def test_get_order_context_uses_real_openapi_list_address_shape() -> None:
     async def run() -> None:
         platform_order_no = "111-9376959-0968245"
         system_order_no = "103732377639436478"
@@ -1752,10 +1752,16 @@ def test_get_order_context_merges_incomplete_detail_address_with_root_country() 
             system_order_no,
             platform_order_no,
             [_item("item-1", "amazon-item-1", "M1", "L1", 1, platform_order_no)],
-            receiver_country_code="US",
-            receiver_state="WA",
-            city="Seattle",
-            postal_code="98168-1303",
+            address_info={
+                "name": "Seattle Buyer",
+                "receiver_country_code": "US",
+                "receiver_country_name": "United States",
+                "receiver_state": "WA",
+                "receiver_city": "Seattle",
+                "receiver_address": "123 Airport Way Suite 4",
+                "receiver_postal_code": "98168-1303",
+                "receiver_tel": "+1 206-555-0100",
+            },
         )
 
         class ContextGateway(FakeGateway):
@@ -1772,7 +1778,7 @@ def test_get_order_context_merges_incomplete_detail_address_with_root_country() 
                                 "product_no": "B0CRRGTPFH",
                             }
                         ],
-                        "receive_info": {"receiver_name": "Seattle Buyer"},
+                        "receive_info": {"receiver_name": "-"},
                     },
                 )
 
@@ -1784,9 +1790,11 @@ def test_get_order_context_merges_incomplete_detail_address_with_root_country() 
         )
 
         assert context.recipient_name == "Seattle Buyer"
-        assert "US" in context.shipping_address_text
+        assert "United States" in context.shipping_address_text
         assert "Seattle" in context.shipping_address_text
+        assert "123 Airport Way Suite 4" in context.shipping_address_text
         assert context.shipping_postal_code == "98168"
+        assert context.shipping_address_error is None
 
     asyncio.run(run())
 

@@ -25,11 +25,28 @@ from lingxing_automation.services.custom_zip_downloader import (
     CUSTOM_ZIP_DOWNLOAD_ERROR,
     CUSTOM_ZIP_NOT_FOUND,
 )
+from lingxing_automation.services.custom_order_api import CustomOrderApiContext
 
 
 PLATFORM_ORDER_NO = "111-2222222-3333333"
 SYSTEM_ORDER_NO = "103000000000000001"
 ORDER_ITEM_ID = "164596991889281"
+
+
+def _api_context(recipient_name: str = "Jane Doe") -> CustomOrderApiContext:
+    item = BatchOrderItem(SYSTEM_ORDER_NO, PLATFORM_ORDER_NO, "")
+    return CustomOrderApiContext(
+        item=item,
+        system_order_nos=(SYSTEM_ORDER_NO,),
+        recipient_name=recipient_name,
+        recipient_name_raw=recipient_name,
+        recipient_name_source="lingxing_openapi",
+        shipping_address_text=(
+            "收件地址 United States，CA，Los Angeles，123 Main Street 邮编 90012"
+        ),
+        shipping_postal_code="90012",
+        shipping_postal_source="lingxing_openapi",
+    )
 
 
 def _custom_zip(*, order_id: str = PLATFORM_ORDER_NO, order_item_id: str = ORDER_ITEM_ID) -> bytes:
@@ -509,10 +526,6 @@ def test_collect_folder_context_routes_zip_to_api_without_browser_fallback(
 ) -> None:
     calls: list[str] = []
 
-    async def read_recipient(_page: object) -> str:
-        calls.append("page_recipient")
-        return "Jane Doe"
-
     async def forbidden_browser_download(*_args: Any, **_kwargs: Any) -> OrderCustomZipBundle:
         raise AssertionError("API-injected ZIP collection must not use browser automation")
 
@@ -546,7 +559,6 @@ def test_collect_folder_context_routes_zip_to_api_without_browser_fallback(
                 error="injected API failure",
             )
 
-    monkeypatch.setattr(contact_sync, "read_detail_recipient_name", read_recipient)
     monkeypatch.setattr(
         contact_sync,
         "download_order_custom_zip_bundle",
@@ -562,22 +574,21 @@ def test_collect_folder_context_routes_zip_to_api_without_browser_fallback(
             staging_root=tmp_path,
             download_custom_zip=True,
             api_operations=Operations(),  # type: ignore[arg-type]
+            api_order_context=_api_context(),
         )
     )
 
     assert context["recipient_name"] == "Jane Doe"
     assert context["zip_bundle"].error == "injected API failure"
-    assert calls == ["page_recipient", "api_zip"]
+    assert context["recipient_name_source"] == "lingxing_openapi"
+    assert calls == ["api_zip"]
 
 
-def test_collect_folder_context_always_uses_web_detail_recipient_name(
+def test_collect_folder_context_uses_openapi_recipient_name(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    """API 返回什么姓名都不能覆盖原网页详情姓名。"""
-
-    async def read_recipient(_page: object) -> str:
-        return "Web Detail Name"
+    """Folder naming must consume the normalized Lingxing OpenAPI context."""
 
     class QuantityClient:
         async def get_order_items(
@@ -600,12 +611,6 @@ def test_collect_folder_context_always_uses_web_detail_recipient_name(
                 recipient_name="Amazon API Name",
             )
 
-    monkeypatch.setattr(
-        contact_sync,
-        "read_detail_recipient_name",
-        read_recipient,
-    )
-
     context = asyncio.run(
         contact_sync.collect_order_folder_json_context(
             object(),
@@ -615,11 +620,12 @@ def test_collect_folder_context_always_uses_web_detail_recipient_name(
             staging_root=tmp_path,
             download_custom_zip=False,
             api_operations=object(),  # type: ignore[arg-type]
+            api_order_context=_api_context("Lingxing OpenAPI Name"),
         )
     )
 
-    assert context["recipient_name"] == "Web Detail Name"
-    assert context["recipient_name_source"] == "lingxing_browser_detail"
+    assert context["recipient_name"] == "Lingxing OpenAPI Name"
+    assert context["recipient_name_source"] == "lingxing_openapi"
 
 
 @pytest.mark.parametrize(
@@ -632,9 +638,6 @@ def test_collect_folder_context_does_not_use_browser_after_api_read_failure(
     api_status: str,
 ) -> None:
     calls: list[str] = []
-
-    async def read_recipient(_page: object) -> str:
-        return "Jane Doe"
 
     class QuantityClient:
         async def get_order_items(self, platform_order_no: str) -> AmazonOrderQuantityResult:
@@ -673,7 +676,6 @@ def test_collect_folder_context_does_not_use_browser_after_api_read_failure(
             error="browser fixture complete",
         )
 
-    monkeypatch.setattr(contact_sync, "read_detail_recipient_name", read_recipient)
     monkeypatch.setattr(contact_sync, "download_order_custom_zip_bundle", browser)
 
     context = asyncio.run(
@@ -685,6 +687,7 @@ def test_collect_folder_context_does_not_use_browser_after_api_read_failure(
             staging_root=tmp_path,
             download_custom_zip=True,
             api_operations=Operations(),  # type: ignore[arg-type]
+            api_order_context=_api_context(),
             interaction_policy=SimpleNamespace(confirm_browser_fallback=confirm),
         )
     )
@@ -700,9 +703,6 @@ def test_collect_folder_context_does_not_use_browser_for_attachment_rate_limit(
     tmp_path: Path,
 ) -> None:
     calls: list[str] = []
-
-    async def read_recipient(_page: object) -> str:
-        return "Jane Doe"
 
     class QuantityClient:
         async def get_order_items(
@@ -746,7 +746,6 @@ def test_collect_folder_context_does_not_use_browser_for_attachment_rate_limit(
         calls.append("browser")
         raise AssertionError("rate-limited API must not fall back to browser")
 
-    monkeypatch.setattr(contact_sync, "read_detail_recipient_name", read_recipient)
     monkeypatch.setattr(
         contact_sync,
         "download_order_custom_zip_bundle",
@@ -762,6 +761,7 @@ def test_collect_folder_context_does_not_use_browser_for_attachment_rate_limit(
             staging_root=tmp_path,
             download_custom_zip=True,
             api_operations=Operations(),  # type: ignore[arg-type]
+            api_order_context=_api_context(),
             interaction_policy=SimpleNamespace(
                 confirm_browser_fallback=confirm
             ),

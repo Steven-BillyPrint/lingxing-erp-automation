@@ -219,7 +219,6 @@ def _patch_order_context(monkeypatch, contact: ContactInfo, *, web_saved: bool =
     monkeypatch.setattr(contact_sync, "wait_for_detail", no_op)
     monkeypatch.setattr(contact_sync, "assert_current_detail_order", no_op)
     monkeypatch.setattr(contact_sync, "collect_order_folder_json_context", collect_context)
-    monkeypatch.setattr(contact_sync, "read_detail_shipping_address_text", no_op)
     monkeypatch.setattr(
         contact_sync,
         "extract_contact_candidates_from_json_items",

@@ -13,3 +13,4 @@ def test_contact_business_mode_is_browser_while_phone_api_remains_diagnostic() -
 
     assert router.mode_for(ApiCapability.UPDATE_BUYER_EMAIL) is ApiCapabilityMode.BROWSER_ONLY
     assert router.mode_for(ApiCapability.UPDATE_PHONE) is ApiCapabilityMode.API_PREFERRED
+    assert router.mode_for(ApiCapability.READ_FULL_ADDRESS) is ApiCapabilityMode.API_PREFERRED

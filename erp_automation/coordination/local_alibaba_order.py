@@ -56,37 +56,18 @@ class LocalAlibabaOrderActionExecutor:
     @staticmethod
     async def _shipping_address(
         detail: Mapping[str, Any],
-        context: Any,
-        system_order_no: str,
     ) -> tuple[Any, str]:
         from shipment_automation.alibaba_ordering import (
             AlibabaOrderRuleError,
             extract_shipping_address,
-            shipping_address_payload_with_web_detail_fallback,
         )
-        from shipment_automation.lingxing_order_browser import LingxingOrderBrowser
 
         try:
             return extract_shipping_address(detail), "lingxing_openapi"
-        except AlibabaOrderRuleError as openapi_error:
-            try:
-                web_detail = await LingxingOrderBrowser(context).order_detail(
-                    system_order_no
-                )
-            except AlibabaOrderRuleError as fallback_error:
-                raise AlibabaOrderRuleError(
-                    f"{openapi_error} 本机领星网页地址兜底失败：{fallback_error}"
-                ) from fallback_error
-            fallback_payload = shipping_address_payload_with_web_detail_fallback(
-                detail,
-                web_detail,
-            )
-            try:
-                return extract_shipping_address(fallback_payload), "lingxing_web_detail_api"
-            except AlibabaOrderRuleError as fallback_error:
-                raise AlibabaOrderRuleError(
-                    f"{fallback_error}（领星 OpenAPI 地址不完整，且本机页面详情仍无法形成完整地址。）"
-                ) from fallback_error
+        except AlibabaOrderRuleError as exc:
+            raise AlibabaOrderRuleError(
+                f"领星公开 API 订单列表地址不完整：{exc}"
+            ) from exc
 
     async def _prepare(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
         from shipment_automation.alibaba_order_browser import (
@@ -103,7 +84,7 @@ class LocalAlibabaOrderActionExecutor:
             browser = AlibabaOrderBrowser(context)
             baseline = await browser.draft_urls()
             address_task = asyncio.create_task(
-                self._shipping_address(detail, context, system_order_no)
+                self._shipping_address(detail)
             )
             quote_task = asyncio.create_task(
                 browser.prepare_quote_page(login_config=login_config)
@@ -197,7 +178,7 @@ class LocalAlibabaOrderActionExecutor:
                 return page, await browser.inspect_draft(page)
 
             address_task = asyncio.create_task(
-                self._shipping_address(detail, context, system_order_no)
+                self._shipping_address(detail)
             )
             draft_task = asyncio.create_task(load_page_and_facts())
             tasks = (address_task, draft_task)

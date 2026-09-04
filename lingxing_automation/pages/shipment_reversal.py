@@ -6,6 +6,7 @@ import re
 from dataclasses import dataclass
 from collections.abc import Awaitable, Callable
 from typing import Any
+from urllib.parse import urlparse
 
 from .system_order_search import (
     _one_visible,
@@ -18,6 +19,15 @@ from .system_order_search import (
 
 
 ORDER_MANAGEMENT_URL = "https://erp.lingxing.com/erp/mmulti/mpOrderManagement"
+
+
+def _is_order_management_page(url: object) -> bool:
+    parsed = urlparse(str(url or "").strip())
+    return (
+        parsed.scheme == "https"
+        and str(parsed.hostname or "").casefold() == "erp.lingxing.com"
+        and parsed.path.rstrip("/") == "/erp/mmulti/mpOrderManagement"
+    )
 
 
 @dataclass(frozen=True)
@@ -49,7 +59,11 @@ async def withdraw_shipped_order_to_pending_review(
     logistics_no: str,
     before_final_confirm: Callable[[], Awaitable[None]] | None = None,
 ) -> ShipmentReversalEvidence:
-    await page.goto(ORDER_MANAGEMENT_URL)
+    # The desktop runner has already attached to and authenticated this page.
+    # Re-navigating the same SPA route waits for every load event again and was
+    # the largest avoidable delay before the system-order search.
+    if not _is_order_management_page(getattr(page, "url", "")):
+        await page.goto(ORDER_MANAGEMENT_URL, wait_until="domcontentloaded")
     await _select_order_tab(page, "已发货")
     await search_exact_system_order(page, system_order_no)
     row_text = await exact_system_order_text(page, system_order_no)

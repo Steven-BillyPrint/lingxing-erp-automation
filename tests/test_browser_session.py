@@ -166,3 +166,32 @@ def test_order_page_timeout_uses_shared_load_failure(monkeypatch, tmp_path):
                 debug_dir=tmp_path,
             )
         )
+
+
+def test_loaded_order_page_uses_small_dom_readiness_probe() -> None:
+    class ReadyLocator:
+        async def count(self):
+            return 1
+
+    class BodyLocator:
+        async def inner_text(self, timeout):
+            raise AssertionError("ready page must not read the entire body")
+
+    class ReadyPage:
+        url = ORDER_MANAGEMENT_URL
+
+        def locator(self, selector):
+            if selector == "#advanced-input:visible":
+                return ReadyLocator()
+            if selector == "body":
+                return BodyLocator()
+            raise AssertionError(f"unexpected selector: {selector}")
+
+    asyncio.run(
+        wait_for_order_page(
+            ReadyPage(),
+            300,
+            LoginConfig(),
+            auto_login=True,
+        )
+    )

@@ -25,8 +25,6 @@ from shipment_automation.alibaba_ordering import (
     product_declaration,
     province_name_for_alibaba,
     signature_required,
-    shipping_address_payload_with_receive_info_fallback,
-    shipping_address_payload_with_web_detail_fallback,
     split_address_lines,
     tent_declaration,
 )
@@ -691,44 +689,31 @@ def test_address_can_take_one_missing_contact_field_from_order_root() -> None:
     assert extract_shipping_address(payload).email == "jane@example.com"
 
 
-def test_verified_web_receive_info_fills_missing_openapi_street() -> None:
-    openapi_detail = {
-        "receive_info": {
-            "receiver_name": "Example Cooperative",
-            "receiver_country_code": "US",
-            "receiver_country_name": "United States of America (USA)",
-            "state_or_region": "FL",
-            "city": "MIAMI",
-            "postal_code": "33182-1909",
-            "receiver_mobile": "3055550199",
-            "address_line1": "",
-        },
-    }
-    web_order_detail = {
-        "global_order_no": "103000000000000001",
-        "buyer_info": {"buyer_email": "receiver@example.com"},
-        "receive_info": {
-            "receiver_name": "Example Cooperative",
-            "receiver_country_code": "US",
-            "receiver_country_name": "United States of America (USA)",
-            "state_or_region": "FL",
-            "city": "MIAMI",
-            "postal_code": "33182-1909",
-            "receiver_mobile": "3055550199",
-            "address_line1": "987 Example Street Apt Unit 100",
-        },
+def test_openapi_order_list_address_can_take_email_from_buyers_info() -> None:
+    payload = {
+        "_lingxing_openapi_order_list_snapshot": {
+            "records": [
+                {
+                    "buyers_info": {"buyer_email": "jane@example.com"},
+                    "address_info": {
+                        "receiver_name": "Jane",
+                        "receiver_country_code": "US",
+                        "receiver_country_name": "United States",
+                        "state_or_region": "CA",
+                        "city": "Los Angeles",
+                        "address_line1": "1 Main Street",
+                        "postal_code": "90012",
+                        "receiver_tel": "2135550188",
+                    },
+                }
+            ]
+        }
     }
 
-    payload = shipping_address_payload_with_web_detail_fallback(
-        openapi_detail,
-        web_order_detail,
-    )
     address = extract_shipping_address(payload)
 
-    assert address.address1 == "987 Example Street"
-    assert address.address2 == "Apt Unit 100"
-    assert address.postal_code == "33182"
-    assert address.email == "receiver@example.com"
+    assert address.email == "jane@example.com"
+    assert address.recipient == "Jane"
 
 
 def test_lingxing_web_order_item_info_container_is_supported() -> None:

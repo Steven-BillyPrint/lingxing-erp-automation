@@ -727,6 +727,8 @@ _ADDRESS_CONTAINER_KEYS = frozenset(
         "deliveryaddress",
         "buyer_info",
         "buyerinfo",
+        "buyers_info",
+        "buyersinfo",
         "buyer",
         "customer_info",
         "customerinfo",
@@ -1108,44 +1110,6 @@ def split_address_lines(
     if " ".join(part for part in (first, second) if part) != source:
         raise AlibabaOrderRuleError("地址拆分完整性校验失败，请人工处理。")
     return first, second
-
-
-def shipping_address_payload_with_web_detail_fallback(
-    payload: Mapping[str, Any],
-    web_order_detail: Mapping[str, Any],
-) -> dict[str, Any]:
-    """Prefer verified web address fields while retaining all contact sources."""
-
-    web_receive_info = web_order_detail.get("receive_info")
-    if not isinstance(web_receive_info, Mapping) or not web_receive_info:
-        raise AlibabaOrderRuleError("领星网页订单详情缺少收货信息。")
-
-    combined: dict[str, Any] = {"receive_info": dict(web_receive_info)}
-    combined.update(
-        (str(key), value)
-        for key, value in payload.items()
-        if str(key) != "receive_info"
-    )
-    # Keep the complete verified web detail because its buyer email is commonly
-    # nested under buyer_info rather than receive_info.  Retain the OpenAPI
-    # detail as another candidate because it may carry fields omitted by the web
-    # endpoint.  Conflicting non-empty values are still rejected by the
-    # extractor instead of being guessed.
-    combined["lingxing_web_order_detail"] = dict(web_order_detail)
-    combined["openapi_order_detail"] = dict(payload)
-    return combined
-
-
-def shipping_address_payload_with_receive_info_fallback(
-    payload: Mapping[str, Any],
-    receive_info: Mapping[str, Any],
-) -> dict[str, Any]:
-    """Compatibility wrapper for callers that only have receive_info."""
-
-    return shipping_address_payload_with_web_detail_fallback(
-        payload,
-        {"receive_info": dict(receive_info)},
-    )
 
 
 @dataclass(frozen=True)

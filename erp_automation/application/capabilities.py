@@ -47,7 +47,7 @@ DEFAULT_CAPABILITY_MODES: dict[Capability, CapabilityMode] = {
     Capability.UPDATE_TRACKING: CapabilityMode.API_PREFERRED,
     Capability.OUTBOUND_ORDER: CapabilityMode.API_PREFERRED,
     Capability.REMARK_SHIPMENT: CapabilityMode.BROWSER_ONLY,
-    Capability.READ_FULL_ADDRESS: CapabilityMode.BROWSER_ONLY,
+    Capability.READ_FULL_ADDRESS: CapabilityMode.API_PREFERRED,
     Capability.ALIBABA_LOGISTICS: CapabilityMode.BROWSER_ONLY,
     Capability.SEND_EMAIL: CapabilityMode.DISABLED,
 }
