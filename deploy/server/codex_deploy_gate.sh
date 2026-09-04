@@ -30,6 +30,8 @@ fi
 repository=/srv/lingxing-erp-automation/repo
 runtime=/srv/lingxing-erp-automation/runtime
 coordination_db="${runtime}/data/coordination.sqlite3"
+app_events_root="${runtime}/logs/app_events"
+task_journal_guard="${repository}/deploy/server/task_journal_guard.py"
 lock_file=/run/lock/lingxing-erp-production-deploy.lock
 deployed_commit_file=/etc/lingxing-erp/deployed-main-commit
 customer_shipping_preflight_file=/etc/lingxing-erp/customer-shipping-preflight.json
@@ -431,7 +433,12 @@ if [[ "${already_deployed}" != "1" ]]; then
     coordinator_active=1
   fi
   active_tasks="$(
-    python3 - "${coordination_db}" "${coordinator_active}" <<'PY'
+    python3 - \
+      "${coordination_db}" \
+      "${coordinator_active}" \
+      "${app_events_root}" \
+      "${task_journal_guard}" <<'PY'
+import importlib.util
 import sqlite3
 import sys
 import time
@@ -439,25 +446,45 @@ from pathlib import Path
 
 path = Path(sys.argv[1])
 coordinator_active = sys.argv[2] == "1"
+app_events_root = Path(sys.argv[3])
+guard_path = Path(sys.argv[4])
 if not path.is_file():
     print(0)
     raise SystemExit(0)
+guard_spec = importlib.util.spec_from_file_location(
+    "erp_deployment_task_journal_guard",
+    guard_path,
+)
+if guard_spec is None or guard_spec.loader is None:
+    raise SystemExit("Could not load the task-journal deployment guard.")
+task_journal_guard = importlib.util.module_from_spec(guard_spec)
+guard_spec.loader.exec_module(task_journal_guard)
 with sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5) as connection:
-    row = connection.execute(
+    rows = connection.execute(
         """
-        SELECT COUNT(DISTINCT task_id)
+        SELECT DISTINCT task_id
         FROM coordination_leases
         WHERE task_id <> ''
           AND (? OR expires_at > ?)
         """,
         (coordinator_active, time.time()),
-    ).fetchone()
-print(int(row[0] if row else 0))
+    ).fetchall()
+leased_task_ids = {str(row[0]) for row in rows}
+journal_task_ids: set[str] = set()
+if coordinator_active:
+    service_started_at = task_journal_guard.service_active_enter_epoch(
+        "lingxing-erp-coordinator.service"
+    )
+    journal_task_ids = task_journal_guard.nonterminal_task_ids_started_since(
+        app_events_root,
+        started_at=service_started_at,
+    )
+print(len(leased_task_ids | journal_task_ids))
 PY
   )"
 fi
 if [[ "${active_tasks}" != "0" ]]; then
-  echo "Deployment refused: ${active_tasks} active background task(s) still hold leases." >&2
+  echo "Deployment refused: ${active_tasks} active background task(s) are still recorded." >&2
   exit 4
 fi
 

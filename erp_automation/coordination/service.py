@@ -3660,10 +3660,13 @@ class CoordinatedControllerService:
                                 summary="Task or shared state changed.",
                             )
                         self._last_snapshot_fingerprints[key] = fingerprint
-                # A live owner is renewed before the snapshot read. Therefore
-                # an expired task lease belongs to an owner that is no longer
-                # alive and must be released even when snapshots keep failing.
-                self.store.cleanup_expired(include_task_leases=True)
+                # Task leases are released only after a terminal snapshot. A
+                # delayed monitor iteration must not erase a still-running
+                # task's deployment guard merely because its TTL elapsed.
+                # Prior-process leases are cleared once, during service
+                # startup, so retaining them here is fail-safe without making
+                # them immortal across coordinator restarts.
+                self.store.cleanup_expired(include_task_leases=False)
                 # Read the authoritative endpoint owners under the same lock
                 # used by registration.  Without this boundary, the monitor
                 # could read an old empty set, a new host could register, and

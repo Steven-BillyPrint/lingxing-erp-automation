@@ -1,17 +1,25 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+
+from deploy.server.task_journal_guard import (
+    nonterminal_task_ids_started_since,
+    service_active_enter_epoch,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
 ENTRY = ROOT / "deploy/server/codex_deploy_entry.sh"
 GATE = ROOT / "deploy/server/codex_deploy_gate.sh"
 SERVER_DEPLOY = ROOT / "deploy/server/deploy_current.sh"
+TASK_JOURNAL_GUARD = ROOT / "deploy/server/task_journal_guard.py"
 SERVER_DOCKERFILE = ROOT / "deploy/server/Dockerfile"
 INSTALLER = ROOT / "deploy/server/install_codex_deploy_key.sh"
 LOCAL_DEPLOY = ROOT / "scripts/deploy_production.ps1"
@@ -21,6 +29,68 @@ RESTORE_DEPLOY_CREDENTIALS = (
 )
 README = ROOT / "README.md"
 POWERSHELL = shutil.which("powershell.exe") or shutil.which("pwsh")
+
+
+def test_task_journal_guard_only_reports_current_process_nonterminal_tasks(
+    tmp_path: Path,
+) -> None:
+    now = datetime.now(timezone.utc)
+    started_at = (now - timedelta(minutes=1)).timestamp()
+
+    def task_snapshot(
+        task_id: str,
+        status: str,
+        created_at: datetime,
+    ) -> dict[str, object]:
+        return {
+            "timestamp": now.isoformat(),
+            "event_type": "task_snapshot",
+            "task": {
+                "task_id": task_id,
+                "status": status,
+                "created_at": created_at.isoformat(),
+            },
+        }
+
+    events = [
+        task_snapshot("stale-running", "running", now - timedelta(hours=2)),
+        task_snapshot("live-running", "running", now - timedelta(seconds=30)),
+        task_snapshot("completed", "running", now - timedelta(seconds=20)),
+        task_snapshot("completed", "succeeded", now - timedelta(seconds=20)),
+    ]
+    app_events = tmp_path / "app_events"
+    app_events.mkdir()
+    (app_events / f"{now.astimezone():%Y-%m-%d}.jsonl").write_text(
+        "\n".join(json.dumps(event) for event in events) + "\n{partial",
+        encoding="utf-8",
+    )
+
+    assert nonterminal_task_ids_started_since(
+        app_events,
+        started_at=started_at,
+    ) == {"live-running"}
+
+
+def test_task_journal_guard_converts_service_monotonic_start_to_epoch(
+    tmp_path: Path,
+) -> None:
+    uptime = tmp_path / "uptime"
+    uptime.write_text("200.00 100.00\n", encoding="utf-8")
+
+    def fake_run(*_args, **_kwargs):
+        return subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="150000000\n",
+            stderr="",
+        )
+
+    assert service_active_enter_epoch(
+        "example.service",
+        run=fake_run,
+        clock=lambda: 1_000.0,
+        uptime_path=uptime,
+    ) == pytest.approx(950.0)
 
 
 def test_shared_key_is_restricted_to_deploy_and_read_only_receipt_commands() -> None:
@@ -51,12 +121,13 @@ def test_server_gate_refuses_active_tasks_and_verifies_health() -> None:
     gate = GATE.read_text(encoding="utf-8")
     deployer = SERVER_DEPLOY.read_text(encoding="utf-8")
 
+    assert TASK_JOURNAL_GUARD.is_file()
     assert "flock -n" in gate
     assert "coordination_leases" in gate
     assert "systemctl is-active --quiet lingxing-erp-coordinator.service" in gate
     assert "task_id <> ''" in gate
     assert "coordinator_active" in gate
-    assert "active background task(s) still hold leases" in gate
+    assert "active background task(s) are still recorded" in gate
     assert 'already_deployed=0' in gate
     assert 'if [[ "${already_deployed}" != "1" ]]' in gate
     assert "deployed-main-commit" in gate
@@ -100,8 +171,12 @@ def test_server_gate_refuses_active_tasks_and_verifies_health() -> None:
     assert "(4_102_444_800,)" in deployer
     assert "now + 60 * 60" not in deployer
     assert 'connection.execute("BEGIN IMMEDIATE")' in deployer
-    assert "SELECT COUNT(DISTINCT request_id)" in deployer
+    assert "SELECT DISTINCT request_id, task_id" in deployer
     assert "task_id <> '' AND ?" in deployer
+    assert "task_journal_guard.py" in gate
+    assert "task_journal_guard.py" in deployer
+    assert "nonterminal_task_ids_started_since" in gate
+    assert "nonterminal_task_ids_started_since" in deployer
     assert (
         '["systemctl", "is-active", "--quiet", '
         '"lingxing-erp-coordinator.service"]'

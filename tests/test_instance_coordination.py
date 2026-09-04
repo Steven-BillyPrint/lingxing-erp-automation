@@ -1525,6 +1525,34 @@ def test_live_cleanup_preserves_task_leases_until_explicit_release(
     assert store.active_leases() == []
 
 
+def test_service_monitor_does_not_ttl_expire_task_leases(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    store = CoordinationStore(tmp_path / "coordination.sqlite3")
+    cleanup_called = threading.Event()
+    cleanup_modes: list[bool] = []
+    original_cleanup = store.cleanup_expired
+
+    def record_cleanup(*, include_task_leases: bool = True) -> None:
+        cleanup_modes.append(include_task_leases)
+        original_cleanup(include_task_leases=include_task_leases)
+        cleanup_called.set()
+
+    monkeypatch.setattr(store, "cleanup_expired", record_cleanup)
+    service = CoordinatedControllerService(
+        InMemoryBackgroundTaskController(),
+        store,
+        settings=CoordinationSettings(monitor_interval_seconds=0.01),
+    )
+    try:
+        assert cleanup_called.wait(timeout=2)
+        assert cleanup_modes
+        assert all(mode is False for mode in cleanup_modes)
+    finally:
+        service.close()
+
+
 def test_service_startup_clears_orphan_task_leases(tmp_path: Path) -> None:
     store = CoordinationStore(tmp_path / "coordination.sqlite3")
     store.register_instance("old-process", "Old Process", ttl_seconds=60)

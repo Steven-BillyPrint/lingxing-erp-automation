@@ -787,7 +787,6 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             }
             for task in self._state.tasks:
                 latest[task.task_id] = task
-        recovered_at = datetime.now(timezone.utc)
         for task_id, task in tuple(latest.items()):
             if task_id in current_task_ids or task.status.terminal:
                 continue
@@ -795,7 +794,6 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                 task,
                 status=TaskStatus.PAUSED,
                 message=_INTERRUPTED_TASK_MESSAGE,
-                updated_at=recovered_at,
             )
         return sorted(latest.values(), key=lambda task: task.updated_at, reverse=True)
 
