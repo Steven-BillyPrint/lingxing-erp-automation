@@ -13,6 +13,8 @@ expected_client_version="$2"
 repository=/srv/lingxing-erp-automation/repo
 runtime=/srv/lingxing-erp-automation/runtime
 coordination_db="${runtime}/data/coordination.sqlite3"
+app_events_root="${runtime}/logs/app_events"
+task_journal_guard="${repository}/deploy/server/task_journal_guard.py"
 current_image=lingxing-erp-coordinator:1.0
 rollback_image=lingxing-erp-coordinator:rollback
 service_stop_marker=/etc/lingxing-erp/deployment-in-progress
@@ -785,7 +787,12 @@ if [[ "${previous_service_active}" == "1" ]]; then
 fi
 
 drain_result="$(
-  sudo python3 - "${coordination_db}" "${service_stop_marker}" <<'PY'
+  sudo python3 - \
+    "${coordination_db}" \
+    "${service_stop_marker}" \
+    "${app_events_root}" \
+    "${task_journal_guard}" <<'PY'
+import importlib.util
 import sqlite3
 import subprocess
 import sys
@@ -795,10 +802,21 @@ from pathlib import Path
 
 path = Path(sys.argv[1])
 stop_marker = Path(sys.argv[2])
+app_events_root = Path(sys.argv[3])
+guard_path = Path(sys.argv[4])
 active = subprocess.run(
     ["systemctl", "is-active", "--quiet", "lingxing-erp-coordinator.service"],
     check=False,
 ).returncode == 0
+
+guard_spec = importlib.util.spec_from_file_location(
+    "erp_deployment_task_journal_guard",
+    guard_path,
+)
+if guard_spec is None or guard_spec.loader is None:
+    raise SystemExit("Could not load the task-journal deployment guard.")
+task_journal_guard = importlib.util.module_from_spec(guard_spec)
+guard_spec.loader.exec_module(task_journal_guard)
 
 
 def write_stop_marker() -> None:
@@ -844,16 +862,29 @@ with sqlite3.connect(path, timeout=15) as connection:
             "DELETE FROM coordination_leases WHERE expires_at <= ?",
             (now,),
         )
-    row = connection.execute(
+    rows = connection.execute(
         """
-        SELECT COUNT(DISTINCT request_id)
+        SELECT DISTINCT request_id, task_id
         FROM coordination_leases
         WHERE (task_id <> '' AND ?)
            OR expires_at > ?
         """,
         (active, now),
-    ).fetchone()
-    active_tasks = int(row[0] if row else 0)
+    ).fetchall()
+    active_request_ids = {str(row[0]) for row in rows}
+    leased_task_ids = {str(row[1]) for row in rows if str(row[1])}
+    journal_task_ids: set[str] = set()
+    if active:
+        service_started_at = task_journal_guard.service_active_enter_epoch(
+            "lingxing-erp-coordinator.service"
+        )
+        journal_task_ids = task_journal_guard.nonterminal_task_ids_started_since(
+            app_events_root,
+            started_at=service_started_at,
+        )
+    active_tasks = len(active_request_ids) + len(
+        journal_task_ids - leased_task_ids
+    )
     if active_tasks:
         connection.rollback()
         print(f"{active_tasks} 0")
