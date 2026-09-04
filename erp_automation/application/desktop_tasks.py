@@ -2236,7 +2236,6 @@ class DesktopTaskRunner:
         if self.shipment_re_mark_func is None:
             return TaskExecutionResult(False, "重新标发执行器尚未连接。", blocked=True)
         from lingxing_automation.browser.session import (
-            get_first_page,
             launch_context,
             wait_for_order_page,
         )
@@ -2311,11 +2310,14 @@ class DesktopTaskRunner:
             return True
 
         workflow_store = ShipmentWorkflowStore(self._path(settings.queue_path))
-        playwright = context = None
+        playwright = context = page = None
         try:
             self._report_progress(task_id, "正在连接提交电脑的可见 Chrome。", 6)
             playwright, context = await launch_context(args)
-            page = await get_first_page(context)
+            # Re-marking may run while a custom-order workflow is still using the
+            # operator's first Chrome tab.  Own a fresh tab for this task so its
+            # navigation and cleanup can never mutate that in-flight page.
+            page = await context.new_page()
             if "mpOrderManagement" not in page.url:
                 await page.goto(ORDER_MANAGEMENT_URL, wait_until="domcontentloaded")
             await wait_for_order_page(
@@ -2356,6 +2358,11 @@ class DesktopTaskRunner:
                 cancelled=True,
             )
         finally:
+            if page is not None:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
             if context is not None:
                 try:
                     await context.close()

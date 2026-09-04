@@ -2913,6 +2913,104 @@ def test_re_mark_command_consumes_exact_checked_action_confirmation(tmp_path) ->
     }
 
 
+def test_re_mark_owns_a_dedicated_chrome_page_without_touching_custom_order(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from lingxing_automation.browser import session as browser_session
+    from lingxing_automation.constants import ORDER_MANAGEMENT_URL
+
+    observed: dict[str, Any] = {}
+
+    class CustomOrderPage:
+        url = "https://erp.lingxing.com/erp/multi/orderManage"
+
+        async def close(self) -> None:
+            pytest.fail("重新标发不得关闭定制订单正在处理的页面。")
+
+    custom_order_page = CustomOrderPage()
+
+    class ReMarkPage:
+        url = ORDER_MANAGEMENT_URL
+
+        async def goto(self, *_args, **_kwargs) -> None:
+            pytest.fail("专用页面已经位于订单管理页，不应重复导航。")
+
+        async def close(self) -> None:
+            observed["re_mark_page_closed"] = True
+
+    re_mark_page = ReMarkPage()
+
+    class Context:
+        pages = [custom_order_page]
+
+        async def new_page(self):
+            observed["new_page_count"] = int(observed.get("new_page_count") or 0) + 1
+            return re_mark_page
+
+        async def close(self) -> None:
+            # The real attached context deliberately does not close the visible
+            # Chrome.  Recording this call still verifies normal detach cleanup.
+            observed["context_close_called"] = True
+
+    class Playwright:
+        async def stop(self) -> None:
+            observed["playwright_stopped"] = True
+
+    async def launch_context(args):
+        observed["browser_cdp_url"] = args.browser_cdp_url
+        return Playwright(), Context()
+
+    async def wait_for_order_page(page, *_args, **_kwargs) -> None:
+        assert page is re_mark_page
+        observed["waited_on_re_mark_page"] = True
+
+    async def re_mark(page, _store, cycle_id, **_kwargs):
+        assert page is re_mark_page
+        assert cycle_id == 41
+        assert custom_order_page.url == "https://erp.lingxing.com/erp/multi/orderManage"
+        return {"status": "completed", "message": "重新标发完成"}
+
+    monkeypatch.setattr(browser_session, "launch_context", launch_context)
+    monkeypatch.setattr(browser_session, "wait_for_order_page", wait_for_order_page)
+
+    settings = _settings(tmp_path)
+    runner = DesktopTaskRunner(
+        tmp_path,
+        settings_provider=lambda: settings,
+        configuration_provider=lambda: {},
+        shipment_re_mark_func=re_mark,
+    )
+    confirmation = DesktopWriteConfirmation.create(
+        DesktopWriteAction.EXECUTE_SHIPMENT_REMARK,
+        PLATFORM_ORDER_NO,
+        system_order_no=SYSTEM_ORDER_NO,
+        logistics_no="ALS01915029156",
+        source="qt_checked_action",
+    )
+
+    result = asyncio.run(
+        runner._re_mark_shipment(
+            41,
+            settings,
+            confirmation,
+            task_id="remark-dedicated-page",
+            browser_endpoint="http://127.0.0.1:24000",
+        )
+    )
+
+    assert result.succeeded is True
+    assert custom_order_page.url == "https://erp.lingxing.com/erp/multi/orderManage"
+    assert observed == {
+        "browser_cdp_url": "http://127.0.0.1:24000",
+        "new_page_count": 1,
+        "waited_on_re_mark_page": True,
+        "re_mark_page_closed": True,
+        "context_close_called": True,
+        "playwright_stopped": True,
+    }
+
+
 @pytest.mark.parametrize(
     "product_type",
     [
