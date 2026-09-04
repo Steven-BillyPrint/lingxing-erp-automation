@@ -38,8 +38,9 @@ class MarkedShipmentUpdateEvidence:
     system_order_no: str
     before_submit_row_text: str
     before_submit_system_marking_text: str
-    after_submit_row_text: str
-    after_submit_system_marking_text: str
+    success_dialog_text: str
+    success_dialog_acknowledged: bool
+    acknowledgement_error: str = ""
     selected_search_type: str = "系统单号"
 
 
@@ -84,26 +85,33 @@ async def update_marked_shipment(
         await before_final_confirm()
     await click_one_visible_button(confirm, "确定", "标发确认按钮")
     success = await one_visible_dialog(page, "全部操作成功")
-    await click_one_visible_button(success, "我知道了", "标发成功确认按钮")
-    # The success dialog closes only after Lingxing has moved the row to its
-    # async marking state.  A single DOM read of 系统标发单号 is the durable UI
-    # acknowledgement; do not poll 标发中/已完成 afterwards.
-    await page.wait_for_timeout(150)
-    after_submit_row_text = await exact_system_order_text(page, system_order_no)
-    after_submit_system_marking_text = await exact_system_order_cell_text(
-        page,
-        system_order_no,
-        "系统标发单号",
-    )
-    if not system_marking_contains_waybill(
-        after_submit_system_marking_text,
-        new_waybill_no,
-    ):
-        raise RuntimeError("标发成功弹窗关闭后，系统标发单号未更新为本周期新运单号。")
+    # one_visible_dialog has already proved that exactly one visible semantic
+    # target contains this receipt.  Do not re-read the same locator: Lingxing
+    # may auto-close it between two DOM operations, which would recreate the
+    # same false-negative race that this adapter is meant to avoid.
+    success_dialog_text = "全部操作成功"
+
+    # “可更新” is a transient queue.  Once Lingxing accepts the update, the
+    # exact order may be removed from this table immediately and later appear
+    # under 已完成.  Requiring the old row to remain readable after the success
+    # acknowledgement therefore turns a real success into a false failure.
+    # Closing the result dialog is UI cleanup only; the dedicated task tab is
+    # closed by the caller, so a cleanup failure must not erase the durable
+    # success acknowledgement or cause the external write to be replayed.
+    acknowledged = False
+    acknowledgement_error = ""
+    try:
+        await click_one_visible_button(success, "我知道了", "标发成功确认按钮")
+        acknowledged = True
+    except Exception as exc:
+        acknowledgement_error = (
+            f"{type(exc).__name__}: {' '.join(str(exc).split())}".rstrip(": ")
+        )
     return MarkedShipmentUpdateEvidence(
         system_order_no=system_order_no,
         before_submit_row_text=before_submit_row_text,
         before_submit_system_marking_text=before_submit_system_marking_text,
-        after_submit_row_text=after_submit_row_text,
-        after_submit_system_marking_text=after_submit_system_marking_text,
+        success_dialog_text=success_dialog_text,
+        success_dialog_acknowledged=acknowledged,
+        acknowledgement_error=acknowledgement_error,
     )

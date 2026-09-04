@@ -487,15 +487,14 @@ def _workflow_fixture(tmp_path):
     async def update(_page, *, before_final_confirm, **kwargs):
         events.append(f"mark:{kwargs['system_order_no']}")
         await before_final_confirm()
-        text = f"OnTrac ： {kwargs['new_waybill_no']} 标发中"
         return MarkedShipmentUpdateEvidence(
             system_order_no=kwargs["system_order_no"],
             before_submit_row_text="可更新",
             before_submit_system_marking_text=(
                 f"OnTrac ： {kwargs['new_waybill_no']} 待标发"
             ),
-            after_submit_row_text="标发中",
-            after_submit_system_marking_text=text,
+            success_dialog_text="全部操作成功",
+            success_dialog_acknowledged=True,
         )
 
     workflow = ShipmentReMarkWorkflow(
@@ -509,7 +508,7 @@ def _workflow_fixture(tmp_path):
     return store, cycle, gateway, events, workflow
 
 
-def test_re_mark_workflow_uses_dom_withdraw_openapi_and_post_submit_dom_evidence(
+def test_re_mark_workflow_uses_pre_submit_waybill_and_success_receipt(
     tmp_path,
 ) -> None:
     store, cycle, gateway, events, workflow = _workflow_fixture(tmp_path)
@@ -575,7 +574,7 @@ def test_re_mark_workflow_stops_before_browser_write_when_lingxing_is_already_ne
     assert events == []
 
 
-def test_mark_intent_without_post_submit_dom_evidence_requires_manual_review(
+def test_mark_intent_without_success_receipt_requires_manual_review(
     tmp_path,
 ) -> None:
     store, cycle, _gateway, _events, workflow = _workflow_fixture(tmp_path)
@@ -606,6 +605,7 @@ def test_mark_intent_without_post_submit_dom_evidence_requires_manual_review(
     blocked = store.get_re_mark_cycle(cycle.id)
     assert blocked is not None
     assert blocked.state == REMARK_MANUAL_REVIEW
+    assert "系统标发单号未更新" in blocked.last_error
 
 
 def test_openapi_channel_intent_failure_is_blocked_without_automatic_replay(

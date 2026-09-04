@@ -263,17 +263,10 @@ class _Clickable:
         return None
 
 
-def test_update_reads_system_marking_cell_once_after_acknowledgement(
+def test_update_uses_success_receipt_without_reading_transient_row_again(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     events: list[str] = []
-    row_texts = iter(("可更新行", "标发中行"))
-    marking_texts = iter(
-        (
-            f"OnTrac ： {NEW_WAYBILL_NO} 待标发",
-            f"OnTrac ： {NEW_WAYBILL_NO} 标发中",
-        )
-    )
 
     async def one_visible(*_args, **_kwargs):
         return _Clickable()
@@ -282,12 +275,12 @@ def test_update_reads_system_marking_cell_once_after_acknowledgement(
         return None
 
     async def row_text(*_args, **_kwargs) -> str:
-        value = next(row_texts)
+        value = "可更新行"
         events.append(f"row:{value}")
         return value
 
     async def cell_text(*_args, **_kwargs) -> str:
-        value = next(marking_texts)
+        value = f"OnTrac ： {NEW_WAYBILL_NO} 待标发"
         events.append(f"cell:{value}")
         return value
 
@@ -322,28 +315,17 @@ def test_update_reads_system_marking_cell_once_after_acknowledgement(
         system_order_no=SYSTEM_ORDER_NO,
         before_submit_row_text="可更新行",
         before_submit_system_marking_text=f"OnTrac ： {NEW_WAYBILL_NO} 待标发",
-        after_submit_row_text="标发中行",
-        after_submit_system_marking_text=f"OnTrac ： {NEW_WAYBILL_NO} 标发中",
+        success_dialog_text="全部操作成功",
+        success_dialog_acknowledged=True,
     )
-    assert events[-3:] == [
-        "click:我知道了",
-        "row:标发中行",
-        f"cell:OnTrac ： {NEW_WAYBILL_NO} 标发中",
-    ]
-    assert events.count(f"cell:OnTrac ： {NEW_WAYBILL_NO} 标发中") == 1
+    assert events[-2:] == ["dialog:全部操作成功", "click:我知道了"]
+    assert events.count("row:可更新行") == 1
+    assert events.count(f"cell:OnTrac ： {NEW_WAYBILL_NO} 待标发") == 1
 
 
-def test_update_fails_closed_when_post_submit_system_marking_is_stale(
+def test_update_completes_when_success_moves_order_out_of_updateable_table(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    row_texts = iter(("可更新行", "标发中行"))
-    marking_texts = iter(
-        (
-            f"OnTrac ： {NEW_WAYBILL_NO} 待标发",
-            "万邦速达 ： WNBAA0494424973YQ 标发中",
-        )
-    )
-
     async def one_visible(*_args, **_kwargs):
         return _Clickable()
 
@@ -351,10 +333,10 @@ def test_update_fails_closed_when_post_submit_system_marking_is_stale(
         return None
 
     async def row_text(*_args, **_kwargs) -> str:
-        return next(row_texts)
+        return "可更新行"
 
     async def cell_text(*_args, **_kwargs) -> str:
-        return next(marking_texts)
+        return f"OnTrac ： {NEW_WAYBILL_NO} 待标发"
 
     async def dialog(*_args, **_kwargs):
         return _Clickable()
@@ -367,11 +349,56 @@ def test_update_fails_closed_when_post_submit_system_marking_is_stale(
     monkeypatch.setattr(update_page, "one_visible_dialog", dialog)
     monkeypatch.setattr(update_page, "click_one_visible_button", no_op)
 
-    with pytest.raises(RuntimeError, match="系统标发单号未更新"):
-        asyncio.run(
-            update_marked_shipment(
-                _Page(),
-                system_order_no=SYSTEM_ORDER_NO,
-                new_waybill_no=NEW_WAYBILL_NO,
-            )
+    evidence = asyncio.run(
+        update_marked_shipment(
+            _Page(),
+            system_order_no=SYSTEM_ORDER_NO,
+            new_waybill_no=NEW_WAYBILL_NO,
         )
+    )
+
+    assert evidence.success_dialog_text == "全部操作成功"
+    assert evidence.success_dialog_acknowledged is True
+
+
+def test_update_keeps_success_when_acknowledgement_button_cleanup_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def one_visible(*_args, **_kwargs):
+        return _Clickable()
+
+    async def no_op(*_args, **_kwargs):
+        return None
+
+    async def row_text(*_args, **_kwargs) -> str:
+        return "可更新行"
+
+    async def cell_text(*_args, **_kwargs) -> str:
+        return f"OnTrac ： {NEW_WAYBILL_NO} 待标发"
+
+    async def dialog(*_args, **_kwargs):
+        return _Clickable()
+
+    async def click_button(_scope, text: str, *_args, **_kwargs):
+        if text == "我知道了":
+            raise RuntimeError("结果弹窗已自动关闭")
+
+    monkeypatch.setattr(update_page, "_one_visible", one_visible)
+    monkeypatch.setattr(update_page, "search_exact_system_order", no_op)
+    monkeypatch.setattr(update_page, "select_exact_system_order", no_op)
+    monkeypatch.setattr(update_page, "exact_system_order_text", row_text)
+    monkeypatch.setattr(update_page, "exact_system_order_cell_text", cell_text)
+    monkeypatch.setattr(update_page, "one_visible_dialog", dialog)
+    monkeypatch.setattr(update_page, "click_one_visible_button", click_button)
+
+    evidence = asyncio.run(
+        update_marked_shipment(
+            _Page(),
+            system_order_no=SYSTEM_ORDER_NO,
+            new_waybill_no=NEW_WAYBILL_NO,
+        )
+    )
+
+    assert evidence.success_dialog_text == "全部操作成功"
+    assert evidence.success_dialog_acknowledged is False
+    assert evidence.acknowledgement_error == "RuntimeError: 结果弹窗已自动关闭"

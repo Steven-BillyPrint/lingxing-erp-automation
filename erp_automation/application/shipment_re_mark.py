@@ -264,7 +264,7 @@ class ShipmentReMarkWorkflow:
                 state=completed.state,
                 message=(
                     "已撤销回待审核、通过领星 OpenAPI 重设物流并重新出库；"
-                    "订单标发提交后已读回系统标发单号为新运单号。"
+                    "订单标发前已核对系统标发单号，提交后已收到领星成功回执。"
                 ),
             )
         except (ErpMarkEmergencyStopped, ErpMarkUserAbort):
@@ -282,7 +282,12 @@ class ShipmentReMarkWorkflow:
                 REMARK_OUTBOUND_INTENT,
                 REMARK_MARK_INTENT,
             }:
-                reason = f"外部写入边界后的结果不明确：{type(exc).__name__}。禁止自动重试。"
+                detail = " ".join(str(exc).split())
+                diagnostic = f"：{detail[:500]}" if detail else ""
+                reason = (
+                    "外部写入边界后的结果不明确："
+                    f"{type(exc).__name__}{diagnostic}。禁止自动重试。"
+                )
                 self.store.require_re_mark_manual_review(cycle_id, reason, run_id=run_id)
                 raise ErpMarkManualReview(reason) from exc
             raise
@@ -662,12 +667,13 @@ class ShipmentReMarkWorkflow:
                     not isinstance(evidence, MarkedShipmentUpdateEvidence)
                     or evidence.system_order_no != cycle.system_order_no
                     or not system_marking_contains_waybill(
-                        evidence.after_submit_system_marking_text,
+                        evidence.before_submit_system_marking_text,
                         cycle.new_waybill_no,
                     )
+                    or "全部操作成功" not in evidence.success_dialog_text
                 ):
                     raise RuntimeError(
-                        "订单标发页没有返回与本周期一致的提交后系统标发单号证据。"
+                        "订单标发页没有返回本周期新运单号及“全部操作成功”回执。"
                     )
                 current = self._required_cycle(cycle.id)
                 self._advance(
