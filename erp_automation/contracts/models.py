@@ -206,6 +206,9 @@ DESKTOP_INSTANCE_ID_PAYLOAD_KEY = "_desktop_instance_id"
 DESKTOP_BROWSER_ENDPOINT_PAYLOAD_KEY = "_desktop_browser_endpoint"
 DESKTOP_OPERATOR_NAME_PAYLOAD_KEY = "_desktop_operator_name"
 DESKTOP_OPERATOR_EMAIL_PAYLOAD_KEY = "_desktop_operator_email"
+PARALLEL_ALIBABA_ORDER_PREPARE_PAYLOAD_KEY = (
+    "_parallel_alibaba_order_prepare"
+)
 
 LOCAL_BROWSER_ACTION_ALIBABA_ORDER_PREPARE = "alibaba_order_prepare"
 LOCAL_BROWSER_ACTION_ALIBABA_ORDER_FILL = "alibaba_order_fill"

@@ -143,6 +143,36 @@ def test_server_runner_blocks_before_business_code_when_browser_lane_is_down(
     )
 
 
+def test_alibaba_prepare_does_not_wait_for_browser_preflight(
+    tmp_path: Path,
+) -> None:
+    class Guard:
+        async def check(self, _endpoint: str) -> BrowserEndpointHealth:
+            raise AssertionError(
+                "Alibaba prepare must read the order while Chrome starts"
+            )
+
+    runner = DesktopTaskRunner(
+        tmp_path,
+        settings_provider=lambda: (_ for _ in ()).throw(
+            AssertionError("only the preflight decision is under test")
+        ),
+        configuration_provider=lambda: {},
+        browser_endpoint_guard=Guard(),
+    )
+    command = TaskCommand(
+        "读取订单并打开阿里查价",
+        TaskArea.SHIPMENT,
+        Capability.ALIBABA_ORDER_PREPARE,
+        order_no="103729824875289685",
+        payload={
+            DESKTOP_BROWSER_ENDPOINT_PAYLOAD_KEY: "http://127.0.0.1:24000",
+        },
+    )
+
+    assert asyncio.run(runner._visible_browser_preflight(command)) is None
+
+
 def test_remote_submission_is_rejected_while_its_browser_tunnel_recovers() -> None:
     class BrowserHost:
         def ensure_started(self) -> None:

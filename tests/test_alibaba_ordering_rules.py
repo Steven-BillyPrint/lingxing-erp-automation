@@ -649,6 +649,70 @@ def test_canadian_address_keeps_complete_postal_code() -> None:
     assert address.province == "British Columbia"
 
 
+def test_virtual_phone_extension_is_not_filled_into_mobile_number() -> None:
+    raw_phone = "+1 346-307-9643 ext. 16046"
+    address = extract_shipping_address(
+        {
+            "receive_info": {
+                "receiver_name": "Jane Smith",
+                "country_code": "US",
+                "country": "United States",
+                "state": "TX",
+                "city": "Houston",
+                "address_line1": "123 Main Street",
+                "postal_code": "77001",
+                "receiver_phone": raw_phone,
+                "receiver_email": "buyer@marketplace.amazon.com",
+            }
+        }
+    )
+
+    assert address.dial_code == "1"
+    assert address.phone == "3463079643"
+    assert address.address2 == raw_phone
+
+
+def test_virtual_phone_is_appended_to_existing_address_two() -> None:
+    raw_phone = "+1 416-555-0188 extension: 12345"
+    address = extract_shipping_address(
+        {
+            "receive_info": {
+                "receiver_name": "Jane Smith",
+                "country_code": "CA",
+                "country": "Canada",
+                "state": "ON",
+                "city": "Toronto",
+                "address_line1": "123 Main Street",
+                "address_line2": "Unit 2",
+                "postal_code": "M5V 3A8",
+                "receiver_phone": raw_phone,
+                "receiver_email": "buyer@marketplace.amazon.ca",
+            }
+        }
+    )
+
+    assert address.phone == "4165550188"
+    assert address.address2 == f"Unit 2 {raw_phone}"
+
+
+def test_invalid_virtual_phone_main_number_is_blocked() -> None:
+    with pytest.raises(AlibabaOrderRuleError, match="10 位主号码"):
+        extract_shipping_address(
+            {
+                "receive_info": {
+                    "receiver_name": "Jane Smith",
+                    "country_code": "US",
+                    "state": "TX",
+                    "city": "Houston",
+                    "address_line1": "123 Main Street",
+                    "postal_code": "77001",
+                    "receiver_phone": "+1 346-307 ext. 16046",
+                    "receiver_email": "buyer@marketplace.amazon.com",
+                }
+            }
+        )
+
+
 def test_state_and_province_abbreviations_expand_to_alibaba_labels() -> None:
     assert province_name_for_alibaba("US", "CA") == "California"
     assert province_name_for_alibaba("CA", "BC") == "British Columbia"

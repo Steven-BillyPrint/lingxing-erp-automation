@@ -3011,16 +3011,23 @@ def test_remote_repeated_click_is_suppressed_while_timeout_is_reconciled() -> No
         )
 
 
-def test_alibaba_order_prepare_opens_quote_directly_without_blank_page() -> None:
+def test_alibaba_order_prepare_starts_quote_without_blocking_rpc_submission() -> None:
+    startup_started = threading.Event()
+    startup_release = threading.Event()
+    rpc_submitted = threading.Event()
+
     class BrowserHost:
         def __init__(self) -> None:
-            self.opened: list[str] = []
+            self.started: list[str] = []
 
         def open_url(self, url: str) -> None:
-            self.opened.append(url)
+            pytest.fail(f"quote activation belongs to the delegated action: {url}")
 
-        def ensure_started(self) -> None:
-            pytest.fail("阿里物流下单不应通过默认 about:blank 启动 Chrome。")
+        def ensure_started(self, *, initial_url: str = "about:blank") -> None:
+            self.started.append(initial_url)
+            startup_started.set()
+            if not startup_release.wait(timeout=2):
+                raise AssertionError("RPC submission waited for browser startup")
 
     host = BrowserHost()
     client = object.__new__(RemoteBackgroundTaskController)
@@ -3033,16 +3040,23 @@ def test_alibaba_order_prepare_opens_quote_directly_without_blank_page() -> None
     client._last_snapshot = DesktopSnapshot()
     client._revision = 0
     client.instance_id = "desktop-one"
-    client._request = lambda *_args, **_kwargs: {
-        "revision": 1,
-        "result_type": "control_result",
-        "result": {
-            "accepted": True,
-            "message": "已提交",
-            "task_id": "prepare-one",
-            "details": {},
-        },
-    }
+    client._local_action_pool = ThreadPoolExecutor(max_workers=1)
+
+    def request(*_args, **_kwargs):
+        assert startup_started.wait(timeout=1)
+        rpc_submitted.set()
+        return {
+            "revision": 1,
+            "result_type": "control_result",
+            "result": {
+                "accepted": True,
+                "message": "已提交",
+                "task_id": "prepare-one",
+                "details": {},
+            },
+        }
+
+    client._request = request
     command = TaskCommand(
         "读取订单并打开阿里查价",
         TaskArea.SHIPMENT,
@@ -3050,10 +3064,15 @@ def test_alibaba_order_prepare_opens_quote_directly_without_blank_page() -> None
         order_no="103729824875289685",
     )
 
-    result = client._rpc("submit_task", command)
+    try:
+        result = client._rpc("submit_task", command)
+    finally:
+        startup_release.set()
+        client._local_action_pool.shutdown(wait=True)
 
     assert result.accepted is True
-    assert host.opened == [ALIBABA_QUOTE_URL]
+    assert rpc_submitted.is_set()
+    assert host.started == [ALIBABA_QUOTE_URL]
 
 
 def test_lingxing_login_opens_the_requesting_desktops_dedicated_profile() -> None:
