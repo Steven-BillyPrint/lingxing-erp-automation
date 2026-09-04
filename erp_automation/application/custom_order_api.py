@@ -48,7 +48,6 @@ from lingxing_automation.services.custom_zip_downloader import (
 from lingxing_automation.services.tent_package_split_adjuster import TentPackageSplitResult
 from lingxing_automation.services.tent_package_split_planner import TentPackageSplitPlan
 from lingxing_automation.services.tent_sku_adjuster import (
-    DetailShippingDestination,
     TentSkuAdjustmentResult,
     _merge_instruction_customer_remark,
 )
@@ -138,6 +137,16 @@ class _ApiOrderSnapshot:
     remark: str
     items: tuple[_ApiOrderItem, ...]
     payload: Mapping[str, Any] = field(repr=False)
+
+
+@dataclass(frozen=True)
+class _ApiShippingDestination:
+    """Normalized receiver destination sourced from documented OpenAPI data."""
+
+    shipping_address_text: str
+    postal_code: str | None
+    postal_source: str = "lingxing_openapi"
+    api_error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -680,7 +689,15 @@ def _address_mappings(payloads: Sequence[Mapping[str, Any]]) -> list[Mapping[str
 
 def _address_score(mapping: Mapping[str, Any]) -> int:
     aliases = (
-        ("receiver_name", "recipient_name", "consignee_name", "buyer_name"),
+        (
+            "receiver_name",
+            "receiverName",
+            "recipient_name",
+            "recipientName",
+            "consignee_name",
+            "buyer_name",
+            "name",
+        ),
         (
             "receiver_country_name",
             "receiver_country",
@@ -688,17 +705,31 @@ def _address_score(mapping: Mapping[str, Any]) -> int:
             "country",
         ),
         ("receiver_country_code", "country_code"),
-        ("state_or_region", "receiver_state", "state", "province"),
-        ("city", "receiver_city"),
-        ("address_line1", "address1", "street", "short_address"),
-        ("postal_code", "postcode", "zip_code", "zip"),
+        ("state_or_region", "receiver_state", "receiverState", "state", "province"),
+        ("city", "receiver_city", "receiverCity"),
+        (
+            "address_line1",
+            "address1",
+            "receiver_address",
+            "receiverAddress",
+            "street",
+            "short_address",
+        ),
+        (
+            "postal_code",
+            "receiver_postal_code",
+            "receiverPostalCode",
+            "postcode",
+            "zip_code",
+            "zip",
+        ),
     )
     return sum(1 for group in aliases if _mapping_value(mapping, *group))
 
 
 def _api_destination_from_payloads(
     payloads: Sequence[Mapping[str, Any]],
-) -> tuple[str | None, str | None, DetailShippingDestination]:
+) -> tuple[str | None, str | None, _ApiShippingDestination]:
     """Extract the non-contact folder/routing fields from documented API data."""
 
     mappings = sorted(
@@ -720,9 +751,12 @@ def _api_destination_from_payloads(
     # partially populated mapping to hide the rest of the API response.
     recipient_name_raw = value_from_any(
         "receiver_name",
+        "receiverName",
         "recipient_name",
+        "recipientName",
         "consignee_name",
         "buyer_name",
+        "name",
     )
     recipient_name = normalize_folder_recipient_name(recipient_name_raw)
     country = value_from_any(
@@ -736,17 +770,48 @@ def _api_destination_from_payloads(
     state = value_from_any(
         "state_or_region",
         "receiver_state",
+        "receiverState",
         "state",
         "province",
     )
-    city = value_from_any("receiver_city", "city")
-    address = value_from_any(
+    city = value_from_any("receiver_city", "receiverCity", "city")
+    address1 = value_from_any(
         "address_line1",
         "address1",
+        "receiver_address",
+        "receiverAddress",
         "street",
         "short_address",
     )
-    postal_raw = value_from_any("postal_code", "postcode", "zip_code", "zip")
+    address2 = value_from_any(
+        "address_line2",
+        "address2",
+        "receiver_address2",
+        "receiverAddress2",
+    )
+    address3 = value_from_any(
+        "address_line3",
+        "address3",
+        "receiver_address3",
+        "receiverAddress3",
+    )
+    doorplate = value_from_any("doorplate_no", "doorplate", "house_number")
+    address_parts: list[str] = []
+    for part in (address1, address2, address3, doorplate):
+        normalized = str(part or "").strip()
+        if normalized and normalized.casefold() not in {
+            value.casefold() for value in address_parts
+        }:
+            address_parts.append(normalized)
+    address = " ".join(address_parts)
+    postal_raw = value_from_any(
+        "postal_code",
+        "receiver_postal_code",
+        "receiverPostalCode",
+        "postcode",
+        "zip_code",
+        "zip",
+    )
     postal_code = normalize_us_postal_code(postal_raw)
     location = "，".join(
         value for value in (country, state, city, address) if str(value or "").strip()
@@ -759,7 +824,7 @@ def _api_destination_from_payloads(
         )
         if value
     )
-    return recipient_name, recipient_name_raw, DetailShippingDestination(
+    return recipient_name, recipient_name_raw, _ApiShippingDestination(
         shipping_address_text=destination_text,
         postal_code=postal_code,
         postal_source="lingxing_openapi",
@@ -1162,6 +1227,7 @@ class LingxingCustomOrderApiOperations:
             shipping_address_text=destination.shipping_address_text,
             shipping_postal_code=destination.postal_code,
             shipping_postal_source=destination.postal_source,
+            shipping_address_error=destination.api_error,
             request_ids=request_ids,
         )
 

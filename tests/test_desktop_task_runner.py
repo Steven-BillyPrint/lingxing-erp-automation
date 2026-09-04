@@ -164,11 +164,11 @@ def test_prepare_alibaba_order_reads_lingxing_and_opens_quote(
         FakeBrowser,
     )
 
-    async def concurrent_address_loader(detail, context, system_order_no):
+    async def concurrent_address_loader(detail):
         observed["address_started"] = True
         await asyncio.sleep(0)
         assert observed.get("quote_page_started") is True
-        return await original_address_loader(detail, context, system_order_no)
+        return await original_address_loader(detail)
 
     monkeypatch.setattr(
         DesktopTaskRunner,
@@ -246,7 +246,7 @@ def test_prepare_alibaba_order_reads_lingxing_and_opens_quote(
     )
 
 
-def test_prepare_alibaba_order_falls_back_to_verified_local_lingxing_address(
+def test_prepare_alibaba_order_uses_public_order_list_address(
     tmp_path,
     monkeypatch,
 ) -> None:
@@ -269,27 +269,6 @@ def test_prepare_alibaba_order_falls_back_to_verified_local_lingxing_address(
             assert login_config.auto_login is True
             return FakeQuotePage()
 
-    class FakeLingxingBrowser:
-        def __init__(self, _context):
-            pass
-
-        async def order_detail(self, system_order_no):
-            assert system_order_no == SYSTEM_ORDER_NO
-            return {
-                "global_order_no": SYSTEM_ORDER_NO,
-                "buyer_info": {"buyer_email": "jane@example.com"},
-                "receive_info": {
-                    "receiver_name": "Example Cooperative",
-                    "receiver_country_code": "US",
-                    "receiver_country_name": "United States of America (USA)",
-                    "state_or_region": "FL",
-                    "city": "MIAMI",
-                    "postal_code": "33182-1909",
-                    "receiver_mobile": "3055550199",
-                    "address_line1": "987 Example Street Apt Unit 100",
-                },
-            }
-
     monkeypatch.setattr(
         "shipment_automation.alibaba_order_browser.attached_alibaba_context",
         fake_context,
@@ -298,13 +277,27 @@ def test_prepare_alibaba_order_falls_back_to_verified_local_lingxing_address(
         "shipment_automation.alibaba_order_browser.AlibabaOrderBrowser",
         FakeAlibabaBrowser,
     )
-    monkeypatch.setattr(
-        "shipment_automation.lingxing_order_browser.LingxingOrderBrowser",
-        FakeLingxingBrowser,
-    )
     detail = _alibaba_order_detail()
     detail["receive_info"]["address_line1"] = ""
     detail["receive_info"]["receiver_email"] = ""
+    detail["_lingxing_openapi_order_list_snapshot"] = {
+        "records": [
+            {
+                "global_order_no": SYSTEM_ORDER_NO,
+                "buyer_info": {"buyer_email": "jane@example.com"},
+                "address_info": {
+                    "receiver_name": "Example Cooperative",
+                    "receiver_country_code": "US",
+                    "receiver_country_name": "United States of America (USA)",
+                    "receiver_state": "FL",
+                    "receiver_city": "MIAMI",
+                    "receiver_postal_code": "33182-1909",
+                    "receiver_tel": "3055550199",
+                    "receiver_address": "987 Example Street Apt Unit 100",
+                },
+            }
+        ]
+    }
 
     async def lookup(_settings, order_identifier):
         return ResolvedOrderDetail(
@@ -342,7 +335,7 @@ def test_prepare_alibaba_order_falls_back_to_verified_local_lingxing_address(
 
     assert result.succeeded is True
     assert result.payload["system_order_no"] == SYSTEM_ORDER_NO
-    assert result.payload["address_source"] == "lingxing_web_detail_api"
+    assert result.payload["address_source"] == "lingxing_openapi"
     assert observed_quote_details["destination_country_code"] == "US"
     assert observed_quote_details["destination_postal_code"] == "33182"
 
@@ -668,11 +661,11 @@ def test_fill_alibaba_order_draft_uses_new_page_and_never_submits(
         FakeBrowser,
     )
 
-    async def concurrent_address_loader(detail, context, system_order_no):
+    async def concurrent_address_loader(detail):
         observed["address_started"] = True
         await asyncio.sleep(0)
         assert observed.get("draft_inspection_started") is True
-        return await original_address_loader(detail, context, system_order_no)
+        return await original_address_loader(detail)
 
     monkeypatch.setattr(
         DesktopTaskRunner,
@@ -896,7 +889,7 @@ def test_prepare_alibaba_order_does_not_save_session_when_quote_open_fails(
         FakeBrowser,
     )
 
-    async def slow_address_loader(_detail, _context, _system_order_no):
+    async def slow_address_loader(_detail):
         observed["address_started"] = True
         try:
             await asyncio.Future()

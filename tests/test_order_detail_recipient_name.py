@@ -8,9 +8,6 @@ from lingxing_automation.pages.order_detail_extraction import (
     _clean_detail_recipient_name,
     read_detail_recipient_name,
 )
-from lingxing_automation.services.tent_sku_adjuster import (
-    read_detail_shipping_address_text,
-)
 
 
 def test_clean_detail_recipient_name_rejects_numeric_range():
@@ -80,53 +77,3 @@ def test_read_detail_recipient_name_prefers_receive_info_wrapper():
                 await browser.close()
 
     assert asyncio.run(run()) == "cory"
-
-
-def test_shipping_address_dom_reader_includes_separate_postal_field():
-    html = """
-    <html>
-      <head>
-        <meta charset="utf-8">
-        <style>
-          .order-detail-dialog, .receive-info, .info-wrapper { display: block; }
-          .order-detail-dialog { width: 800px; }
-          .info-wrapper { height: 24px; }
-          .label, .value { display: inline-block; min-width: 80px; }
-        </style>
-      </head>
-      <body>
-        <div class="order-detail-dialog">
-          <div>系统单号 103725267407372040</div>
-          <div class="receive-info">
-            <div>收货信息</div>
-            <div class="info-wrapper">
-              <span class="label">收件地址</span>
-              <span class="value">United States of America (USA)(美国)，OH，CLEVELAND</span>
-            </div>
-            <div class="info-wrapper">
-              <span class="label">邮编</span>
-              <span class="value">44102-2135</span>
-            </div>
-            <div class="info-wrapper">
-              <span class="label">详细地址</span>
-              <span class="value">5605 TILLMAN AVE</span>
-            </div>
-          </div>
-        </div>
-      </body>
-    </html>
-    """
-
-    async def run() -> str:
-        async with async_playwright() as playwright:
-            browser = await playwright.chromium.launch(headless=True)
-            try:
-                page = await browser.new_page(viewport={"width": 1200, "height": 800})
-                await page.set_content(html)
-                return await read_detail_shipping_address_text(page)
-            finally:
-                await browser.close()
-
-    text = asyncio.run(run())
-    assert "CLEVELAND" in text
-    assert "邮编 44102-2135" in text

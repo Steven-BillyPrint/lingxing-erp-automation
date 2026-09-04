@@ -88,6 +88,7 @@ _SHIPMENT_API_WINDOW_SECONDS = 30 * 24 * 60 * 60
 _SHIPMENT_WINDOW_OVERLAP_SECONDS = 1
 _ORDER_IDENTIFIER_LOOKUP_PAGE_LENGTH = 200
 _ORDER_IDENTIFIER_LOOKUP_PAGE_LIMIT = 10
+_ORDER_LIST_OPENAPI_SNAPSHOT_KEY = "_lingxing_openapi_order_list_snapshot"
 _PRODUCT_IDENTITY_BACKFILL_BATCH_SIZE = 25
 _PRODUCT_IDENTITY_BACKFILL_TARGET_BUDGET = 500
 _CUSTOMER_SHIPPING_SERVICE_BACKFILL_TARGET_BUDGET = 500
@@ -179,11 +180,18 @@ def _record_system_order_no(record: OrderRecord) -> str:
     )
 
 
-def _with_order_list_product_identities(
+def _with_order_list_evidence(
     detail_payload: Mapping[str, Any],
     records: Sequence[OrderRecord],
 ) -> dict[str, Any]:
-    """Attach exact, sanitized list-row product and amount evidence to detail."""
+    """Attach exact documented list evidence to one verified order detail.
+
+    The documented detail endpoint does not reliably expose receiver data.
+    Alibaba ordering consumes the list snapshot through the generic address
+    extractor, while product classification keeps using the sanitized rows
+    below.  Only records already matched to the same system/platform identity
+    are attached.
+    """
 
     snapshot_rows: list[dict[str, Any]] = []
     for record in records:
@@ -205,6 +213,10 @@ def _with_order_list_product_identities(
                 snapshot_row["sales_amount"] = str(row.sales_amount)
             snapshot_rows.append(snapshot_row)
     enriched = dict(detail_payload)
+    if records:
+        enriched[_ORDER_LIST_OPENAPI_SNAPSHOT_KEY] = {
+            "records": [dict(record.payload) for record in records],
+        }
     if snapshot_rows:
         enriched[ORDER_PRODUCT_EVIDENCE_SNAPSHOT_KEY] = {
             "rows": snapshot_rows,
@@ -257,7 +269,7 @@ def build_capability_router(
     # deliberately browser-only in the custom-order orchestration, while the
     # low-level phone API remains available for diagnostics and compatibility.
     modes[ApiCapability.UPDATE_BUYER_EMAIL] = ApiCapabilityMode.BROWSER_ONLY
-    modes[ApiCapability.READ_FULL_ADDRESS] = ApiCapabilityMode.BROWSER_ONLY
+    modes[ApiCapability.READ_FULL_ADDRESS] = ApiCapabilityMode.API_PREFERRED
     modes[ApiCapability.ALIBABA_LOGISTICS] = ApiCapabilityMode.BROWSER_ONLY
     modes[ApiCapability.REMARK_SHIPMENT] = ApiCapabilityMode.BROWSER_ONLY
     modes[ApiCapability.SEND_EMAIL] = ApiCapabilityMode.DISABLED
@@ -567,7 +579,7 @@ class DesktopApiServices:
                     in _record_platform_order_nos(record)
                 )
             )
-        payload = _with_order_list_product_identities(payload, exact_records)
+        payload = _with_order_list_evidence(payload, exact_records)
         return ResolvedOrderDetail(
             requested_order_no=requested_order_no,
             system_order_no=system_order_no,

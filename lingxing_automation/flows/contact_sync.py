@@ -32,7 +32,6 @@ from ..pages.order_detail import (
     collect_detail_contact_candidates,
     click_system_order,
     find_contact_from_system_orders,
-    read_detail_recipient_name,
     read_shipping_contact_values,
     update_current_detail_contact,
     update_contact_for_system_orders,
@@ -115,10 +114,7 @@ from ..services.tent_package_split_planner import (
     build_tent_package_split_plan,
 )
 from ..services.tent_sku_adjuster import (
-    DetailShippingDestination,
     execute_tent_sku_adjustment,
-    read_detail_shipping_destination,
-    read_detail_shipping_address_text,
     read_list_shipping_deadline_text,
     upsert_instruction_customer_remark,
 )
@@ -713,17 +709,34 @@ async def collect_order_folder_json_context(
     staging_root: str | Path,
     download_custom_zip: bool,
     api_operations: CustomOrderApiOperations | None = None,
+    api_order_context: CustomOrderApiContext | None = None,
     interaction_policy: CustomOrderInteractionPolicy | None = None,
 ) -> dict[str, Any]:
-    """收集文件夹生成所需的 zip JSON、Amazon 数量和网页详情收件人信息。"""
+    """收集文件夹数据；收件人只使用已验证的领星公开 API 上下文。"""
 
     context_started = time.monotonic()
-    recipient_name, quantity_result = await asyncio.gather(
-        read_detail_recipient_name(page),
-        amazon_quantity_client.get_order_items(item.platform_order_no),
+    api_context_task = asyncio.create_task(
+        _resolve_openapi_order_context(
+            api_order_context,
+            api_operations,
+            item=item,
+            system_order_no=system_order_no,
+        )
+    )
+    quantity_task = asyncio.create_task(
+        amazon_quantity_client.get_order_items(item.platform_order_no)
+    )
+    resolved_api_context, quantity_result = await asyncio.gather(
+        api_context_task,
+        quantity_task,
+    )
+    recipient_name = (
+        resolved_api_context.recipient_name if resolved_api_context is not None else None
     )
     recipient_name_source = (
-        "lingxing_browser_detail" if recipient_name else "missing"
+        resolved_api_context.recipient_name_source
+        if resolved_api_context is not None
+        else "lingxing_openapi_unavailable"
     )
     if api_operations is not None:
         summary_loader = getattr(amazon_quantity_client, "get_order_summary", None)
@@ -1323,42 +1336,97 @@ def tent_instruction_remark_required(plan) -> bool:
     return has_instruction and bool(str(getattr(plan, "customer_remark", "") or "").strip())
 
 
-async def _read_detail_destination_with_web_region(
-    page,
+def _validate_openapi_order_context(
+    context: CustomOrderApiContext,
+    *,
+    item: BatchOrderItem,
     system_order_no: str,
-) -> tuple[DetailShippingDestination, str]:
-    """Keep API postal metadata while taking country/region from the detail page.
+) -> None:
+    """Prove that a normalized OpenAPI context belongs to the current order."""
 
-    Lingxing's documented OpenAPI detail payload is not a reliable source for
-    the customer destination.  The authenticated ERP detail page is already
-    open and exposes the complete ``收件地址`` text, so routing must use that
-    text even when the rest of the order context came from OpenAPI.  A cached
-    reader avoids evaluating the DOM twice when the internal postal endpoint
-    itself falls back to the page.
-    """
+    if context.item.platform_order_no != item.platform_order_no:
+        raise RuntimeError("API 订单上下文的平台单号与待处理订单不一致。")
+    expected_system_order_no = str(system_order_no or "").strip()
+    observed_system_order_nos = {
+        str(value or "").strip()
+        for value in (
+            *context.system_order_nos,
+            context.item.system_order_no,
+        )
+        if str(value or "").strip()
+    }
+    if (
+        expected_system_order_no
+        and observed_system_order_nos
+        and expected_system_order_no not in observed_system_order_nos
+    ):
+        raise RuntimeError("API 订单上下文的系统单号与待处理订单不一致。")
 
-    web_region_text: str | None = None
 
-    async def read_web_region(current_page) -> str:
-        nonlocal web_region_text
-        if web_region_text is None:
-            try:
-                web_region_text = await read_detail_shipping_address_text(
-                    current_page
-                )
-            except Exception:
-                # Keep the existing authenticated-detail/API result available
-                # when a transient page redraw makes the DOM unreadable.
-                web_region_text = ""
-        return web_region_text
+async def _resolve_openapi_order_context(
+    context: CustomOrderApiContext | None,
+    api_operations: CustomOrderApiOperations | None,
+    *,
+    item: BatchOrderItem,
+    system_order_no: str,
+) -> CustomOrderApiContext | None:
+    """Reuse or load one normalized context through the documented OpenAPI."""
 
-    destination = await read_detail_shipping_destination(
-        page,
-        system_order_no,
-        dom_reader=read_web_region,
+    resolved = context
+    if resolved is None:
+        loader = getattr(api_operations, "get_order_context", None)
+        if callable(loader):
+            resolved = await loader(
+                platform_order_no=item.platform_order_no,
+                system_order_no=system_order_no,
+            )
+    if resolved is not None:
+        _validate_openapi_order_context(
+            resolved,
+            item=item,
+            system_order_no=system_order_no,
+        )
+    return resolved
+
+
+def _openapi_destination_values(
+    context: CustomOrderApiContext | None,
+) -> tuple[str, str | None, str, str | None, str | None]:
+    """Return normalized routing values without consulting ERP web data."""
+
+    if context is None:
+        return (
+            "",
+            None,
+            "lingxing_openapi_unavailable",
+            "当前流程没有取得领星公开 API 订单上下文。",
+            None,
+        )
+    address_text = str(context.shipping_address_text or "").strip()
+    postal_code = normalize_us_postal_code(context.shipping_postal_code)
+    diagnostics: list[str] = []
+    if context.shipping_address_error:
+        diagnostics.append(str(context.shipping_address_error).strip())
+    if not address_text:
+        diagnostics.append("领星公开 API 订单列表未返回可用收货地址。")
+    if not postal_code:
+        diagnostics.append("领星公开 API 订单列表未返回有效五位邮编。")
+    diagnostic = "；".join(dict.fromkeys(value for value in diagnostics if value)) or None
+    request_id = next(
+        (
+            str(value).strip()
+            for value in reversed(context.request_ids)
+            if str(value or "").strip()
+        ),
+        None,
     )
-    web_text = str(await read_web_region(page) or "").strip()
-    return destination, web_text or destination.shipping_address_text
+    return (
+        address_text,
+        postal_code,
+        str(context.shipping_postal_source or "lingxing_openapi"),
+        diagnostic,
+        request_id,
+    )
 
 
 async def read_shipping_deadline_for_tent_stage(
@@ -3043,6 +3111,24 @@ async def _process_batch_order_item_impl(
         if api_order_context is None:
             await close_order_detail_dialog(page)
         return payload
+    context_system_order_no = str(item.system_order_no or "").strip()
+    if not context_system_order_no and len(unique_system_order_nos) == 1:
+        context_system_order_no = unique_system_order_nos[0]
+    if context_system_order_no:
+        try:
+            api_order_context = await _resolve_openapi_order_context(
+                api_order_context,
+                api_operations,
+                item=item,
+                system_order_no=context_system_order_no,
+            )
+        except Exception as exc:
+            payload["status"] = "openapi_order_context_failed"
+            payload["message"] = (
+                "领星公开 API 订单上下文读取失败："
+                f"{str(exc) or type(exc).__name__}"
+            )
+            return payload
     if len(unique_system_order_nos) != 1:
         workflow_record = (
             load_order_workflow_record(dedupe_path, item.platform_order_no)
@@ -3152,26 +3238,21 @@ async def _process_batch_order_item_impl(
                     or ""
                 ).strip()
                 try:
-                    await close_order_detail_dialog(page)
-                    await click_system_order(page, original_system_order_no)
-                    await wait_for_detail(page, original_system_order_no)
-                    await assert_current_detail_order(
-                        page,
-                        original_system_order_no,
-                        item.platform_order_no,
-                        "warehouse postal refresh",
+                    api_order_context = await _resolve_openapi_order_context(
+                        api_order_context,
+                        api_operations,
+                        item=item,
+                        system_order_no=original_system_order_no,
                     )
                     (
-                        refreshed_destination,
                         refreshed_shipping_text,
-                    ) = await _read_detail_destination_with_web_region(
-                        page,
-                        original_system_order_no,
+                        refreshed_postal_code,
+                        refreshed_postal_source,
+                        refreshed_api_error,
+                        refreshed_request_id,
+                    ) = _openapi_destination_values(
+                        api_order_context,
                     )
-                    refreshed_postal_code = refreshed_destination.postal_code
-                    refreshed_postal_source = refreshed_destination.postal_source
-                    refreshed_api_error = refreshed_destination.api_error
-                    refreshed_request_id = refreshed_destination.request_id
                     destination_region = parse_destination_region(
                         refreshed_shipping_text
                     )
@@ -3197,7 +3278,7 @@ async def _process_batch_order_item_impl(
                         "warehouse_logistics_manual_review"
                     )
                     payload["warehouse_logistics_error"] = (
-                        "仓库阶段无法从原始系统单重新读取邮编："
+                        "仓库阶段无法从领星公开 API 重新读取原始系统单邮编："
                         f"{str(exc) or type(exc).__name__}"
                     )
                     payload["message"] = (
@@ -3208,8 +3289,6 @@ async def _process_batch_order_item_impl(
                     if api_order_context is None:
                         await close_order_detail_dialog(page)
                     return payload
-                if api_order_context is None:
-                    await close_order_detail_dialog(page)
                 if not restored_plan.destination.postal_code:
                     payload["status"] = (
                         "updated_folder_created_warehouse_logistics_failed"
@@ -3338,13 +3417,12 @@ async def _process_batch_order_item_impl(
         "before extraction",
     )
     (
-        shipping_destination,
         shipping_address_text,
-    ) = await _read_detail_destination_with_web_region(page, system_order_no)
-    shipping_postal_code = shipping_destination.postal_code
-    shipping_postal_source = shipping_destination.postal_source
-    shipping_postal_error = shipping_destination.api_error
-    shipping_request_id = shipping_destination.request_id
+        shipping_postal_code,
+        shipping_postal_source,
+        shipping_postal_error,
+        shipping_request_id,
+    ) = _openapi_destination_values(api_order_context)
     payload["shipping_address_text"] = _short_text(shipping_address_text, 1000)
     payload["shipping_postal_code"] = shipping_postal_code
     payload["shipping_postal_source"] = shipping_postal_source
@@ -3362,6 +3440,7 @@ async def _process_batch_order_item_impl(
         staging_root=Path(log_dir) / "custom_zip_staging",
         download_custom_zip=download_custom_zip,
         api_operations=api_operations,
+        api_order_context=api_order_context,
         interaction_policy=interaction_policy,
     )
     payload["timings"]["folder_context_ms"] = round(
@@ -5480,6 +5559,7 @@ async def run_once(args: argparse.Namespace) -> SyncResult:
 
         single_folder_item: BatchOrderItem | None = None
         single_folder_context: dict[str, Any] = {}
+        single_api_order_context: CustomOrderApiContext | None = None
         single_shipping_address_text = ""
         single_payment_time = latest_payment_text("\n".join(texts))
         try:
@@ -5504,6 +5584,12 @@ async def run_once(args: argparse.Namespace) -> SyncResult:
                     parent_asin=product_match.parent_asin,
                     product_type=product_match.product_type,
                 )
+                single_api_order_context = await _resolve_openapi_order_context(
+                    None,
+                    getattr(args, "custom_order_api_operations", None),
+                    item=single_folder_item,
+                    system_order_no=single_folder_item.system_order_no,
+                )
                 single_folder_context = await collect_order_folder_json_context(
                     page,
                     single_folder_item,
@@ -5512,9 +5598,14 @@ async def run_once(args: argparse.Namespace) -> SyncResult:
                     staging_root=Path(args.log_dir) / "custom_zip_staging",
                     download_custom_zip=not args.no_download_custom_zip,
                     api_operations=getattr(args, "custom_order_api_operations", None),
+                    api_order_context=single_api_order_context,
                     interaction_policy=getattr(args, "custom_order_interaction_policy", None),
                 )
-                single_shipping_address_text = await read_detail_shipping_address_text(page)
+                single_shipping_address_text = (
+                    single_api_order_context.shipping_address_text
+                    if single_api_order_context is not None
+                    else ""
+                )
                 zip_bundle = single_folder_context.get("zip_bundle")
                 json_contacts = extract_contact_candidates_from_json_items(
                     getattr(zip_bundle, "customization_items", []) if zip_bundle is not None else []

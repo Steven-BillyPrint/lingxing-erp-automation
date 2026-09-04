@@ -80,6 +80,7 @@ class CustomOrderApiContext:
     shipping_address_text: str = ""
     shipping_postal_code: str | None = None
     shipping_postal_source: str = "lingxing_openapi"
+    shipping_address_error: str | None = None
     request_ids: tuple[str, ...] = ()
 
 

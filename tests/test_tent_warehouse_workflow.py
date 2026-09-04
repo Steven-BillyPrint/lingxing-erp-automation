@@ -5,8 +5,10 @@ from dataclasses import replace
 
 from lingxing_automation.flows import contact_sync
 from lingxing_automation.models import BatchOrderItem
-from lingxing_automation.services.custom_order_api import WarehouseLogisticsOutcome
-from lingxing_automation.services.tent_sku_adjuster import DetailShippingDestination
+from lingxing_automation.services.custom_order_api import (
+    CustomOrderApiContext,
+    WarehouseLogisticsOutcome,
+)
 from lingxing_automation.services.tent_sku_planner import (
     DestinationRegion,
     TentSkuAdjustmentPlan,
@@ -402,7 +404,7 @@ def test_split_order_retry_restores_persisted_plan_and_skips_detail(monkeypatch,
     assert captured["plan"].destination.postal_code == "11725"
 
 
-def test_split_order_retry_refetches_missing_postal_from_original_order_only(
+def test_split_order_retry_refreshes_missing_postal_from_openapi_context(
     monkeypatch,
     tmp_path,
 ):
@@ -454,17 +456,6 @@ def test_split_order_retry_refetches_missing_postal_from_original_order_only(
         assert order_no == SYSTEM
         assert platform_order_no == PLATFORM
 
-    async def read_destination(_page, order_no, **_kwargs):
-        assert order_no == SYSTEM
-        return DetailShippingDestination(
-            shipping_address_text=(
-                "收件地址 United States of America (USA)，OH，CLEVELAND 邮编 44102"
-            ),
-            postal_code="44102",
-            postal_source="erp_detail_api",
-            request_id="detail-request",
-        )
-
     async def warehouse_stage(*_args, **kwargs):
         captured["candidate_nos"] = kwargs["package_split_system_order_nos"]
         captured["plan"] = kwargs["sku_plan_override"]
@@ -481,12 +472,25 @@ def test_split_order_retry_refetches_missing_postal_from_original_order_only(
     monkeypatch.setattr(contact_sync, "click_system_order", click)
     monkeypatch.setattr(contact_sync, "wait_for_detail", detail_wait)
     monkeypatch.setattr(contact_sync, "assert_current_detail_order", assert_detail)
-    monkeypatch.setattr(
-        contact_sync,
-        "read_detail_shipping_destination",
-        read_destination,
-    )
     monkeypatch.setattr(contact_sync, "run_tent_warehouse_logistics_stage", warehouse_stage)
+
+    api_item = BatchOrderItem(
+        SYSTEM,
+        PLATFORM,
+        "tent original order",
+        product_type="tent",
+    )
+    api_context = CustomOrderApiContext(
+        item=api_item,
+        system_order_nos=(SYSTEM, "child-a", "child-b"),
+        recipient_name="OpenAPI Buyer",
+        shipping_address_text=(
+            "收件地址 United States of America (USA)，OH，CLEVELAND 邮编 44102"
+        ),
+        shipping_postal_code="44102",
+        shipping_postal_source="lingxing_openapi",
+        request_ids=("openapi-request",),
+    )
 
     result = asyncio.run(
         contact_sync.process_batch_order_item(
@@ -503,18 +507,19 @@ def test_split_order_retry_refetches_missing_postal_from_original_order_only(
             write_dedupe=True,
             ignore_payment_window=True,
             api_operations=object(),  # type: ignore[arg-type]
+            api_order_context=api_context,
         )
     )
 
     refreshed_record = load_order_workflow_record(state, PLATFORM)
     refreshed_plan = refreshed_record["warehouse_logistics_plan_input"]
-    assert captured["opened"] == [SYSTEM]
+    assert captured["opened"] == []
     assert captured["candidate_nos"] == ["child-b", "child-a"]
     assert captured["plan"].destination.postal_code == "44102"
-    assert captured["plan"].destination.postal_source == "erp_detail_api"
+    assert captured["plan"].destination.postal_source == "lingxing_openapi"
     assert captured["runtime_system_order_no"] == SYSTEM
     assert refreshed_plan["destination"]["postal_code"] == "44102"
-    assert refreshed_plan["destination"]["postal_source"] == "erp_detail_api"
+    assert refreshed_plan["destination"]["postal_source"] == "lingxing_openapi"
     assert refreshed_record["contact_writeback_complete"] is True
     assert refreshed_record["folder_complete"] is True
     assert refreshed_record["sku_adjustment_complete"] is True

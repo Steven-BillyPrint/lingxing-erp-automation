@@ -38,7 +38,7 @@ from shipment_automation.models import (
     LogisticsDetail,
     ShipmentCandidate,
 )
-from shipment_automation.alibaba_ordering import ProductCategory
+from shipment_automation.alibaba_ordering import ProductCategory, extract_shipping_address
 from shipment_automation.alibaba_product_classification import (
     classify_order_product,
 )
@@ -292,6 +292,17 @@ def test_order_detail_lookup_enriches_direct_system_order_with_list_asin(
     row = _official_order(platform_order_no=platform_order_no)
     row["global_order_no"] = system_order_no
     row["item_info"][0]["product_no"] = "B0D6KZ7G88"
+    row["address_info"] = {
+        "name": "Public API Buyer",
+        "receiver_country_code": "US",
+        "receiver_country_name": "United States",
+        "receiver_state": "CA",
+        "receiver_city": "Los Angeles",
+        "receiver_address": "123 Main Street Suite 2",
+        "receiver_postal_code": "90012-1234",
+        "receiver_tel": "+1 213-555-0188",
+        "receiver_email": "buyer@example.com",
+    }
     client = DetailRecordingClient(
         [row],
         {
@@ -313,6 +324,13 @@ def test_order_detail_lookup_enriches_direct_system_order_with_list_asin(
     )
 
     assert classify_order_product(result.payload).category is ProductCategory.TENT
+    address = extract_shipping_address(result.payload)
+    assert address.recipient == "Public API Buyer"
+    assert address.address1 == "123 Main Street"
+    assert address.address2 == "Suite 2"
+    assert address.postal_code == "90012"
+    assert address.phone == "2135550188"
+    assert address.email == "buyer@example.com"
     assert client.calls == [
         {
             "offset": 0,

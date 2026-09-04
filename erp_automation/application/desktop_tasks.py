@@ -684,44 +684,20 @@ class DesktopTaskRunner:
     @staticmethod
     async def _alibaba_shipping_address(
         detail: Mapping[str, Any],
-        context: Any,
-        system_order_no: str,
     ) -> tuple[Any, str]:
-        """Use OpenAPI first, then the submitting user's verified ERP detail."""
+        """Build the Alibaba address only from documented OpenAPI payloads."""
 
         from shipment_automation.alibaba_ordering import (
             AlibabaOrderRuleError,
             extract_shipping_address,
-            shipping_address_payload_with_web_detail_fallback,
-        )
-        from shipment_automation.lingxing_order_browser import (
-            LingxingOrderBrowser,
         )
 
         try:
             return extract_shipping_address(detail), "lingxing_openapi"
-        except AlibabaOrderRuleError as openapi_error:
-            try:
-                web_order_detail = await LingxingOrderBrowser(context).order_detail(
-                    system_order_no
-                )
-            except AlibabaOrderRuleError as fallback_error:
-                raise AlibabaOrderRuleError(
-                    f"{openapi_error} 本机领星网页地址兜底失败：{fallback_error}"
-                ) from fallback_error
-            fallback_payload = shipping_address_payload_with_web_detail_fallback(
-                detail,
-                web_order_detail,
-            )
-            try:
-                return (
-                    extract_shipping_address(fallback_payload),
-                    "lingxing_web_detail_api",
-                )
-            except AlibabaOrderRuleError as fallback_error:
-                raise AlibabaOrderRuleError(
-                    f"{fallback_error}（领星 OpenAPI 地址不完整，且本机页面详情仍无法形成完整地址。）"
-                ) from fallback_error
+        except AlibabaOrderRuleError as exc:
+            raise AlibabaOrderRuleError(
+                f"领星公开 API 订单列表地址不完整：{exc}"
+            ) from exc
 
     async def _prepare_alibaba_order(
         self,
@@ -830,8 +806,6 @@ class DesktopTaskRunner:
                     address_task = asyncio.create_task(
                         self._alibaba_shipping_address(
                             detail,
-                            context,
-                            resolved.system_order_no,
                         ),
                         name="alibaba-prepare-shipping-address",
                     )
@@ -1114,8 +1088,6 @@ class DesktopTaskRunner:
                     address_task = asyncio.create_task(
                         self._alibaba_shipping_address(
                             detail,
-                            context,
-                            resolved.system_order_no,
                         ),
                         name="alibaba-fill-shipping-address",
                     )
