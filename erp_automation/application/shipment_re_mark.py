@@ -193,7 +193,11 @@ class ShipmentReMarkWorkflow:
                 raise ErpMarkUserAbort("重新标发周期已经结束。")
             if cycle.state == REMARK_DETECTED:
                 self._progress(progress_func, "正在通过领星 OpenAPI 复核当前运单号。", 8)
-                current_waybill = await self._current_lingxing_waybill(cycle)
+                preflight_wms_rows = await self._wms_rows(cycle)
+                current_waybill = await self._current_lingxing_waybill(
+                    cycle,
+                    rows=preflight_wms_rows,
+                )
                 reconciliation = (
                     self.store.reconcile_completed_refresh_lingxing_waybill(
                         system_order_no=cycle.system_order_no,
@@ -223,12 +227,15 @@ class ShipmentReMarkWorkflow:
                         ),
                     )
                 cycle = self._required_cycle(cycle.id)
+            else:
+                preflight_wms_rows = None
             self._progress(progress_func, "正在通过领星 OpenAPI 核对原已发货包裹。", 12)
             cycle = await self._withdraw_if_needed(
                 page,
                 cycle,
                 runtime_guard_func=runtime_guard_func,
                 run_id=run_id,
+                preflight_wms_rows=preflight_wms_rows,
             )
             self._progress(progress_func, "已撤销回待审核，正在重设渠道、运单、运费和重量。", 38)
             cycle = await self._outbound_if_needed(
@@ -289,10 +296,15 @@ class ShipmentReMarkWorkflow:
         *,
         runtime_guard_func: RuntimeGuardFunc | None,
         run_id: str | None,
+        preflight_wms_rows: Sequence[Mapping[str, Any]] | None = None,
     ) -> ReMarkCycle:
         if cycle.state not in {REMARK_DETECTED, REMARK_WITHDRAW_INTENT}:
             return cycle
-        old_row = await self._old_outbound_row(cycle, required=cycle.state == REMARK_DETECTED)
+        old_row = await self._old_outbound_row(
+            cycle,
+            required=cycle.state == REMARK_DETECTED,
+            rows=preflight_wms_rows,
+        )
         if cycle.state == REMARK_WITHDRAW_INTENT and await self._withdrawal_confirmed(cycle):
             self._advance(
                 cycle,
@@ -722,10 +734,15 @@ class ShipmentReMarkWorkflow:
             rows.append(row)
         return rows
 
-    async def _current_lingxing_waybill(self, cycle: ReMarkCycle) -> str:
+    async def _current_lingxing_waybill(
+        self,
+        cycle: ReMarkCycle,
+        *,
+        rows: Sequence[Mapping[str, Any]] | None = None,
+    ) -> str:
         try:
             return current_lingxing_waybill_from_wms_rows(
-                await self._wms_rows(cycle),
+                list(rows) if rows is not None else await self._wms_rows(cycle),
                 system_order_no=cycle.system_order_no,
                 platform_order_no=cycle.platform_order_no,
                 logistics_no=cycle.logistics_no,
@@ -743,11 +760,14 @@ class ShipmentReMarkWorkflow:
         cycle: ReMarkCycle,
         *,
         required: bool,
+        rows: Sequence[Mapping[str, Any]] | None = None,
     ) -> Mapping[str, Any] | None:
-        rows = await self._wms_rows(cycle)
+        candidate_rows = (
+            list(rows) if rows is not None else await self._wms_rows(cycle)
+        )
         matches = [
             row
-            for row in rows
+            for row in candidate_rows
             if _status(row) == 3
             and str(row.get("waybill_no") or "").strip() == cycle.old_waybill_no
             and str(row.get("tracking_no") or "").strip()

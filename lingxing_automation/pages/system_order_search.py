@@ -108,10 +108,13 @@ async def exact_system_order_fragments(page: Any, system_order_no: str) -> list[
 
 async def exact_system_order_text(page: Any, system_order_no: str) -> str:
     fragments = await exact_system_order_fragments(page, system_order_no)
-    return " ".join(
-        " ".join((await fragment.inner_text()).split())
-        for fragment in fragments
-    ).strip()
+    # An ``await`` inside a generator expression turns that expression into
+    # an async generator, which ``str.join`` cannot consume.  Read each DOM
+    # fragment explicitly so the result remains a normal list of strings.
+    fragment_texts: list[str] = []
+    for fragment in fragments:
+        fragment_texts.append(" ".join((await fragment.inner_text()).split()))
+    return " ".join(fragment_texts).strip()
 
 
 async def exact_system_order_cell_text(

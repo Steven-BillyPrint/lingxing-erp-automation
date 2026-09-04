@@ -1790,6 +1790,102 @@ def test_generated_task_id_flows_to_worker_and_success_log(tmp_path):
     controller.close()
 
 
+def test_re_mark_jumps_ahead_of_queued_ordinary_marks_without_concurrency(
+    tmp_path,
+) -> None:
+    controller = _controller(tmp_path)
+    first_started = threading.Event()
+    release_first = threading.Event()
+    execution_order: list[str] = []
+    concurrent_count = 0
+    max_concurrent_count = 0
+    concurrency_lock = threading.Lock()
+
+    def runner(command):
+        nonlocal concurrent_count, max_concurrent_count
+        with concurrency_lock:
+            concurrent_count += 1
+            max_concurrent_count = max(max_concurrent_count, concurrent_count)
+        try:
+            execution_order.append(command.name)
+            if command.name == "first ordinary mark":
+                first_started.set()
+                assert release_first.wait(2)
+            return {"status": "completed", "message": "done"}
+        finally:
+            with concurrency_lock:
+                concurrent_count -= 1
+
+    controller.attach_task_runner(runner)
+    assert controller.set_emergency_stop_writes(False).accepted
+    first_template = _write_command(
+        "first ordinary mark",
+        area=TaskArea.SHIPMENT,
+        logistics_no="ALS-FIRST",
+    )
+    first = controller.submit_task(
+        TaskCommand(
+            "first ordinary mark",
+            first_template.area,
+            first_template.capability,
+            payload=first_template.payload,
+            order_no=first_template.order_no,
+        )
+    )
+    assert first.accepted and first.task_id
+    assert first_started.wait(2)
+
+    ordinary_command = _write_command(
+        "second ordinary mark",
+        area=TaskArea.SHIPMENT,
+        logistics_no="ALS-SECOND",
+    )
+    ordinary_command = TaskCommand(
+        "second ordinary mark",
+        ordinary_command.area,
+        ordinary_command.capability,
+        payload=ordinary_command.payload,
+        order_no=ordinary_command.order_no,
+    )
+    ordinary = controller.submit_task(ordinary_command)
+
+    confirmation = DesktopWriteConfirmation.create(
+        DesktopWriteAction.EXECUTE_SHIPMENT_REMARK,
+        "113-1341773-1145022",
+        system_order_no="103735075688785273",
+        logistics_no="ALS-REMARK",
+    )
+    remark = controller.submit_task(
+        TaskCommand(
+            "priority re-mark",
+            TaskArea.SHIPMENT,
+            Capability.REMARK_SHIPMENT,
+            payload={
+                "logistics_no": "ALS-REMARK",
+                "system_order_no": "103735075688785273",
+                "re_mark_cycle_id": 41,
+                DESKTOP_CONFIRMATION_PAYLOAD_KEY: confirmation.to_payload(),
+            },
+            order_no="113-1341773-1145022",
+        )
+    )
+    assert ordinary.accepted and ordinary.task_id
+    assert remark.accepted and remark.task_id
+
+    release_first.set()
+    controller._futures[first.task_id].result(timeout=2)
+    controller._futures[remark.task_id].result(timeout=2)
+    controller._futures[ordinary.task_id].result(timeout=2)
+
+    assert execution_order == [
+        "first ordinary mark",
+        "priority re-mark",
+        "second ordinary mark",
+    ]
+    assert max_concurrent_count == 1
+    controller.close()
+
+
 def test_generated_task_id_flows_to_worker_and_failure_log(tmp_path):
     controller = _controller(tmp_path)
     started = threading.Event()

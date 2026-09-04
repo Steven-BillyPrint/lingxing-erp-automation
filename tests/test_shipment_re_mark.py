@@ -535,6 +535,9 @@ def test_re_mark_workflow_uses_dom_withdraw_openapi_and_post_submit_dom_evidence
         f"mark:{SYSTEM_ORDER_NO}",
     ]
     assert any(read.startswith("detail:") for read in gateway.reads)
+    # The initial Lingxing waybill check and old-outbound check share one
+    # authoritative WMS snapshot; later reads prove withdrawal and re-outbound.
+    assert gateway.reads.count("wms") == 3
     completed = store.get_re_mark_cycle(cycle.id)
     assert completed is not None and completed.state == REMARK_COMPLETED
     row = store.get_by_logistics_no(LOGISTICS_NO)

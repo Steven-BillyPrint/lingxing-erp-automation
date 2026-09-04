@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import asyncio
 import hashlib
+import itertools
 import queue
 import re
 import sqlite3
@@ -154,7 +155,10 @@ class _DaemonTaskExecutor:
     """Single-worker executor whose abandoned task cannot block process exit."""
 
     def __init__(self, *, thread_name: str) -> None:
-        self._queue: queue.Queue[object] = queue.Queue()
+        self._queue: queue.PriorityQueue[tuple[int, int, object]] = (
+            queue.PriorityQueue()
+        )
+        self._queue_sequence = itertools.count()
         self._lock = threading.Lock()
         self._shutdown = False
         self._thread = threading.Thread(
@@ -170,11 +174,26 @@ class _DaemonTaskExecutor:
         *args: Any,
         **kwargs: Any,
     ) -> Future[Any]:
+        return self.submit_priority(0, function, *args, **kwargs)
+
+    def submit_priority(
+        self,
+        priority: int,
+        function: Callable[..., Any],
+        *args: Any,
+        **kwargs: Any,
+    ) -> Future[Any]:
         future: Future[Any] = Future()
         with self._lock:
             if self._shutdown:
                 raise RuntimeError("Task executor has been shut down.")
-            self._queue.put((future, function, args, kwargs))
+            self._queue.put(
+                (
+                    int(priority),
+                    next(self._queue_sequence),
+                    (future, function, args, kwargs),
+                )
+            )
         return future
 
     def shutdown(
@@ -189,24 +208,30 @@ class _DaemonTaskExecutor:
                 if cancel_futures:
                     while True:
                         try:
-                            item = self._queue.get_nowait()
+                            _priority, _sequence, payload = self._queue.get_nowait()
                         except queue.Empty:
                             break
-                        if item is None:
+                        if payload is None:
                             continue
-                        future = item[0]
+                        future = payload[0]
                         if isinstance(future, Future):
                             future.cancel()
-                self._queue.put(None)
+                self._queue.put(
+                    (
+                        2**31 - 1,
+                        next(self._queue_sequence),
+                        None,
+                    )
+                )
         if wait:
             self._thread.join()
 
     def _worker(self) -> None:
         while True:
-            item = self._queue.get()
-            if item is None:
+            _priority, _sequence, payload = self._queue.get()
+            if payload is None:
                 return
-            future, function, args, kwargs = item
+            future, function, args, kwargs = payload
             if not future.set_running_or_notify_cancel():
                 continue
             try:
@@ -1488,6 +1513,13 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         return getattr(self, self._executor_attr_for_command(command))
 
     @staticmethod
+    def _executor_priority_for_command(command: TaskCommand) -> int:
+        # Keep all shipment writes in the same serial lane, but put an explicit
+        # operator-triggered re-mark ahead of ordinary marks that have not yet
+        # started.  The currently running write is never interrupted.
+        return -10 if command.capability is Capability.REMARK_SHIPMENT else 0
+
+    @staticmethod
     def _executor_attr_for_command(command: TaskCommand) -> str:
         trigger = str(command.payload.get("trigger") or "")
         if (
@@ -1700,7 +1732,8 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                 )
             execution_command = replace(command, execution_id=result.task_id)
             executor = self._executor_for_command(execution_command)
-            self._futures[result.task_id] = executor.submit(
+            self._futures[result.task_id] = executor.submit_priority(
+                self._executor_priority_for_command(execution_command),
                 self._execute_task,
                 result.task_id,
                 execution_command,
@@ -2274,7 +2307,10 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                 order_no=task.order_no,
                 execution_id=task_id,
             )
-            self._futures[task_id] = self._executor_for_command(command).submit(
+            self._futures[task_id] = self._executor_for_command(
+                command
+            ).submit_priority(
+                self._executor_priority_for_command(command),
                 self._execute_task,
                 task_id,
                 command,

@@ -237,6 +237,16 @@ async def wait_for_order_page(
                 "领星要求当前服务器完成手机绑定或设备验证；"
                 "云端无头浏览器无法代替人工完成。请先完成一次服务器浏览器验证后再重新提交。"
             )
+        # On the already-loaded order-management SPA, reading the entire body
+        # can be very expensive over a remote CDP tunnel.  The unique visible
+        # search root is the same readiness boundary used by page automation,
+        # and needs only one small DOM query.
+        if "mpOrderManagement" in str(page.url or ""):
+            try:
+                if await page.locator("#advanced-input:visible").count() == 1:
+                    return
+            except Exception:
+                pass
         try:
             body_text = await page.locator("body").inner_text(timeout=1500)
         except Exception:

@@ -5,6 +5,7 @@ import asyncio
 import pytest
 
 import lingxing_automation.pages.marked_shipment_update as update_page
+import lingxing_automation.pages.shipment_reversal as reversal_page
 from lingxing_automation.pages.marked_shipment_update import (
     MarkedShipmentUpdateEvidence,
     system_marking_contains_waybill,
@@ -12,6 +13,7 @@ from lingxing_automation.pages.marked_shipment_update import (
 )
 from lingxing_automation.pages.system_order_search import (
     exact_system_order_cell_text,
+    exact_system_order_text,
 )
 
 
@@ -68,6 +70,112 @@ def test_system_marking_cell_is_read_by_header_colid_and_dynamic_rowid() -> None
                 await browser.close()
 
     assert asyncio.run(run()) == f"OnTrac ： {NEW_WAYBILL_NO} 标发中"
+
+
+def test_exact_system_order_text_reads_fragments_without_async_generator() -> None:
+    html = f"""
+    <table>
+      <thead><tr><th colid="col_8">系统单号</th></tr></thead>
+      <tbody>
+        <tr rowid="row_20"><td colid="col_8">{SYSTEM_ORDER_NO}</td></tr>
+        <tr rowid="row_20"><td colid="col_9">手动-OnTrac {NEW_WAYBILL_NO}</td></tr>
+      </tbody>
+    </table>
+    """
+
+    async def run() -> str:
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(html)
+                return await exact_system_order_text(page, SYSTEM_ORDER_NO)
+            finally:
+                await browser.close()
+
+    assert asyncio.run(run()) == (
+        f"{SYSTEM_ORDER_NO} 手动-OnTrac {NEW_WAYBILL_NO}"
+    )
+
+
+def test_withdraw_reuses_authenticated_order_management_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    class ExistingPage:
+        url = reversal_page.ORDER_MANAGEMENT_URL
+
+        async def goto(self, *_args, **_kwargs) -> None:
+            raise AssertionError("already-loaded order page must not be navigated again")
+
+        async def wait_for_timeout(self, _milliseconds: int) -> None:
+            return None
+
+    class Dialog:
+        def get_by_text(self, text: str, *, exact: bool):
+            assert exact
+            events.append(f"option:{text}")
+            return object()
+
+    async def record(name: str, *_args, **_kwargs):
+        events.append(name)
+
+    async def row_text(*_args, **_kwargs) -> str:
+        return (
+            f"{SYSTEM_ORDER_NO} 113-1341773-1145022 "
+            f"手动-OnTrac {NEW_WAYBILL_NO} ALS01915029156"
+        )
+
+    async def dialog(*_args, **_kwargs):
+        return Dialog()
+
+    async def one_visible(*_args, **_kwargs):
+        return _Clickable()
+
+    async def before_confirm() -> None:
+        events.append("intent")
+
+    monkeypatch.setattr(
+        reversal_page,
+        "_select_order_tab",
+        lambda *_args, **_kwargs: record("tab"),
+    )
+    monkeypatch.setattr(
+        reversal_page,
+        "search_exact_system_order",
+        lambda *_args, **_kwargs: record("search"),
+    )
+    monkeypatch.setattr(reversal_page, "exact_system_order_text", row_text)
+    monkeypatch.setattr(
+        reversal_page,
+        "select_exact_system_order",
+        lambda *_args, **_kwargs: record("select"),
+    )
+    monkeypatch.setattr(
+        reversal_page,
+        "click_one_visible_button",
+        lambda *_args, **_kwargs: record("button"),
+    )
+    monkeypatch.setattr(reversal_page, "one_visible_dialog", dialog)
+    monkeypatch.setattr(reversal_page, "_one_visible", one_visible)
+
+    evidence = asyncio.run(
+        reversal_page.withdraw_shipped_order_to_pending_review(
+            ExistingPage(),
+            system_order_no=SYSTEM_ORDER_NO,
+            platform_order_no="113-1341773-1145022",
+            old_waybill_no=NEW_WAYBILL_NO,
+            logistics_no="ALS01915029156",
+            before_final_confirm=before_confirm,
+        )
+    )
+
+    assert evidence.system_order_no == SYSTEM_ORDER_NO
+    assert events[:3] == ["tab", "search", "select"]
+    assert events[-2:] == ["intent", "button"]
 
 
 class _Locator:
