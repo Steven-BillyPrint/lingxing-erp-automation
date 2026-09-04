@@ -49,6 +49,7 @@ from ..pages.order_management import (
     wait_for_visible_batch_order_rows,
     wait_for_orders_in_list,
 )
+from ..pages.order_table_actions import switch_order_tab
 from ..parsers.dates import classify_recent_payment_window, latest_payment_text
 from ..parsers.contact import (
     contact_choice_identity,
@@ -246,6 +247,12 @@ class _LazyContactOrderPage:
                 auto_login=not self.args.no_auto_login,
                 debug_dir=getattr(self.args, "debug_log_dir", "debug/logs"),
             )
+        # The visible Chrome profile is shared by desktop workflows.  A prior
+        # shipment re-mark (or a manual operator action) may leave the order
+        # management SPA on "已发货" even though the route itself is unchanged.
+        # Custom-order browser writes always target orders in "待审核", so make
+        # that tab an explicit page invariant before the lazy page is exposed.
+        await switch_order_tab(self.page, "待审核")
         return self.page
 
     async def evaluate(self, *args: Any, **kwargs: Any):

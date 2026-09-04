@@ -26,6 +26,8 @@ from erp_automation.contracts.models import (
     ShipmentPage,
     MigrationInfo,
     NOTIFICATION_CONTACT_REFRESH_TRIGGER,
+    NOTIFICATION_PROVIDER_TEST_TRIGGER,
+    NOTIFICATION_RECEIPT_REFRESH_TRIGGER,
     NOTIFICATION_REVIEW_RESCAN_TRIGGER,
     SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER,
     SHIPMENT_NOTIFICATION_SEND_TRIGGER,
@@ -198,6 +200,31 @@ class InMemoryBackgroundTaskController:
                     return ControlResult(
                         False,
                         "领星客户通知物流正在同步，请等待当前任务完成。",
+                        duplicate.task_id,
+                    )
+
+            maintenance_trigger_messages = {
+                NOTIFICATION_RECEIPT_REFRESH_TRIGGER: (
+                    "发送状态正在后台刷新，请等待当前任务完成。"
+                ),
+                NOTIFICATION_PROVIDER_TEST_TRIGGER: (
+                    "通知供应商连接正在测试，请等待当前任务完成。"
+                ),
+            }
+            if trigger in maintenance_trigger_messages:
+                duplicate = next(
+                    (
+                        task
+                        for task in self._state.tasks
+                        if str(task.payload.get("trigger") or "") == trigger
+                        and not task.status.terminal
+                    ),
+                    None,
+                )
+                if duplicate is not None:
+                    return ControlResult(
+                        False,
+                        maintenance_trigger_messages[trigger],
                         duplicate.task_id,
                     )
 

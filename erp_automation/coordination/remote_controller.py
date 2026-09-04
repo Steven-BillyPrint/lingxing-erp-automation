@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import base64
+import hashlib
+import json
 import os
 import re
 import socket
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from copy import deepcopy
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
@@ -59,14 +62,9 @@ from .service import (
 
 _CLIENT_VERSION_PATTERN = re.compile(r"^\d{4}\.\d{2}\.\d{2}\.\d+$")
 
-_NOTIFICATION_SEND_TIMEOUT_PER_ITEM_SECONDS = 105.0
-_NOTIFICATION_SEND_TIMEOUT_OVERHEAD_SECONDS = 30.0
-_MAX_NOTIFICATION_SEND_TIMEOUT_SECONDS = 60.0 * 60.0
 _NOTIFICATION_READ_TIMEOUT_SECONDS = 30.0
-_STATUS_MUTATION_READ_TIMEOUT_SECONDS = 30.0
-_TASK_BATCH_READ_TIMEOUT_OVERHEAD_SECONDS = 5.0
-_TASK_BATCH_READ_TIMEOUT_PER_ITEM_SECONDS = 0.25
-_MAX_TASK_BATCH_READ_TIMEOUT_SECONDS = 60.0
+_PORTABLE_CONFIGURATION_EXPORT_REQUEST = "export_portable_configuration"
+_PORTABLE_CONFIGURATION_IMPORT_REQUEST = "import_portable_configuration"
 _CONCURRENT_READ_METHODS = frozenset(
     {
         "list_custom_order_page",
@@ -119,6 +117,10 @@ def _filter_snapshot_for_operator(
 
 class CoordinationConnectionError(RuntimeError):
     """The shared controller could not be reached or authenticated."""
+
+
+class CoordinationReadTimeout(CoordinationConnectionError):
+    """The server accepted a connection but did not confirm an outcome in time."""
 
 
 class CoordinationAuthenticationRequired(CoordinationConnectionError):
@@ -250,6 +252,7 @@ class RemoteBackgroundTaskController:
         )
         self._timeout_seconds = max(3.0, float(timeout_seconds))
         self._lock = threading.RLock()
+        self._browser_rpc_lock = threading.RLock()
         self._page_cache_lock = threading.RLock()
         self._closed = False
         self._last_snapshot = DesktopSnapshot(
@@ -270,6 +273,14 @@ class RemoteBackgroundTaskController:
             max_workers=1,
             thread_name_prefix="erp-local-browser-action",
         )
+        self._request_reconciliation_pool = ThreadPoolExecutor(
+            max_workers=2,
+            thread_name_prefix="erp-request-reconciliation",
+        )
+        self._request_reconciliation_stop = threading.Event()
+        self._pending_request_ids: set[str] = set()
+        self._pending_mutation_fingerprints: dict[str, str] = {}
+        self._reconciled_request_messages: list[str] = []
         self._snapshot_revision: int | None = None
         self._startup_snapshot_pending = False
         self._prefetched_custom_order_pages: dict[
@@ -509,9 +520,21 @@ class RemoteBackgroundTaskController:
                 self._authentication_error = ""
         except CoordinationConnectionError:
             raise
-        except (httpx.HTTPError, ValueError) as exc:
+        except httpx.ReadTimeout as exc:
+            raise CoordinationReadTimeout(
+                "共享 ERP 后台仍在处理请求，客户端等待确认超时。"
+            ) from exc
+        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
             raise CoordinationConnectionError(
                 f"无法连接共享 ERP 后台：{exc}"
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise CoordinationConnectionError(
+                f"共享 ERP 后台通信失败：{exc}"
+            ) from exc
+        except ValueError as exc:
+            raise CoordinationConnectionError(
+                f"共享 ERP 后台响应解析失败：{exc}"
             ) from exc
         if not isinstance(payload, dict):
             raise CoordinationConnectionError("共享 ERP 后台返回了无效响应。")
@@ -544,6 +567,7 @@ class RemoteBackgroundTaskController:
         self,
         payload: Mapping[str, Any],
     ) -> DesktopSnapshot:
+        reconciled_message = self._take_reconciled_request_message()
         response_revision = int(payload.get("revision") or self._revision)
         self.instance_pause_supported = bool(
             payload.get(
@@ -566,6 +590,10 @@ class RemoteBackgroundTaskController:
                     "任务安全结束后会自动更新。"
                 )
                 self._last_snapshot = snapshot
+            elif reconciled_message:
+                snapshot = deepcopy(self._last_snapshot)
+                snapshot.backend_message = reconciled_message
+                self._last_snapshot = snapshot
             return self._last_snapshot
 
         snapshot = decode_snapshot(payload.get("snapshot"))
@@ -586,6 +614,8 @@ class RemoteBackgroundTaskController:
                 "客户端已有新版本；当前版本只能完成已经开始的任务，"
                 "任务安全结束后会自动更新。"
             )
+        elif reconciled_message:
+            snapshot.backend_message = reconciled_message
         decoded_interactions = decode_interactions(payload.get("interactions"))
         automatic_interactions = {
             request.request_id: request
@@ -991,37 +1021,6 @@ class RemoteBackgroundTaskController:
             3.0,
             float(getattr(self, "_timeout_seconds", 5.0)),
         )
-        if method == "submit_tasks":
-            first_arg = args[0] if args else ()
-            item_count = (
-                len(first_arg)
-                if isinstance(first_arg, (list, tuple))
-                else 1
-            )
-            read_timeout = min(
-                _MAX_TASK_BATCH_READ_TIMEOUT_SECONDS,
-                max(
-                    base_timeout,
-                    _TASK_BATCH_READ_TIMEOUT_OVERHEAD_SECONDS
-                    + max(1, item_count)
-                    * _TASK_BATCH_READ_TIMEOUT_PER_ITEM_SECONDS,
-                ),
-            )
-            return httpx.Timeout(
-                base_timeout,
-                connect=base_timeout,
-                read=read_timeout,
-                write=base_timeout,
-                pool=base_timeout,
-            )
-        if method in {"change_shipment_status", "change_shipment_statuses"}:
-            return httpx.Timeout(
-                base_timeout,
-                connect=base_timeout,
-                read=max(base_timeout, _STATUS_MUTATION_READ_TIMEOUT_SECONDS),
-                write=base_timeout,
-                pool=base_timeout,
-            )
         if method in {
             "list_shipment_notifications",
             "get_shipment_notification_details",
@@ -1039,36 +1038,254 @@ class RemoteBackgroundTaskController:
                 write=base_timeout,
                 pool=base_timeout,
             )
-        if method == "approve_shipment_notifications":
-            first_arg = args[0] if args else ()
-            item_count = (
-                len(first_arg)
-                if isinstance(first_arg, (list, tuple, set, frozenset))
-                else 1
-            )
-        elif method in {
-            "approve_shipment_notification",
-            "retry_shipment_notification",
-        }:
-            item_count = 1
-        else:
+        return None
+
+    def _rpc_guard(self, method: str, args: tuple[Any, ...]) -> Any:
+        """Serialize only local browser preparation, never ordinary HTTP waits."""
+
+        if method not in {"submit_task", "submit_tasks"} or not args:
+            return nullcontext()
+        values = args[0] if method == "submit_tasks" else (args[0],)
+        commands = values if isinstance(values, (list, tuple)) else (values,)
+        if any(
+            isinstance(command, TaskCommand)
+            and task_requires_visible_browser(command)
+            for command in commands
+        ):
+            lock = self.__dict__.get("_browser_rpc_lock")
+            if lock is None:
+                lock = threading.RLock()
+                self.__dict__["_browser_rpc_lock"] = lock
+            return lock
+        return nullcontext()
+
+    @staticmethod
+    def _mutation_fingerprint(
+        method: str,
+        args: Sequence[Any],
+        kwargs: Mapping[str, Any],
+    ) -> str:
+        encoded = json.dumps(
+            {
+                "method": str(method or ""),
+                "args": to_jsonable(list(args)),
+                "kwargs": to_jsonable(dict(kwargs)),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _pending_mutation_result(
+        self,
+        fingerprint: str,
+    ) -> ControlResult | None:
+        if not fingerprint:
             return None
-        read_timeout = min(
-            _MAX_NOTIFICATION_SEND_TIMEOUT_SECONDS,
-            max(
-                base_timeout,
-                _NOTIFICATION_SEND_TIMEOUT_OVERHEAD_SECONDS
-                + max(1, item_count)
-                * _NOTIFICATION_SEND_TIMEOUT_PER_ITEM_SECONDS,
-            ),
+        with self._metadata_guard():
+            request_id = self.__dict__.setdefault(
+                "_pending_mutation_fingerprints",
+                {},
+            ).get(fingerprint)
+        if not request_id:
+            return None
+        return ControlResult(
+            False,
+            "相同请求仍在后台核对执行结果，请勿重复操作。",
+            details={
+                "request_id": request_id,
+                "submission_outcome_unknown": True,
+                "non_modal": True,
+                "retry_suppressed": True,
+            },
         )
-        return httpx.Timeout(
-            base_timeout,
-            connect=base_timeout,
-            read=read_timeout,
-            write=base_timeout,
-            pool=base_timeout,
-        )
+
+    def _record_reconciled_request_message(self, message: str) -> None:
+        normalized = " ".join(str(message or "").split())[:500]
+        if not normalized:
+            return
+        with self._metadata_guard():
+            messages = self.__dict__.setdefault(
+                "_reconciled_request_messages",
+                [],
+            )
+            messages.append(normalized)
+            del messages[:-5]
+
+    def _take_reconciled_request_message(self) -> str:
+        with self._metadata_guard():
+            messages = self.__dict__.setdefault(
+                "_reconciled_request_messages",
+                [],
+            )
+            if not messages:
+                return ""
+            message = messages[-1]
+            messages.clear()
+            return message
+
+    def _schedule_request_reconciliation(
+        self,
+        request_id: str,
+        method: str,
+        *,
+        success_handler: Callable[[Mapping[str, Any]], str] | None = None,
+        submitted_commands: Sequence[TaskCommand] = (),
+        request_fingerprint: str = "",
+    ) -> None:
+        """Poll a timed-out mutation by id without delaying the UI action."""
+
+        with self._metadata_guard():
+            pending = self.__dict__.setdefault("_pending_request_ids", set())
+            if bool(self.__dict__.get("_closed", False)) or request_id in pending:
+                return
+            pending.add(request_id)
+            if request_fingerprint:
+                self.__dict__.setdefault(
+                    "_pending_mutation_fingerprints",
+                    {},
+                )[request_fingerprint] = request_id
+
+        def reconcile() -> None:
+            stop_event = self.__dict__.get("_request_reconciliation_stop")
+            if stop_event is None:
+                stop_event = threading.Event()
+                self.__dict__["_request_reconciliation_stop"] = stop_event
+            try:
+                for delay in (0.25, 0.75, 1.5, 3.0, 5.0, 10.0, 15.0, 30.0, 30.0):
+                    if stop_event.wait(delay):
+                        return
+                    with self._metadata_guard():
+                        if self._closed:
+                            return
+                    try:
+                        status = self._request(
+                            "POST",
+                            "/v1/requests/status",
+                            timeout=httpx.Timeout(
+                                3.0,
+                                connect=3.0,
+                                read=3.0,
+                                write=3.0,
+                                pool=3.0,
+                            ),
+                            json={
+                                "instance_id": self.instance_id,
+                                "request_id": request_id,
+                                "method": method,
+                            },
+                        )
+                    except CoordinationConnectionError:
+                        continue
+                    state = str(status.get("state") or "NOT_FOUND")
+                    if state in {"NOT_FOUND", "PENDING", "RUNNING"}:
+                        continue
+                    if state == "SUCCEEDED":
+                        response = status.get("response")
+                        if isinstance(response, Mapping):
+                            self._advance_revision(response.get("revision"))
+                            if submitted_commands:
+                                raw_result = response.get("result")
+                                result_type = str(response.get("result_type") or "")
+                                raw_results = (
+                                    list(raw_result)
+                                    if result_type == "control_results"
+                                    and isinstance(raw_result, list)
+                                    else [raw_result]
+                                )
+                                with self._lock:
+                                    for command, encoded_result in zip(
+                                        submitted_commands,
+                                        raw_results,
+                                    ):
+                                        result = decode_control_result(encoded_result)
+                                        if (
+                                            result.accepted
+                                            and result.task_id
+                                            and self._closes_browser_after_task(command)
+                                        ):
+                                            cleanup_ids = (
+                                                self._logistics_browser_cleanup_task_ids
+                                                if (
+                                                    command.area is TaskArea.SHIPMENT
+                                                    and command.capability
+                                                    is Capability.ALIBABA_LOGISTICS
+                                                )
+                                                else self._browser_cleanup_task_ids
+                                            )
+                                            cleanup_ids.add(str(result.task_id))
+                            if success_handler is not None:
+                                try:
+                                    message = success_handler(response)
+                                except Exception as exc:
+                                    message = (
+                                        "后台已完成请求，但本机结果处理失败："
+                                        f"{type(exc).__name__}。"
+                                    )
+                                self._record_reconciled_request_message(message)
+                                return
+                            raw_result = response.get("result")
+                            result_type = str(response.get("result_type") or "")
+                            if result_type == "control_result":
+                                result = decode_control_result(raw_result)
+                                self._record_reconciled_request_message(
+                                    "后台已确认执行结果：" + result.message
+                                )
+                            elif result_type == "control_results":
+                                self._record_reconciled_request_message(
+                                    "后台已确认批量请求执行完成；任务列表将自动刷新。"
+                                )
+                            else:
+                                self._record_reconciled_request_message(
+                                    "后台已确认请求执行完成。"
+                                )
+                        return
+                    self._record_reconciled_request_message(
+                        "后台确认请求失败："
+                        + str(status.get("error") or "未返回失败原因。")
+                    )
+                    return
+                self._record_reconciled_request_message(
+                    "后台请求结果仍未确认；请在任务或状态列表核对，勿重复操作。"
+                )
+            finally:
+                with self._metadata_guard():
+                    self.__dict__.setdefault(
+                        "_pending_request_ids",
+                        set(),
+                    ).discard(request_id)
+                    fingerprints = self.__dict__.setdefault(
+                        "_pending_mutation_fingerprints",
+                        {},
+                    )
+                    if fingerprints.get(request_fingerprint) == request_id:
+                        fingerprints.pop(request_fingerprint, None)
+
+        pool = self.__dict__.get("_request_reconciliation_pool")
+        if pool is None:
+            with self._metadata_guard():
+                self.__dict__.setdefault(
+                    "_pending_request_ids",
+                    set(),
+                ).discard(request_id)
+                self.__dict__.setdefault(
+                    "_pending_mutation_fingerprints",
+                    {},
+                ).pop(request_fingerprint, None)
+            return
+        try:
+            pool.submit(reconcile)
+        except RuntimeError:
+            with self._metadata_guard():
+                self.__dict__.setdefault(
+                    "_pending_request_ids",
+                    set(),
+                ).discard(request_id)
+                self.__dict__.setdefault(
+                    "_pending_mutation_fingerprints",
+                    {},
+                ).pop(request_fingerprint, None)
 
     def _rpc(self, method: str, *args: Any, **kwargs: Any) -> Any:
         request_id = uuid4().hex
@@ -1087,7 +1304,16 @@ class RemoteBackgroundTaskController:
                 else value
             )
 
-        with self._lock:
+        request_fingerprint = (
+            self._mutation_fingerprint(method, args, kwargs)
+            if method in MUTATION_METHODS
+            else ""
+        )
+        pending_result = self._pending_mutation_result(request_fingerprint)
+        if pending_result is not None:
+            return submission_result(pending_result)
+
+        with self._rpc_guard(method, args):
             try:
                 if method in {"submit_task", "submit_tasks"} and getattr(
                     self,
@@ -1199,7 +1425,21 @@ class RemoteBackgroundTaskController:
                             and command.capability
                             is Capability.ALIBABA_ORDER_PREPARE
                         ):
-                            browser_host.open_url(ALIBABA_QUOTE_URL)
+                            if method == "submit_task":
+                                # The user has explicitly clicked prepare, so
+                                # start Chrome now but do not make the RPC wait
+                                # for a cold browser.  The automatic local
+                                # action is queued on this same single-worker
+                                # lane and will open/validate the quote page
+                                # after startup while the server reads Lingxing.
+                                self._local_action_pool.submit(
+                                    browser_host.ensure_started,
+                                    initial_url=ALIBABA_QUOTE_URL,
+                                )
+                            else:
+                                # Keep batch submission's all-or-nothing
+                                # browser readiness contract unchanged.
+                                browser_host.open_url(ALIBABA_QUOTE_URL)
                         elif (
                             command.area is TaskArea.MAINTENANCE
                             and str(command.payload.get("trigger") or "").strip()
@@ -1331,6 +1571,31 @@ class RemoteBackgroundTaskController:
                 ValueError,
             ) as exc:
                 message = str(exc)
+                cause: BaseException | None = exc
+                read_timed_out = isinstance(exc, CoordinationReadTimeout)
+                while cause is not None and not read_timed_out:
+                    read_timed_out = isinstance(cause, httpx.ReadTimeout)
+                    cause = cause.__cause__
+                if method in MUTATION_METHODS and read_timed_out:
+                    self._schedule_request_reconciliation(
+                        request_id,
+                        method,
+                        submitted_commands=submitted_commands,
+                        request_fingerprint=request_fingerprint,
+                    )
+                    return submission_result(
+                        ControlResult(
+                            False,
+                            "请求已送达共享后台，正在等待并核对最终执行结果；请勿重复操作。",
+                            details={
+                                "request_id": request_id,
+                                "request_method": method,
+                                "submission_outcome_unknown": True,
+                                "non_modal": True,
+                                "retry_suppressed": True,
+                            },
+                        )
+                    )
                 if method == "submit_tasks":
                     if isinstance(exc, CoordinationAuthenticationRequired):
                         return submission_result(self._authentication_result())
@@ -1341,26 +1606,6 @@ class RemoteBackgroundTaskController:
                                 message,
                                 details={
                                     "local_browser_unavailable": True,
-                                    "retry_suppressed": True,
-                                },
-                            )
-                        )
-                    cause: BaseException | None = exc
-                    read_timed_out = False
-                    while cause is not None:
-                        if isinstance(cause, httpx.ReadTimeout):
-                            read_timed_out = True
-                            break
-                        cause = cause.__cause__
-                    if read_timed_out:
-                        return submission_result(
-                            ControlResult(
-                                False,
-                                "批量提交请求已发送，正在等待服务器确认；"
-                                "程序会通过任务列表继续核对，请勿重复提交。",
-                                details={
-                                    "submission_outcome_unknown": True,
-                                    "non_modal": True,
                                     "retry_suppressed": True,
                                 },
                             )
@@ -1558,43 +1803,74 @@ class RemoteBackgroundTaskController:
                 False,
                 "共享客户端只允许导出设置；SQLite 业务状态统一保存在服务器。",
             )
-        with self._lock:
-            try:
-                payload = self._request(
-                    "POST",
-                    "/v1/configuration/export",
-                    json={
-                        "instance_id": self.instance_id,
-                        "request_id": uuid4().hex,
-                        "passphrase": str(passphrase or ""),
-                    },
-                )
-                result = decode_control_result(payload.get("result"))
-                if not result.accepted:
-                    return result
-                encoded = str(payload.get("package_base64") or "")
-                package = base64.b64decode(encoded, validate=True)
-                if (
-                    not package
-                    or len(package) > MAX_PORTABLE_CONFIGURATION_PACKAGE_BYTES
-                ):
-                    raise ValueError("服务器返回的加密设置包大小无效。")
-                target = Path(destination)
-                atomic_write_bytes(
-                    target,
-                    package,
-                    backup_path=backup_path_for(target),
-                )
-                self._advance_revision(payload.get("revision"))
-                return ControlResult(
-                    True,
-                    f"加密设置已导出到当前电脑：{target}",
-                    details=dict(result.details),
-                )
-            except (CoordinationConnectionError, OSError, ValueError) as exc:
-                if isinstance(exc, CoordinationAuthenticationRequired):
-                    return self._authentication_result()
-                return ControlResult(False, f"导出加密设置失败：{exc}")
+        request_id = uuid4().hex
+        target = Path(destination)
+        request_fingerprint = self._mutation_fingerprint(
+            _PORTABLE_CONFIGURATION_EXPORT_REQUEST,
+            (str(target),),
+            {},
+        )
+        pending_result = self._pending_mutation_result(request_fingerprint)
+        if pending_result is not None:
+            return pending_result
+
+        def persist_export(payload: Mapping[str, Any]) -> ControlResult:
+            result = decode_control_result(payload.get("result"))
+            if not result.accepted:
+                return result
+            encoded = str(payload.get("package_base64") or "")
+            package = base64.b64decode(encoded, validate=True)
+            if (
+                not package
+                or len(package) > MAX_PORTABLE_CONFIGURATION_PACKAGE_BYTES
+            ):
+                raise ValueError("服务器返回的加密设置包大小无效。")
+            atomic_write_bytes(
+                target,
+                package,
+                backup_path=backup_path_for(target),
+            )
+            self._advance_revision(payload.get("revision"))
+            return ControlResult(
+                True,
+                f"加密设置已导出到当前电脑：{target}",
+                details=dict(result.details),
+            )
+
+        try:
+            payload = self._request(
+                "POST",
+                "/v1/configuration/export",
+                json={
+                    "instance_id": self.instance_id,
+                    "request_id": request_id,
+                    "passphrase": str(passphrase or ""),
+                },
+            )
+            return persist_export(payload)
+        except CoordinationReadTimeout:
+            self._schedule_request_reconciliation(
+                request_id,
+                _PORTABLE_CONFIGURATION_EXPORT_REQUEST,
+                success_handler=lambda response: (
+                    "后台已确认执行结果：" + persist_export(response).message
+                ),
+                request_fingerprint=request_fingerprint,
+            )
+            return ControlResult(
+                False,
+                "设置导出请求已送达后台，正在核对结果；完成后会保存到所选位置。",
+                details={
+                    "request_id": request_id,
+                    "submission_outcome_unknown": True,
+                    "non_modal": True,
+                    "retry_suppressed": True,
+                },
+            )
+        except (CoordinationConnectionError, OSError, ValueError) as exc:
+            if isinstance(exc, CoordinationAuthenticationRequired):
+                return self._authentication_result()
+            return ControlResult(False, f"导出加密设置失败：{exc}")
 
     def import_portable_migration(
         self,
@@ -1618,31 +1894,61 @@ class RemoteBackgroundTaskController:
             or len(package) > MAX_PORTABLE_CONFIGURATION_PACKAGE_BYTES
         ):
             return ControlResult(False, "本机加密设置包大小无效。")
-        with self._lock:
-            try:
-                payload = self._request(
-                    "POST",
-                    "/v1/configuration/import",
-                    json={
-                        "instance_id": self.instance_id,
-                        "request_id": uuid4().hex,
-                        "passphrase": str(passphrase or ""),
-                        "package_base64": base64.b64encode(package).decode(
-                            "ascii"
-                        ),
-                    },
-                )
-                self._advance_revision(payload.get("revision"))
-                result = decode_control_result(payload.get("result"))
-                if result.accepted:
-                    # The imported settings must be fetched even if a caller
-                    # previously cached a snapshot at the same local object.
+        request_id = uuid4().hex
+        request_fingerprint = self._mutation_fingerprint(
+            _PORTABLE_CONFIGURATION_IMPORT_REQUEST,
+            (str(source), hashlib.sha256(package).hexdigest()),
+            {},
+        )
+        pending_result = self._pending_mutation_result(request_fingerprint)
+        if pending_result is not None:
+            return pending_result
+
+        def apply_import(payload: Mapping[str, Any]) -> ControlResult:
+            self._advance_revision(payload.get("revision"))
+            result = decode_control_result(payload.get("result"))
+            if result.accepted:
+                # The imported settings must be fetched even if a caller
+                # previously cached a snapshot at the same local object.
+                with self._lock:
                     self._snapshot_revision = None
-                return result
-            except (CoordinationConnectionError, ValueError) as exc:
-                if isinstance(exc, CoordinationAuthenticationRequired):
-                    return self._authentication_result()
-                return ControlResult(False, f"导入加密设置失败：{exc}")
+            return result
+
+        try:
+            payload = self._request(
+                "POST",
+                "/v1/configuration/import",
+                json={
+                    "instance_id": self.instance_id,
+                    "request_id": request_id,
+                    "passphrase": str(passphrase or ""),
+                    "package_base64": base64.b64encode(package).decode("ascii"),
+                },
+            )
+            return apply_import(payload)
+        except CoordinationReadTimeout:
+            self._schedule_request_reconciliation(
+                request_id,
+                _PORTABLE_CONFIGURATION_IMPORT_REQUEST,
+                success_handler=lambda response: (
+                    "后台已确认执行结果：" + apply_import(response).message
+                ),
+                request_fingerprint=request_fingerprint,
+            )
+            return ControlResult(
+                False,
+                "设置导入请求已送达后台，正在核对最终结果；请勿重复导入。",
+                details={
+                    "request_id": request_id,
+                    "submission_outcome_unknown": True,
+                    "non_modal": True,
+                    "retry_suppressed": True,
+                },
+            )
+        except (CoordinationConnectionError, ValueError) as exc:
+            if isinstance(exc, CoordinationAuthenticationRequired):
+                return self._authentication_result()
+            return ControlResult(False, f"导入加密设置失败：{exc}")
 
     def prepare_close(self) -> ControlResult:
         """Pause owned work before detaching this desktop window."""
@@ -1680,6 +1986,16 @@ class RemoteBackgroundTaskController:
         except CoordinationConnectionError:
             pass
         finally:
+            reconciliation_stop = self.__dict__.get(
+                "_request_reconciliation_stop"
+            )
+            if reconciliation_stop is not None:
+                reconciliation_stop.set()
+            reconciliation_pool = self.__dict__.get(
+                "_request_reconciliation_pool"
+            )
+            if reconciliation_pool is not None:
+                reconciliation_pool.shutdown(wait=False, cancel_futures=True)
             self._local_action_pool.shutdown(wait=False, cancel_futures=True)
             self._client.close()
             if self._browser_host is not None:

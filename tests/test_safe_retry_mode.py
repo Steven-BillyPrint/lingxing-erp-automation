@@ -188,6 +188,65 @@ def test_api_retry_does_not_launch_browser_until_contact_writeback(monkeypatch, 
     assert result["status"] == "completed"
 
 
+def test_lazy_contact_page_restores_waiting_review_tab_before_browser_write(monkeypatch):
+    events: list[object] = []
+
+    class Page:
+        url = contact_sync.ORDER_MANAGEMENT_URL
+
+        async def goto(self, *_args, **_kwargs):
+            raise AssertionError("订单管理路由已打开时不应重复导航")
+
+    page = Page()
+
+    class Context:
+        pages = [page]
+
+    class Playwright:
+        pass
+
+    async def launch_context(_args):
+        events.append("launch")
+        return Playwright(), Context()
+
+    async def get_first_page(context):
+        assert context.pages == [page]
+        events.append("get_first_page")
+        return page
+
+    async def wait_for_order_page(current_page, *_args, **_kwargs):
+        assert current_page is page
+        events.append("authenticated")
+
+    async def switch_order_tab(current_page, tab_text):
+        assert current_page is page
+        events.append(("switch_order_tab", tab_text))
+
+    monkeypatch.setattr(contact_sync, "launch_context", launch_context)
+    monkeypatch.setattr(contact_sync, "get_first_page", get_first_page)
+    monkeypatch.setattr(contact_sync, "wait_for_order_page", wait_for_order_page)
+    monkeypatch.setattr(contact_sync, "switch_order_tab", switch_order_tab)
+
+    args = SimpleNamespace(
+        no_auto_login=True,
+        login_timeout_sec=300,
+        debug_log_dir="debug/logs",
+    )
+    lazy_page = contact_sync._LazyContactOrderPage(args)
+
+    first = asyncio.run(lazy_page._ensure())
+    second = asyncio.run(lazy_page._ensure())
+
+    assert first is page
+    assert second is page
+    assert events == [
+        "launch",
+        "get_first_page",
+        "authenticated",
+        ("switch_order_tab", "待审核"),
+    ]
+
+
 def test_empty_retry_without_confirmed_order_keeps_no_candidate_result():
     outcome = contact_sync.retry_no_candidate_outcome(
         {

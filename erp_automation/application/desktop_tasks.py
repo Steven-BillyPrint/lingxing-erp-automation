@@ -35,8 +35,11 @@ from erp_automation.contracts.models import (
     LOCAL_BROWSER_ACTION_ALIBABA_ORDER_PREPARE,
     LINGXING_BROWSER_LOGIN_TRIGGER,
     NOTIFICATION_CONTACT_REFRESH_TRIGGER,
+    NOTIFICATION_PROVIDER_TEST_TRIGGER,
+    NOTIFICATION_RECEIPT_REFRESH_TRIGGER,
     NOTIFICATION_REVIEW_RESCAN_TRIGGER,
     NOTIFICATION_SYNC_INCLUDE_DEFERRED_RETRIES_KEY,
+    PARALLEL_ALIBABA_ORDER_PREPARE_PAYLOAD_KEY,
     SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER,
     SHIPMENT_NOTIFICATION_SEND_TRIGGER,
     TaskArea,
@@ -80,6 +83,8 @@ NotificationContactRefreshCallable = Callable[
     [DesktopSettings, Mapping[str, Any], str | None, tuple[int, ...]],
     Awaitable[Mapping[str, Any]],
 ]
+NotificationReceiptRefreshCallable = Callable[[], Any]
+NotificationProviderTestCallable = Callable[[str], Any]
 ErpMarkCallable = Callable[..., Awaitable[str]]
 ShipmentReMarkCallable = Callable[..., Awaitable[Mapping[str, Any]]]
 CustomOrderOperationsFactory = Callable[
@@ -143,6 +148,8 @@ class DesktopTaskRunner:
         shipment_notification_sync: NotificationSyncCallable | ScanCallable | None = None,
         shipment_notification_review_send: NotificationReviewSendCallable | None = None,
         shipment_notification_contact_refresh: NotificationContactRefreshCallable | None = None,
+        shipment_notification_receipt_refresh: NotificationReceiptRefreshCallable | None = None,
+        notification_provider_test: NotificationProviderTestCallable | None = None,
         api_test: ScanCallable | None = None,
         erp_mark_func: ErpMarkCallable | None = None,
         shipment_re_mark_func: ShipmentReMarkCallable | None = None,
@@ -166,6 +173,8 @@ class DesktopTaskRunner:
         self.shipment_notification_sync = shipment_notification_sync
         self.shipment_notification_review_send = shipment_notification_review_send
         self.shipment_notification_contact_refresh = shipment_notification_contact_refresh
+        self.shipment_notification_receipt_refresh = shipment_notification_receipt_refresh
+        self.notification_provider_test = notification_provider_test
         self.api_test = api_test
         self.erp_mark_func = erp_mark_func
         self.shipment_re_mark_func = shipment_re_mark_func
@@ -303,6 +312,53 @@ class DesktopTaskRunner:
                 )
             payload = dict(value)
             return self._result(payload, success_statuses={"completed"})
+        if (
+            command.area is TaskArea.MAINTENANCE
+            and command.capability is Capability.LIST_ORDERS
+            and str(command.payload.get("trigger") or "").strip()
+            == NOTIFICATION_RECEIPT_REFRESH_TRIGGER
+        ):
+            if self.shipment_notification_receipt_refresh is None:
+                return TaskExecutionResult(False, "发送状态后台刷新器尚未连接。")
+            self._report_progress(
+                command.execution_id or "",
+                "正在后台查询邮件和短信供应商发送状态。",
+                30,
+            )
+            value = await self._await_cancellable(
+                asyncio.to_thread(self.shipment_notification_receipt_refresh),
+                command.execution_id,
+            )
+            return TaskExecutionResult(
+                bool(getattr(value, "accepted", False)),
+                str(getattr(value, "message", "发送状态刷新完成。")),
+                dict(getattr(value, "details", {}) or {}),
+            )
+        if (
+            command.area is TaskArea.MAINTENANCE
+            and command.capability is Capability.LIST_ORDERS
+            and str(command.payload.get("trigger") or "").strip()
+            == NOTIFICATION_PROVIDER_TEST_TRIGGER
+        ):
+            provider = str(command.payload.get("provider") or "").strip().lower()
+            if provider not in {"alimail", "clicksend"}:
+                return TaskExecutionResult(False, "通知供应商类型无效。")
+            if self.notification_provider_test is None:
+                return TaskExecutionResult(False, "通知供应商连接测试器尚未连接。")
+            self._report_progress(
+                command.execution_id or "",
+                "正在后台测试通知供应商连接。",
+                30,
+            )
+            value = await self._await_cancellable(
+                asyncio.to_thread(self.notification_provider_test, provider),
+                command.execution_id,
+            )
+            return TaskExecutionResult(
+                bool(getattr(value, "accepted", False)),
+                str(getattr(value, "message", "供应商连接测试完成。")),
+                dict(getattr(value, "details", {}) or {}),
+            )
         if (
             command.area is TaskArea.MAINTENANCE
             and command.capability is Capability.LIST_ORDERS
@@ -627,6 +683,14 @@ class DesktopTaskRunner:
     ) -> TaskExecutionResult | None:
         """Fail safely before business code when the assigned CDP lane is down."""
 
+        if (
+            command.area is TaskArea.SHIPMENT
+            and command.capability is Capability.ALIBABA_ORDER_PREPARE
+        ):
+            # The submitting desktop starts Chrome asynchronously only after
+            # this explicit user action.  Read the order in parallel and let
+            # the delegated local action report an actual startup/login error.
+            return None
         guard = self.browser_endpoint_guard
         if guard is None or not task_requires_visible_browser(command):
             return None
@@ -737,13 +801,119 @@ class DesktopTaskRunner:
             )
         if self._task_cancellation_requested(task_id):
             return self._shutdown_cancelled_result()
+        prepare_started = time.monotonic()
+        order_detail_elapsed_ms = 0
+        browser_prepare_elapsed_ms: object = None
         try:
+            login_config = AlibabaLoginConfig(
+                account=settings.alibaba_account,
+                password=settings.alibaba_password,
+                auto_login=settings.alibaba_auto_login,
+            )
+            parallel_browser_prepare = bool(
+                self.delegate_browser_actions
+                and instance_id
+                and command.payload.get(
+                    PARALLEL_ALIBABA_ORDER_PREPARE_PAYLOAD_KEY
+                )
+            )
             self._report_progress(
                 command.execution_id or "",
-                "正在读取领星订单详情并识别商品 ASIN/SKU。",
+                (
+                    "正在并行读取领星订单资料并准备本机阿里查价页。"
+                    if parallel_browser_prepare
+                    else "正在读取领星订单资料并识别商品 ASIN/SKU。"
+                ),
                 20,
             )
-            resolved = await self._alibaba_order_detail(settings, system_order_no)
+
+            async def read_order_detail() -> ResolvedOrderDetail:
+                nonlocal order_detail_elapsed_ms
+                order_detail_started = time.monotonic()
+                value = await self._alibaba_order_detail(
+                    settings,
+                    system_order_no,
+                )
+                order_detail_elapsed_ms = round(
+                    (time.monotonic() - order_detail_started) * 1000
+                )
+                return value
+
+            response: DesktopInteractionResponse | None = None
+            if parallel_browser_prepare:
+                order_detail_task = asyncio.create_task(
+                    read_order_detail(),
+                    name="alibaba-prepare-order-detail",
+                )
+                local_browser_task = asyncio.create_task(
+                    self._request_interaction(
+                        task_id=task_id,
+                        stage="alibaba_order:prepare_local_browser",
+                        title="本机准备阿里查价页",
+                        message="正在提交电脑准备阿里查价页。",
+                        target_instance_id=instance_id,
+                        automatic_action=(
+                            LOCAL_BROWSER_ACTION_ALIBABA_ORDER_PREPARE
+                        ),
+                        action_payload={
+                            "browser_only": True,
+                            "login_config": {
+                                "account": login_config.account,
+                                "password": login_config.password,
+                                "auto_login": login_config.auto_login,
+                            },
+                        },
+                    ),
+                    name="alibaba-prepare-local-browser",
+                )
+                preparation_tasks = (order_detail_task, local_browser_task)
+                try:
+                    done, _pending = await asyncio.wait(
+                        preparation_tasks,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if (
+                        order_detail_task in done
+                        and local_browser_task not in done
+                    ):
+                        try:
+                            order_detail_task.result()
+                        except Exception:
+                            pass
+                        else:
+                            self._report_progress(
+                                task_id,
+                                "订单资料已读取，正在等待本机阿里查价页。",
+                                50,
+                            )
+                    elif (
+                        local_browser_task in done
+                        and order_detail_task not in done
+                    ):
+                        try:
+                            early_response = local_browser_task.result()
+                        except Exception:
+                            pass
+                        else:
+                            if early_response.accepted:
+                                self._report_progress(
+                                    task_id,
+                                    "本机阿里查价页已就绪，正在等待领星订单资料。",
+                                    50,
+                                )
+                    resolved, response = await asyncio.gather(
+                        *preparation_tasks
+                    )
+                finally:
+                    for preparation_task in preparation_tasks:
+                        if not preparation_task.done():
+                            preparation_task.cancel()
+                    await asyncio.gather(
+                        *preparation_tasks,
+                        return_exceptions=True,
+                    )
+            else:
+                resolved = await read_order_detail()
             detail = resolved.payload
             if self._task_cancellation_requested(task_id):
                 return self._shutdown_cancelled_result()
@@ -754,52 +924,61 @@ class DesktopTaskRunner:
                 "订单资料校验完成，正在并行准备地址与阿里查价页。",
                 70,
             )
-            login_config = AlibabaLoginConfig(
-                account=settings.alibaba_account,
-                password=settings.alibaba_password,
-                auto_login=settings.alibaba_auto_login,
-            )
             if self.delegate_browser_actions and instance_id:
-                response = await self._request_interaction(
-                    task_id=task_id,
-                    stage="alibaba_order:prepare_local_browser",
-                    title="本机准备阿里查价页",
-                    message="正在提交电脑读取地址并准备阿里查价页。",
-                    target_instance_id=instance_id,
-                    automatic_action=LOCAL_BROWSER_ACTION_ALIBABA_ORDER_PREPARE,
-                    action_payload={
-                        "detail": dict(detail),
-                        "system_order_no": resolved.system_order_no,
-                        "login_config": {
-                            "account": login_config.account,
-                            "password": login_config.password,
-                            "auto_login": login_config.auto_login,
+                if response is None:
+                    response = await self._request_interaction(
+                        task_id=task_id,
+                        stage="alibaba_order:prepare_local_browser",
+                        title="本机准备阿里查价页",
+                        message="正在提交电脑读取地址并准备阿里查价页。",
+                        target_instance_id=instance_id,
+                        automatic_action=(
+                            LOCAL_BROWSER_ACTION_ALIBABA_ORDER_PREPARE
+                        ),
+                        action_payload={
+                            "detail": dict(detail),
+                            "system_order_no": resolved.system_order_no,
+                            "login_config": {
+                                "account": login_config.account,
+                                "password": login_config.password,
+                                "auto_login": login_config.auto_login,
+                            },
                         },
-                    },
-                )
+                    )
                 if not response.accepted:
                     raise AlibabaOrderRuleError(
                         str(response.result_data.get("error_message") or "")
                         or "提交电脑准备阿里查价页失败。"
                     )
-                raw_address = response.result_data.get("address")
-                if not isinstance(raw_address, Mapping):
-                    raise AlibabaOrderRuleError("提交电脑返回的收货地址无效。")
-                address = ShippingAddress(
-                    **{
-                        field_name: str(raw_address.get(field_name) or "")
-                        for field_name in ShippingAddress.__dataclass_fields__
-                    }
-                )
-                address_source = str(
-                    response.result_data.get("address_source") or ""
-                )
+                if parallel_browser_prepare:
+                    address, address_source = await self._alibaba_shipping_address(
+                        detail
+                    )
+                else:
+                    raw_address = response.result_data.get("address")
+                    if not isinstance(raw_address, Mapping):
+                        raise AlibabaOrderRuleError(
+                            "提交电脑返回的收货地址无效。"
+                        )
+                    address = ShippingAddress(
+                        **{
+                            field_name: str(raw_address.get(field_name) or "")
+                            for field_name in ShippingAddress.__dataclass_fields__
+                        }
+                    )
+                    address_source = str(
+                        response.result_data.get("address_source") or ""
+                    )
                 baseline = tuple(
                     str(value)
                     for value in response.result_data.get("baseline_draft_urls") or ()
                     if str(value or "").strip()
                 )
+                browser_prepare_elapsed_ms = response.result_data.get(
+                    "browser_prepare_elapsed_ms"
+                )
             else:
+                browser_prepare_started = time.monotonic()
                 async with attached_alibaba_context(browser_endpoint) as context:
                     browser = AlibabaOrderBrowser(context)
                     baseline = await browser.draft_urls()
@@ -837,6 +1016,9 @@ class DesktopTaskRunner:
                     if self._task_cancellation_requested(task_id):
                         return self._shutdown_cancelled_result()
                     await quote_page.bring_to_front()
+                browser_prepare_elapsed_ms = round(
+                    (time.monotonic() - browser_prepare_started) * 1000
+                )
             if self._task_cancellation_requested(task_id):
                 return self._shutdown_cancelled_result()
             AlibabaOrderSessionStore(
@@ -901,6 +1083,11 @@ class DesktopTaskRunner:
                     "quote_fields_prefilled": False,
                     "address_ready": True,
                     "address_source": address_source,
+                    "order_detail_elapsed_ms": order_detail_elapsed_ms,
+                    "browser_prepare_elapsed_ms": browser_prepare_elapsed_ms,
+                    "prepare_total_elapsed_ms": round(
+                        (time.monotonic() - prepare_started) * 1000
+                    ),
                     "system_order_no": resolved.system_order_no,
                     "platform_order_no": resolved.platform_order_no,
                     "erp_write_calls": 0,

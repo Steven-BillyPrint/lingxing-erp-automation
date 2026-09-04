@@ -52,6 +52,7 @@ from erp_automation.ui.models import (
     LINGXING_BROWSER_LOGIN_TRIGGER,
     NOTIFICATION_CONTACT_REFRESH_TRIGGER,
     NOTIFICATION_REVIEW_RESCAN_TRIGGER,
+    PARALLEL_ALIBABA_ORDER_PREPARE_PAYLOAD_KEY,
     SHIPMENT_NOTIFICATION_SEND_TRIGGER,
     ShipmentRow,
     TaskArea,
@@ -926,6 +927,9 @@ def test_alibaba_order_page_uses_two_independent_stages(
             Capability.ALIBABA_ORDER_PREPARE
         )
         assert controller.submitted_commands[-1].order_no == "SYS-100"
+        assert controller.submitted_commands[-1].payload[
+            PARALLEL_ALIBABA_ORDER_PREPARE_PAYLOAD_KEY
+        ] is True
 
         page.expedited_checkbox.setChecked(True)
         assert page.signature_checkbox.isChecked() is False
@@ -957,6 +961,7 @@ def test_alibaba_order_page_uses_two_independent_stages(
 
 def test_alibaba_order_page_displays_and_copies_ephemeral_quote_details(app) -> None:
     page = AlibabaOrderPage(RecordingController(), lambda _result: None)
+    assert page.fill_button.isEnabled() is False
     page.system_order_edit.setText("SYS-QUOTE-100")
     request = DesktopInteractionRequest(
         request_id="quote-details-1",
@@ -987,6 +992,7 @@ def test_alibaba_order_page_displays_and_copies_ephemeral_quote_details(app) -> 
     assert page.quote_category_label.text() == "喷绘类"
     assert page.heavy_checkbox.isChecked() is False
     assert page.heavy_checkbox.isEnabled() is False
+    assert page.fill_button.isEnabled() is True
     assert "SYS-QUOTE-100" in page.quote_order_label.text()
     assert "113-1234567-1234567" in page.quote_order_label.text()
 
@@ -1002,6 +1008,7 @@ def test_alibaba_order_page_displays_and_copies_ephemeral_quote_details(app) -> 
     assert page.quote_postal_label.text() == "-"
     assert page.quote_category_label.text() == "-"
     assert page.heavy_checkbox.isEnabled() is True
+    assert page.fill_button.isEnabled() is False
     page.deleteLater()
 
 
@@ -7461,7 +7468,7 @@ def test_alibaba_order_page_ignores_tasks_owned_by_another_instance(app):
         assert page._active_task_ids == ()
         assert page.status_label.text() == "尚未开始"
         assert page.prepare_button.isEnabled() is True
-        assert page.fill_button.isEnabled() is True
+        assert page.fill_button.isEnabled() is False
 
         local = TaskRecord(
             "local-alibaba-draft",

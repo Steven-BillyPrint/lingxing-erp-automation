@@ -28,6 +28,7 @@ from .notification_store import ShipmentNotificationStore
 
 DELIVERY_POLL_TIMEOUT_SECONDS = 60.0
 DELIVERY_POLL_INTERVAL_SECONDS = 5.0
+RECEIPT_REFRESH_MAX_CONCURRENCY = 5
 _STATUS_CHECK_FAILURE_PREFIXES = ("状态核验超时：", "状态查询失败：")
 
 
@@ -396,36 +397,51 @@ class ShipmentNotificationService:
         }
         error_reasons: Counter[str] = Counter()
         owner = f"manual-receipt-refresh:{id(self)}"
-        for notification in notifications:
+
+        semaphore = asyncio.Semaphore(RECEIPT_REFRESH_MAX_CONCURRENCY)
+
+        async def refresh_one(
+            notification: dict[str, Any],
+        ) -> tuple[str, str] | None:
             notification_id = int(notification["id"])
-            if not self.store.claim_receipt_check(notification_id, owner=owner):
-                continue
-            query_succeeded = False
-            try:
-                refreshed = await self.refresh_delivery_receipt(notification_id)
-                query_succeeded = True
-            except (NotificationProviderError, ValueError) as exc:
-                result["errors"] += 1
-                error_reasons[_receipt_query_error_reason(exc)] += 1
-                self.store.finish_receipt_check(
+            async with semaphore:
+                if not self.store.claim_receipt_check(notification_id, owner=owner):
+                    return None
+                try:
+                    refreshed = await self.refresh_delivery_receipt(notification_id)
+                except Exception as exc:
+                    self.store.finish_receipt_check(
+                        notification_id,
+                        owner=owner,
+                        query_succeeded=False,
+                    )
+                    return "error", _receipt_query_error_reason(exc)
+                refreshed = self.store.finish_receipt_check(
                     notification_id,
                     owner=owner,
-                    query_succeeded=False,
-                )
+                    query_succeeded=True,
+                ) or refreshed
+                return str(refreshed["state"]), ""
+
+        outcomes = await asyncio.gather(
+            *(refresh_one(notification) for notification in notifications)
+        )
+        for outcome in outcomes:
+            if outcome is None:
                 continue
-            refreshed = self.store.finish_receipt_check(
-                notification_id,
-                owner=owner,
-                query_succeeded=query_succeeded,
-            ) or refreshed
+            state, error = outcome
+            if state == "error":
+                result["errors"] += 1
+                error_reasons[error] += 1
+                continue
             result["checked"] += 1
-            if refreshed["state"] == NOTIFICATION_DELIVERED:
+            if state == NOTIFICATION_DELIVERED:
                 result["completed"] += 1
-            elif refreshed["state"] == "RETRYABLE":
+            elif state == NOTIFICATION_RETRYABLE:
                 result["retryable"] += 1
-            elif refreshed["state"] == NOTIFICATION_FAILED:
+            elif state == NOTIFICATION_FAILED:
                 result["status_check_failed"] += 1
-            elif refreshed["state"] == NOTIFICATION_DELIVERY_UNCONFIRMED:
+            elif state == NOTIFICATION_DELIVERY_UNCONFIRMED:
                 result["unconfirmed"] += 1
         result["error_reasons"] = _receipt_error_reasons(error_reasons)
         return result
@@ -444,30 +460,41 @@ class ShipmentNotificationService:
         )
         result = {"checked": 0, "completed": 0, "unconfirmed": 0, "errors": 0}
         error_reasons: Counter[str] = Counter()
-        for notification in notifications:
+        semaphore = asyncio.Semaphore(RECEIPT_REFRESH_MAX_CONCURRENCY)
+
+        async def refresh_one(
+            notification: dict[str, Any],
+        ) -> tuple[str, str]:
             notification_id = int(notification["id"])
-            query_succeeded = False
-            try:
-                refreshed = await self.refresh_delivery_receipt(notification_id)
-                query_succeeded = True
-            except (NotificationProviderError, ValueError) as exc:
-                result["errors"] += 1
-                error_reasons[_receipt_query_error_reason(exc)] += 1
-                self.store.finish_receipt_check(
+            async with semaphore:
+                try:
+                    refreshed = await self.refresh_delivery_receipt(notification_id)
+                except Exception as exc:
+                    self.store.finish_receipt_check(
+                        notification_id,
+                        owner=owner,
+                        query_succeeded=False,
+                    )
+                    return "error", _receipt_query_error_reason(exc)
+                refreshed = self.store.finish_receipt_check(
                     notification_id,
                     owner=owner,
-                    query_succeeded=False,
-                )
+                    query_succeeded=True,
+                ) or refreshed
+                return str(refreshed["state"]), ""
+
+        outcomes = await asyncio.gather(
+            *(refresh_one(notification) for notification in notifications)
+        )
+        for state, error in outcomes:
+            if state == "error":
+                result["errors"] += 1
+                error_reasons[error] += 1
                 continue
-            refreshed = self.store.finish_receipt_check(
-                notification_id,
-                owner=owner,
-                query_succeeded=query_succeeded,
-            ) or refreshed
             result["checked"] += 1
-            if refreshed["state"] == NOTIFICATION_DELIVERED:
+            if state == NOTIFICATION_DELIVERED:
                 result["completed"] += 1
-            elif refreshed["state"] == NOTIFICATION_DELIVERY_UNCONFIRMED:
+            elif state == NOTIFICATION_DELIVERY_UNCONFIRMED:
                 result["unconfirmed"] += 1
         result["error_reasons"] = _receipt_error_reasons(error_reasons)
         return result
@@ -482,5 +509,6 @@ class ShipmentNotificationService:
 __all__ = [
     "DELIVERY_POLL_INTERVAL_SECONDS",
     "DELIVERY_POLL_TIMEOUT_SECONDS",
+    "RECEIPT_REFRESH_MAX_CONCURRENCY",
     "ShipmentNotificationService",
 ]

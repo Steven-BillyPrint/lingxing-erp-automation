@@ -37,8 +37,11 @@ from erp_automation.ui.models import (
     DesktopWriteConfirmation,
     LINGXING_BROWSER_LOGIN_TRIGGER,
     NOTIFICATION_CONTACT_REFRESH_TRIGGER,
+    NOTIFICATION_PROVIDER_TEST_TRIGGER,
+    NOTIFICATION_RECEIPT_REFRESH_TRIGGER,
     NOTIFICATION_REVIEW_RESCAN_TRIGGER,
     NOTIFICATION_SYNC_INCLUDE_DEFERRED_RETRIES_KEY,
+    PARALLEL_ALIBABA_ORDER_PREPARE_PAYLOAD_KEY,
     SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER,
     SHIPMENT_NOTIFICATION_SEND_TRIGGER,
     TaskArea,
@@ -342,8 +345,12 @@ def test_prepare_alibaba_order_uses_public_order_list_address(
 
 def test_shared_prepare_delegates_browser_work_to_submitting_desktop(tmp_path) -> None:
     observed: dict[str, Any] = {}
+    order_lookup_started = asyncio.Event()
+    browser_prepare_started = asyncio.Event()
 
     async def lookup(_settings, order_identifier):
+        order_lookup_started.set()
+        await asyncio.wait_for(browser_prepare_started.wait(), timeout=1)
         return ResolvedOrderDetail(
             requested_order_no=order_identifier,
             system_order_no=SYSTEM_ORDER_NO,
@@ -354,28 +361,16 @@ def test_shared_prepare_delegates_browser_work_to_submitting_desktop(tmp_path) -
     async def interaction_handler(**kwargs):
         action = str(kwargs.get("automatic_action") or "")
         if action:
+            browser_prepare_started.set()
+            await asyncio.wait_for(order_lookup_started.wait(), timeout=1)
             observed["action"] = action
             observed["action_payload"] = kwargs["action_payload"]
             return DesktopInteractionResponse(
                 "prepare-local",
                 True,
                 result_data={
-                    "address": {
-                        "company": "Jane Smith",
-                        "recipient": "Jane Smith",
-                        "country_code": "US",
-                        "country_name": "United States",
-                        "province": "CA",
-                        "city": "Los Angeles",
-                        "address1": "123 Main Street",
-                        "address2": "",
-                        "postal_code": "90012",
-                        "dial_code": "1",
-                        "phone": "2135550188",
-                        "email": "jane@example.com",
-                    },
-                    "address_source": "lingxing_openapi",
                     "baseline_draft_urls": ["https://example.invalid/old-draft"],
+                    "browser_prepare_elapsed_ms": 25,
                 },
             )
         observed["quote_details"] = dict(kwargs.get("display_data") or {})
@@ -401,16 +396,22 @@ def test_shared_prepare_delegates_browser_work_to_submitting_desktop(tmp_path) -
             TaskArea.SHIPMENT,
             Capability.ALIBABA_ORDER_PREPARE,
             order_no=PLATFORM_ORDER_NO,
-            payload={"_desktop_instance_id": "desktop-a"},
+            payload={
+                "_desktop_instance_id": "desktop-a",
+                PARALLEL_ALIBABA_ORDER_PREPARE_PAYLOAD_KEY: True,
+            },
         )
     )
 
     assert result.succeeded is True
     assert observed["action"] == "alibaba_order_prepare"
+    assert observed["action_payload"]["browser_only"] is True
+    assert "detail" not in observed["action_payload"]
     assert observed["action_payload"]["login_config"]["password"] == (
         "configured-password"
     )
     assert observed["quote_details"]["destination_postal_code"] == "90012"
+    assert result.payload["browser_prepare_elapsed_ms"] == 25
     assert AlibabaOrderSessionStore(
         tmp_path / "data" / "alibaba_ordering.sqlite3"
     ).get(SYSTEM_ORDER_NO, instance_id="desktop-a") is not None
@@ -1186,6 +1187,69 @@ def test_notification_contact_refresh_is_a_read_only_background_task(tmp_path) -
     assert result.payload["erp_write_calls"] == 0
     assert result.payload["external_provider_calls"] == 0
     assert result.payload["notification_contact_refresh_duration_ms"] >= 0
+
+
+def test_notification_receipt_refresh_runs_inside_background_task(tmp_path) -> None:
+    calls: list[str] = []
+
+    def refresh() -> ControlResult:
+        calls.append(threading.current_thread().name)
+        return ControlResult(
+            True,
+            "发送状态刷新完成。",
+            details={"checked": 3, "completed": 2},
+        )
+
+    runner = DesktopTaskRunner(
+        tmp_path,
+        settings_provider=lambda: _settings(tmp_path),
+        configuration_provider=lambda: {},
+        shipment_notification_receipt_refresh=refresh,
+    )
+
+    result = runner(
+        TaskCommand(
+            "刷新客户通知发送状态",
+            TaskArea.MAINTENANCE,
+            Capability.LIST_ORDERS,
+            execution_id="receipt-refresh-task",
+            payload={"trigger": NOTIFICATION_RECEIPT_REFRESH_TRIGGER},
+        )
+    )
+
+    assert result.succeeded is True
+    assert result.payload == {"checked": 3, "completed": 2}
+    assert calls and calls[0] != threading.current_thread().name
+
+
+def test_notification_provider_test_runs_inside_background_task(tmp_path) -> None:
+    providers: list[str] = []
+
+    def test_provider(provider: str) -> ControlResult:
+        providers.append(provider)
+        return ControlResult(True, "供应商连接测试成功。")
+
+    runner = DesktopTaskRunner(
+        tmp_path,
+        settings_provider=lambda: _settings(tmp_path),
+        configuration_provider=lambda: {},
+        notification_provider_test=test_provider,
+    )
+
+    result = runner(
+        TaskCommand(
+            "测试阿里邮箱连接",
+            TaskArea.MAINTENANCE,
+            Capability.LIST_ORDERS,
+            payload={
+                "trigger": NOTIFICATION_PROVIDER_TEST_TRIGGER,
+                "provider": "alimail",
+            },
+        )
+    )
+
+    assert result.succeeded is True
+    assert providers == ["alimail"]
 
 
 def test_notification_review_rescan_uses_dedicated_sync_without_shipment_scan(
