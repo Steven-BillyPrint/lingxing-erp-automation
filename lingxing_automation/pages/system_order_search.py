@@ -156,6 +156,26 @@ async def exact_system_order_cell_text(
     return " ".join((await cells[0].inner_text()).split()).strip()
 
 
+async def _order_checkbox_is_checked(target: Any) -> bool:
+    """Read the rendered checkbox state instead of counting VXE icon nodes.
+
+    VXE always keeps checked, unchecked, and indeterminate icons in the DOM and
+    switches their CSS visibility.  Counting ``.vxe-checkbox--checked-icon``
+    therefore reports an unchecked row as checked and skips the required click.
+    """
+
+    if str(await target.get_attribute("aria-checked") or "").casefold() == "true":
+        return True
+    if await _visible(target.locator(".vxe-checkbox--checked-icon")):
+        return True
+    if str(await target.get_attribute("type") or "").casefold() == "checkbox":
+        try:
+            return bool(await target.is_checked())
+        except Exception:
+            return False
+    return False
+
+
 async def select_exact_system_order(page: Any, system_order_no: str) -> None:
     fragments = await exact_system_order_fragments(page, system_order_no)
     checkbox_targets: list[Any] = []
@@ -172,16 +192,10 @@ async def select_exact_system_order(page: Any, system_order_no: str) -> None:
             f"系统单号 {system_order_no} 的勾选节点不唯一，实际 {len(checkbox_targets)} 个。"
         )
     target = checkbox_targets[0]
-    checked = str(await target.get_attribute("aria-checked") or "").casefold() == "true"
-    if not checked:
-        checked = bool(await target.locator(".vxe-checkbox--checked-icon").count())
-    if not checked:
+    if not await _order_checkbox_is_checked(target):
         await target.click()
     await page.wait_for_timeout(150)
-    checked = str(await target.get_attribute("aria-checked") or "").casefold() == "true"
-    if not checked:
-        checked = bool(await target.locator(".vxe-checkbox--checked-icon").count())
-    if not checked:
+    if not await _order_checkbox_is_checked(target):
         raise RuntimeError(f"系统单号 {system_order_no} 勾选后未读到已选状态。")
 
 

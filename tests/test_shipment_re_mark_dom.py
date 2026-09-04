@@ -14,6 +14,7 @@ from lingxing_automation.pages.marked_shipment_update import (
 from lingxing_automation.pages.system_order_search import (
     exact_system_order_cell_text,
     exact_system_order_text,
+    select_exact_system_order,
 )
 
 
@@ -98,6 +99,66 @@ def test_exact_system_order_text_reads_fragments_without_async_generator() -> No
     assert asyncio.run(run()) == (
         f"{SYSTEM_ORDER_NO} 手动-OnTrac {NEW_WAYBILL_NO}"
     )
+
+
+def test_select_exact_system_order_clicks_rendered_unchecked_vxe_checkbox_once() -> None:
+    html = f"""
+    <style>
+      .vxe-cell--checkbox {{ display: inline-block; width: 14px; height: 14px; }}
+      .vxe-checkbox--icon {{ width: 14px; height: 14px; }}
+      .vxe-checkbox--checked-icon {{ display: none; }}
+      .vxe-checkbox--unchecked-icon {{ display: block; }}
+      tr.row--checked .vxe-checkbox--checked-icon {{ display: block; }}
+      tr.row--checked .vxe-checkbox--unchecked-icon {{ display: none; }}
+    </style>
+    <table>
+      <thead><tr><th colid="col_8">系统单号</th></tr></thead>
+      <tbody>
+        <tr rowid="{SYSTEM_ORDER_NO}" class="vxe-body--row">
+          <td class="col--checkbox">
+            <span class="vxe-cell--checkbox">
+              <span class="vxe-checkbox--icon vxe-checkbox--checked-icon"></span>
+              <span class="vxe-checkbox--icon vxe-checkbox--unchecked-icon"></span>
+              <span class="vxe-checkbox--icon vxe-checkbox--indeterminate-icon"></span>
+            </span>
+          </td>
+          <td colid="col_8">{SYSTEM_ORDER_NO}</td>
+        </tr>
+      </tbody>
+    </table>
+    <script>
+      window.checkboxClicks = 0;
+      document.querySelector('.vxe-cell--checkbox').addEventListener('click', () => {{
+        window.checkboxClicks += 1;
+        document.querySelector('tr[rowid]').classList.add('row--checked');
+      }});
+    </script>
+    """
+
+    async def run() -> tuple[str, int]:
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.set_content(html)
+                await select_exact_system_order(page, SYSTEM_ORDER_NO)
+                # A retry must observe the rendered checked icon and remain
+                # idempotent instead of toggling the row back off.
+                await select_exact_system_order(page, SYSTEM_ORDER_NO)
+                row_class = await page.locator(
+                    f'tr[rowid="{SYSTEM_ORDER_NO}"]'
+                ).get_attribute("class")
+                click_count = await page.evaluate("window.checkboxClicks")
+                return str(row_class or ""), int(click_count)
+            finally:
+                await browser.close()
+
+    row_class, click_count = asyncio.run(run())
+
+    assert "row--checked" in row_class
+    assert click_count == 1
 
 
 def test_withdraw_reuses_authenticated_order_management_page(
