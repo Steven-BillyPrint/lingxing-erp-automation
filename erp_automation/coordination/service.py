@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
 import math
 import re
 import socket
@@ -28,6 +29,8 @@ from erp_automation.contracts.models import (
     ShipmentPage,
     LogPage,
     NOTIFICATION_CONTACT_REFRESH_TRIGGER,
+    NOTIFICATION_PROVIDER_TEST_TRIGGER,
+    NOTIFICATION_RECEIPT_REFRESH_TRIGGER,
     NOTIFICATION_REVIEW_RESCAN_TRIGGER,
     SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER,
     SHIPMENT_NOTIFICATION_SEND_TRIGGER,
@@ -51,6 +54,9 @@ from .codec import (
 from .store import CoordinationStore
 
 
+LOGGER = logging.getLogger(__name__)
+
+
 MAX_PORTABLE_CONFIGURATION_PACKAGE_BYTES = 4 * 1024 * 1024
 
 SCHEDULED_SCAN_INTERVALS = {
@@ -61,6 +67,8 @@ SCHEDULED_SCAN_INTERVALS = {
 _LOCAL_LOGISTICS_FOLLOWUP_PAYLOAD_KEY = "local_visible_logistics_followup"
 _NOTIFICATION_COMPENSATION_FOLLOWUP_KIND = "notification_compensation"
 _SERVER_FOLLOWUP_INSTANCE_ID = "server-persistent-followups"
+_PORTABLE_CONFIGURATION_EXPORT_REQUEST = "export_portable_configuration"
+_PORTABLE_CONFIGURATION_IMPORT_REQUEST = "import_portable_configuration"
 
 
 def _with_configuration_identity(
@@ -263,6 +271,11 @@ def _resource_keys(method: str, args: list[Any], kwargs: dict[str, Any]) -> tupl
                     f"notification:{notification_id}"
                     for notification_id in notification_ids
                 )
+        if trigger == NOTIFICATION_RECEIPT_REFRESH_TRIGGER:
+            return ("notifications:receipts",)
+        if trigger == NOTIFICATION_PROVIDER_TEST_TRIGGER:
+            provider = _text(command.payload.get("provider")) or "unknown"
+            return (f"notification-provider:{provider}",)
         order = _text(command.order_no)
         if order:
             return (f"order:{order}",)
@@ -1317,10 +1330,11 @@ class CoordinatedControllerService:
     ) -> ControlResult:
         """Lift the global stop after inspecting every loaded controller.
 
-        The caller holds ``_call_lock``, which is also used by ordinary task
-        admission. No new client mutation can race between the read-only
-        preflight and the commit. Controllers already released require no
-        transition, so their active work cannot reject an idempotent repair.
+        The caller holds the narrow global-policy ``_call_lock``. Ordinary
+        resource-scoped mutations do not use this lock; controllers still
+        enforce the emergency-stop write gate at task admission/execution.
+        Controllers already released require no transition, so their active
+        work cannot reject an idempotent repair.
         """
 
         original_global_state = bool(self._global_emergency_stop)
@@ -2126,33 +2140,63 @@ class CoordinatedControllerService:
         """Create a configuration-only package and return encrypted bytes."""
 
         self.heartbeat(instance_id, identity=identity)
-        with TemporaryDirectory(prefix="erp-config-export-") as directory:
-            destination = Path(directory) / "settings.erp-migrate"
-            response = self.invoke(
-                instance_id=instance_id,
+        cached = self.store.cached_response(
+            request_id,
+            instance_id=instance_id,
+            method=_PORTABLE_CONFIGURATION_EXPORT_REQUEST,
+        )
+        if cached is not None:
+            return _with_configuration_identity(cached, identity)
+        admission = self.store.begin_request(
+            request_id=request_id,
+            instance_id=instance_id,
+            method=_PORTABLE_CONFIGURATION_EXPORT_REQUEST,
+        )
+        if not bool(admission.get("created")):
+            raise RuntimeError("Configuration export is already running or failed.")
+        try:
+            with TemporaryDirectory(prefix="erp-config-export-") as directory:
+                destination = Path(directory) / "settings.erp-migrate"
+                response = self.invoke(
+                    instance_id=instance_id,
+                    request_id=f"{request_id}:export",
+                    method="export_portable_migration",
+                    raw_args=[str(destination), str(passphrase or "")],
+                    raw_kwargs={"include_state": False},
+                    identity=identity,
+                )
+                result = response.get("result")
+                accepted = isinstance(result, Mapping) and bool(
+                    result.get("accepted")
+                )
+                if not accepted:
+                    completed = {**response, "package_base64": ""}
+                else:
+                    package = destination.read_bytes()
+                    if (
+                        not package
+                        or len(package) > MAX_PORTABLE_CONFIGURATION_PACKAGE_BYTES
+                    ):
+                        raise ValueError("Portable configuration package size is invalid.")
+                    completed = {
+                        **response,
+                        "package_base64": base64.b64encode(package).decode("ascii"),
+                    }
+            self.store.save_response(
                 request_id=request_id,
-                method="export_portable_migration",
-                raw_args=[str(destination), str(passphrase or "")],
-                raw_kwargs={"include_state": False},
-                identity=identity,
+                instance_id=instance_id,
+                method=_PORTABLE_CONFIGURATION_EXPORT_REQUEST,
+                response=completed,
             )
-            response = _with_configuration_identity(response, identity)
-            result = response.get("result")
-            accepted = isinstance(result, Mapping) and bool(
-                result.get("accepted")
+            return _with_configuration_identity(completed, identity)
+        except Exception as exc:
+            self.store.fail_request(
+                request_id=request_id,
+                instance_id=instance_id,
+                method=_PORTABLE_CONFIGURATION_EXPORT_REQUEST,
+                error=f"{type(exc).__name__}: 配置导出失败。",
             )
-            if not accepted:
-                return {**response, "package_base64": ""}
-            package = destination.read_bytes()
-            if (
-                not package
-                or len(package) > MAX_PORTABLE_CONFIGURATION_PACKAGE_BYTES
-            ):
-                raise ValueError("Portable configuration package size is invalid.")
-            return {
-                **response,
-                "package_base64": base64.b64encode(package).decode("ascii"),
-            }
+            raise
 
     def import_portable_configuration(
         self,
@@ -2175,21 +2219,50 @@ class CoordinatedControllerService:
             raise ValueError("Portable configuration package is invalid.") from exc
         if not package or len(package) > MAX_PORTABLE_CONFIGURATION_PACKAGE_BYTES:
             raise ValueError("Portable configuration package size is invalid.")
-        with TemporaryDirectory(prefix="erp-config-import-") as directory:
-            source = Path(directory) / "settings.erp-migrate"
-            source.write_bytes(package)
-            response = self.invoke(
-                instance_id=instance_id,
+        cached = self.store.cached_response(
+            request_id,
+            instance_id=instance_id,
+            method=_PORTABLE_CONFIGURATION_IMPORT_REQUEST,
+        )
+        if cached is not None:
+            return _with_configuration_identity(cached, identity)
+        admission = self.store.begin_request(
+            request_id=request_id,
+            instance_id=instance_id,
+            method=_PORTABLE_CONFIGURATION_IMPORT_REQUEST,
+        )
+        if not bool(admission.get("created")):
+            raise RuntimeError("Configuration import is already running or failed.")
+        try:
+            with TemporaryDirectory(prefix="erp-config-import-") as directory:
+                source = Path(directory) / "settings.erp-migrate"
+                source.write_bytes(package)
+                response = self.invoke(
+                    instance_id=instance_id,
+                    request_id=f"{request_id}:import",
+                    method="import_portable_migration",
+                    raw_args=[str(source), str(passphrase or "")],
+                    raw_kwargs={
+                        "overwrite": True,
+                        "configuration_only": True,
+                    },
+                    identity=identity,
+                )
+            self.store.save_response(
                 request_id=request_id,
-                method="import_portable_migration",
-                raw_args=[str(source), str(passphrase or "")],
-                raw_kwargs={
-                    "overwrite": True,
-                    "configuration_only": True,
-                },
-                identity=identity,
+                instance_id=instance_id,
+                method=_PORTABLE_CONFIGURATION_IMPORT_REQUEST,
+                response=response,
             )
             return _with_configuration_identity(response, identity)
+        except Exception as exc:
+            self.store.fail_request(
+                request_id=request_id,
+                instance_id=instance_id,
+                method=_PORTABLE_CONFIGURATION_IMPORT_REQUEST,
+                error=f"{type(exc).__name__}: 配置导入失败。",
+            )
+            raise
 
     def snapshot_payload(
         self,
@@ -2297,6 +2370,51 @@ class CoordinatedControllerService:
             response["shipment_page"] = to_jsonable(shipment_page)
         return response
 
+    def request_status_payload(
+        self,
+        *,
+        instance_id: str,
+        request_id: str,
+        method: str,
+        identity: OperatorIdentity | None = None,
+    ) -> dict[str, Any]:
+        """Return the durable outcome of one mutation without re-executing it."""
+
+        self.heartbeat(instance_id, identity=identity)
+        status = self.store.request_status(
+            request_id,
+            instance_id=instance_id,
+            method=method,
+        )
+        if status is None:
+            return {
+                "request_id": request_id,
+                "method": method,
+                "state": "NOT_FOUND",
+                "response": None,
+                "error": "服务器尚未记录该请求。",
+            }
+        return status
+
+    def fail_request(
+        self,
+        *,
+        instance_id: str,
+        request_id: str,
+        method: str,
+        error: str,
+    ) -> None:
+        """Persist a terminal RPC failure for timeout reconciliation."""
+
+        if method not in MUTATION_METHODS or not request_id:
+            return
+        self.store.fail_request(
+            request_id=request_id,
+            instance_id=instance_id,
+            method=method,
+            error=error,
+        )
+
     def invoke(
         self,
         *,
@@ -2323,6 +2441,40 @@ class CoordinatedControllerService:
         if cached is not None:
             return cached
         args, kwargs = _decode_call(method, raw_args, raw_kwargs)
+        if method in MUTATION_METHODS:
+            admission = self.store.begin_request(
+                request_id=request_id,
+                instance_id=instance_id,
+                method=method,
+            )
+            if not bool(admission.get("created")):
+                state = str(admission.get("state") or "RUNNING")
+                encoded = str(admission.get("response_json") or "")
+                if state == "SUCCEEDED" and encoded:
+                    decoded = json.loads(encoded)
+                    if isinstance(decoded, dict):
+                        return decoded
+                message = (
+                    str(admission.get("error") or "").strip()
+                    if state == "FAILED"
+                    else "请求正在服务器执行；请通过请求状态继续核对，勿重复操作。"
+                )
+                result = ControlResult(
+                    False,
+                    message or "请求结果尚未确认。",
+                    details={
+                        "request_id": request_id,
+                        "request_state": state,
+                        "submission_outcome_unknown": state != "FAILED",
+                        "non_modal": True,
+                        "retry_suppressed": True,
+                    },
+                )
+                return {
+                    "result_type": "control_result",
+                    "result": to_jsonable(result),
+                    "revision": self.store.current_revision(),
+                }
         if method == "submit_tasks":
             # Keep every existing per-task safety gate, coordination lease,
             # idempotency record and audit event. Only the desktop/server
@@ -2890,14 +3042,14 @@ class CoordinatedControllerService:
             elif emergency_stop_activation:
                 value = self._activate_global_emergency_stop(controller)
             else:
-                with self._call_lock:
+                def invoke_controller() -> Any:
                     raced_pause = self.store.instance_execution_pause(instance_id)
                     if (
                         bool(raced_pause.get("execution_paused"))
                         and method in MUTATION_METHODS
                         and not instance_pause_override_allowed
                     ):
-                        value = ControlResult(
+                        return ControlResult(
                             False,
                             "本机暂停门禁已生效；当前操作被直接拒绝，未创建任务或加入队列。",
                             details={
@@ -2909,21 +3061,45 @@ class CoordinatedControllerService:
                                 "reason": "instance_execution_paused",
                             },
                         )
-                    else:
-                        value = (
-                            self._invoke_global_policy(
-                                controller,
-                                method,
-                                args,
-                                kwargs,
-                            )
-                            if method
-                            in {
-                                "update_capability_mode",
-                                "set_emergency_stop_writes",
-                            }
-                            else getattr(controller, method)(*args, **kwargs)
+                    return (
+                        self._invoke_global_policy(
+                            controller,
+                            method,
+                            args,
+                            kwargs,
                         )
+                        if method
+                        in {
+                            "update_capability_mode",
+                            "set_emergency_stop_writes",
+                        }
+                        else getattr(controller, method)(*args, **kwargs)
+                    )
+
+                # Ordinary operations are protected by durable per-resource
+                # leases and each controller's own state lock.  The service-wide
+                # lock is reserved for the two truly global policy transitions;
+                # no provider, file, crypto or bulk database I/O may hold it.
+                if method in {
+                    "update_capability_mode",
+                    "set_emergency_stop_writes",
+                }:
+                    lock_wait_started = time.monotonic()
+                    with self._call_lock:
+                        lock_wait_ms = round(
+                            (time.monotonic() - lock_wait_started) * 1000
+                        )
+                        value = invoke_controller()
+                    if lock_wait_ms >= 100:
+                        LOGGER.warning(
+                            "coordination_rpc_lock_wait method=%s request_id=%s "
+                            "lock_wait_ms=%s",
+                            method,
+                            request_id,
+                            lock_wait_ms,
+                        )
+                else:
+                    value = invoke_controller()
             if batch_owner_conflicts and isinstance(value, ControlResult):
                 skipped = len(batch_owner_conflicts)
                 value = ControlResult(
@@ -3042,6 +3218,12 @@ class CoordinatedControllerService:
                     "源扫描提交发生异常：" f"{type(exc).__name__}。",
                     outcome="SOURCE_SUBMIT_FAILED",
                 )
+            self.store.fail_request(
+                request_id=request_id,
+                instance_id=instance_id,
+                method=method,
+                error=f"{type(exc).__name__}: 请求执行失败。",
+            )
             raise
         finally:
             if not keep_task_lease:
@@ -3220,8 +3402,7 @@ class CoordinatedControllerService:
                 continue
 
             try:
-                with self._call_lock:
-                    result = controller.submit_task(command)
+                result = controller.submit_task(command)
                 if result.accepted and result.task_id:
                     self.store.mark_task_followup_submitted(
                         followup_id,

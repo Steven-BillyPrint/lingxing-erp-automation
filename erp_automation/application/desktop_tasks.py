@@ -35,6 +35,8 @@ from erp_automation.contracts.models import (
     LOCAL_BROWSER_ACTION_ALIBABA_ORDER_PREPARE,
     LINGXING_BROWSER_LOGIN_TRIGGER,
     NOTIFICATION_CONTACT_REFRESH_TRIGGER,
+    NOTIFICATION_PROVIDER_TEST_TRIGGER,
+    NOTIFICATION_RECEIPT_REFRESH_TRIGGER,
     NOTIFICATION_REVIEW_RESCAN_TRIGGER,
     NOTIFICATION_SYNC_INCLUDE_DEFERRED_RETRIES_KEY,
     SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER,
@@ -80,6 +82,8 @@ NotificationContactRefreshCallable = Callable[
     [DesktopSettings, Mapping[str, Any], str | None, tuple[int, ...]],
     Awaitable[Mapping[str, Any]],
 ]
+NotificationReceiptRefreshCallable = Callable[[], Any]
+NotificationProviderTestCallable = Callable[[str], Any]
 ErpMarkCallable = Callable[..., Awaitable[str]]
 ShipmentReMarkCallable = Callable[..., Awaitable[Mapping[str, Any]]]
 CustomOrderOperationsFactory = Callable[
@@ -143,6 +147,8 @@ class DesktopTaskRunner:
         shipment_notification_sync: NotificationSyncCallable | ScanCallable | None = None,
         shipment_notification_review_send: NotificationReviewSendCallable | None = None,
         shipment_notification_contact_refresh: NotificationContactRefreshCallable | None = None,
+        shipment_notification_receipt_refresh: NotificationReceiptRefreshCallable | None = None,
+        notification_provider_test: NotificationProviderTestCallable | None = None,
         api_test: ScanCallable | None = None,
         erp_mark_func: ErpMarkCallable | None = None,
         shipment_re_mark_func: ShipmentReMarkCallable | None = None,
@@ -166,6 +172,8 @@ class DesktopTaskRunner:
         self.shipment_notification_sync = shipment_notification_sync
         self.shipment_notification_review_send = shipment_notification_review_send
         self.shipment_notification_contact_refresh = shipment_notification_contact_refresh
+        self.shipment_notification_receipt_refresh = shipment_notification_receipt_refresh
+        self.notification_provider_test = notification_provider_test
         self.api_test = api_test
         self.erp_mark_func = erp_mark_func
         self.shipment_re_mark_func = shipment_re_mark_func
@@ -303,6 +311,53 @@ class DesktopTaskRunner:
                 )
             payload = dict(value)
             return self._result(payload, success_statuses={"completed"})
+        if (
+            command.area is TaskArea.MAINTENANCE
+            and command.capability is Capability.LIST_ORDERS
+            and str(command.payload.get("trigger") or "").strip()
+            == NOTIFICATION_RECEIPT_REFRESH_TRIGGER
+        ):
+            if self.shipment_notification_receipt_refresh is None:
+                return TaskExecutionResult(False, "发送状态后台刷新器尚未连接。")
+            self._report_progress(
+                command.execution_id or "",
+                "正在后台查询邮件和短信供应商发送状态。",
+                30,
+            )
+            value = await self._await_cancellable(
+                asyncio.to_thread(self.shipment_notification_receipt_refresh),
+                command.execution_id,
+            )
+            return TaskExecutionResult(
+                bool(getattr(value, "accepted", False)),
+                str(getattr(value, "message", "发送状态刷新完成。")),
+                dict(getattr(value, "details", {}) or {}),
+            )
+        if (
+            command.area is TaskArea.MAINTENANCE
+            and command.capability is Capability.LIST_ORDERS
+            and str(command.payload.get("trigger") or "").strip()
+            == NOTIFICATION_PROVIDER_TEST_TRIGGER
+        ):
+            provider = str(command.payload.get("provider") or "").strip().lower()
+            if provider not in {"alimail", "clicksend"}:
+                return TaskExecutionResult(False, "通知供应商类型无效。")
+            if self.notification_provider_test is None:
+                return TaskExecutionResult(False, "通知供应商连接测试器尚未连接。")
+            self._report_progress(
+                command.execution_id or "",
+                "正在后台测试通知供应商连接。",
+                30,
+            )
+            value = await self._await_cancellable(
+                asyncio.to_thread(self.notification_provider_test, provider),
+                command.execution_id,
+            )
+            return TaskExecutionResult(
+                bool(getattr(value, "accepted", False)),
+                str(getattr(value, "message", "供应商连接测试完成。")),
+                dict(getattr(value, "details", {}) or {}),
+            )
         if (
             command.area is TaskArea.MAINTENANCE
             and command.capability is Capability.LIST_ORDERS

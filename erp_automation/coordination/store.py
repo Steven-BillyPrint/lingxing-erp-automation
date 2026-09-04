@@ -169,8 +169,11 @@ class CoordinationStore:
                         request_id TEXT PRIMARY KEY,
                         instance_id TEXT NOT NULL,
                         method TEXT NOT NULL,
-                        response_json TEXT NOT NULL,
-                        created_at REAL NOT NULL
+                        response_json TEXT NOT NULL DEFAULT '',
+                        state TEXT NOT NULL DEFAULT 'SUCCEEDED',
+                        error_text TEXT NOT NULL DEFAULT '',
+                        created_at REAL NOT NULL,
+                        updated_at REAL NOT NULL DEFAULT 0
                     );
                     CREATE INDEX IF NOT EXISTS idx_coordination_requests_created
                     ON coordination_requests(created_at);
@@ -235,6 +238,43 @@ class CoordinationStore:
                     "coordination_events",
                     "operator_name",
                     "TEXT NOT NULL DEFAULT ''",
+                )
+                self._ensure_column(
+                    connection,
+                    "coordination_requests",
+                    "state",
+                    "TEXT NOT NULL DEFAULT 'SUCCEEDED'",
+                )
+                self._ensure_column(
+                    connection,
+                    "coordination_requests",
+                    "error_text",
+                    "TEXT NOT NULL DEFAULT ''",
+                )
+                self._ensure_column(
+                    connection,
+                    "coordination_requests",
+                    "updated_at",
+                    "REAL NOT NULL DEFAULT 0",
+                )
+                # A RUNNING row can survive only when the previous server
+                # process stopped before persisting a response.  Preserve the
+                # request identity and expose the uncertainty instead of
+                # executing the same mutation again after restart.
+                now = self._clock()
+                connection.execute(
+                    """
+                    UPDATE coordination_requests
+                    SET state = 'FAILED',
+                        error_text = CASE
+                            WHEN error_text = '' THEN
+                                '服务器在结果持久化前重新启动；请核对业务状态。'
+                            ELSE error_text
+                        END,
+                        updated_at = ?
+                    WHERE state IN ('PENDING', 'RUNNING')
+                    """,
+                    (now,),
                 )
             self._initialized = True
 
@@ -1807,6 +1847,99 @@ class CoordinationStore:
             connection.commit()
         return revision
 
+    def begin_request(
+        self,
+        *,
+        request_id: str,
+        instance_id: str,
+        method: str,
+    ) -> dict[str, Any]:
+        """Persist mutation admission before any side effect is executed."""
+
+        request = self._validate_identifier(request_id, label="request_id")
+        instance = self._validate_identifier(instance_id, label="instance_id")
+        method_name = self._validate_identifier(method, label="method", maximum=120)
+        now = self._clock()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            inserted = connection.execute(
+                """
+                INSERT OR IGNORE INTO coordination_requests(
+                    request_id, instance_id, method, response_json,
+                    state, error_text, created_at, updated_at
+                ) VALUES (?, ?, ?, '', 'RUNNING', '', ?, ?)
+                """,
+                (request, instance, method_name, now, now),
+            ).rowcount
+            row = connection.execute(
+                """
+                SELECT instance_id, method, state, response_json,
+                       error_text, created_at, updated_at
+                FROM coordination_requests
+                WHERE request_id = ?
+                """,
+                (request,),
+            ).fetchone()
+            connection.commit()
+        if row is None:
+            raise RuntimeError("Coordination request could not be persisted.")
+        if str(row["instance_id"]) != instance:
+            raise ValueError("Request ID is already owned by another desktop instance.")
+        if str(row["method"]) != method_name:
+            raise ValueError("Request ID is already bound to another operation.")
+        return {
+            "created": bool(inserted),
+            "request_id": request,
+            "instance_id": instance,
+            "method": method_name,
+            "state": str(row["state"] or "RUNNING"),
+            "response_json": str(row["response_json"] or ""),
+            "error": str(row["error_text"] or ""),
+            "created_at": float(row["created_at"] or 0),
+            "updated_at": float(row["updated_at"] or 0),
+        }
+
+    def request_status(
+        self,
+        request_id: str,
+        *,
+        instance_id: str,
+        method: str,
+    ) -> dict[str, Any] | None:
+        request = self._validate_identifier(request_id, label="request_id")
+        instance = self._validate_identifier(instance_id, label="instance_id")
+        method_name = self._validate_identifier(method, label="method", maximum=120)
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT instance_id, method, state, response_json,
+                       error_text, created_at, updated_at
+                FROM coordination_requests
+                WHERE request_id = ?
+                """,
+                (request,),
+            ).fetchone()
+        if row is None:
+            return None
+        if str(row["instance_id"]) != instance:
+            raise ValueError("Request ID is already owned by another desktop instance.")
+        if str(row["method"]) != method_name:
+            raise ValueError("Request ID is already bound to another operation.")
+        response: dict[str, Any] | None = None
+        encoded = str(row["response_json"] or "")
+        if encoded:
+            decoded = json.loads(encoded)
+            response = decoded if isinstance(decoded, dict) else None
+        return {
+            "request_id": request,
+            "method": method_name,
+            "state": str(row["state"] or "RUNNING"),
+            "response": response,
+            "error": str(row["error_text"] or ""),
+            "created_at": float(row["created_at"] or 0),
+            "updated_at": float(row["updated_at"] or 0),
+        }
+
     def cached_response(
         self,
         request_id: str,
@@ -1818,7 +1951,7 @@ class CoordinationStore:
         with self._connect() as connection:
             row = connection.execute(
                 """
-                SELECT instance_id, method, response_json
+                SELECT instance_id, method, state, response_json
                 FROM coordination_requests
                 WHERE request_id = ?
                 """,
@@ -1830,6 +1963,8 @@ class CoordinationStore:
             raise ValueError("Request ID is already owned by another desktop instance.")
         if method is not None and str(row["method"]) != str(method):
             raise ValueError("Request ID is already bound to another operation.")
+        if str(row["state"] or "") != "SUCCEEDED":
+            return None
         decoded = json.loads(str(row["response_json"]))
         return decoded if isinstance(decoded, dict) else None
 
@@ -1864,12 +1999,49 @@ class CoordinationStore:
         instance = self._validate_identifier(instance_id, label="instance_id")
         method_name = self._validate_identifier(method, label="method", maximum=120)
         encoded = json.dumps(response, ensure_ascii=False, separators=(",", ":"))
+        now = self._clock()
         with self._connect() as connection:
             connection.execute(
                 """
-                INSERT OR IGNORE INTO coordination_requests(
-                    request_id, instance_id, method, response_json, created_at
-                ) VALUES (?, ?, ?, ?, ?)
+                INSERT INTO coordination_requests(
+                    request_id, instance_id, method, response_json,
+                    state, error_text, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 'SUCCEEDED', '', ?, ?)
+                ON CONFLICT(request_id) DO UPDATE SET
+                    response_json = excluded.response_json,
+                    state = 'SUCCEEDED',
+                    error_text = '',
+                    updated_at = excluded.updated_at
+                WHERE coordination_requests.instance_id = excluded.instance_id
+                  AND coordination_requests.method = excluded.method
                 """,
-                (request, instance, method_name, encoded, self._clock()),
+                (request, instance, method_name, encoded, now, now),
+            )
+
+    def fail_request(
+        self,
+        *,
+        request_id: str,
+        instance_id: str,
+        method: str,
+        error: str,
+    ) -> None:
+        request = self._validate_identifier(request_id, label="request_id")
+        instance = self._validate_identifier(instance_id, label="instance_id")
+        method_name = self._validate_identifier(method, label="method", maximum=120)
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE coordination_requests
+                SET state = 'FAILED', error_text = ?, updated_at = ?
+                WHERE request_id = ? AND instance_id = ? AND method = ?
+                  AND state != 'SUCCEEDED'
+                """,
+                (
+                    str(error or "请求执行失败。")[:500],
+                    self._clock(),
+                    request,
+                    instance,
+                    method_name,
+                ),
             )

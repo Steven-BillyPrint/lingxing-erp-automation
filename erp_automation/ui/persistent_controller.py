@@ -2020,7 +2020,8 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                 self._terminally_fenced_tasks.discard(task_id)
                 self._shutdown_cancel_requested.discard(task_id)
                 self._task_pause_reasons.pop(task_id, None)
-                self._refresh_persistent_rows()
+                self._custom_rows_signature = None
+                self._shipment_rows_signature = None
 
     def _block_queued_tasks_for_shared_prerequisite(
         self,
@@ -4143,7 +4144,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                 self._state.migration = replace(self._state.migration, last_result=message)
                 self._append_log(LogLevel.ERROR, "migration", message)
                 return ControlResult(False, message)
-            self._refresh_persistent_rows()
+            self._custom_rows_signature = None
             message = f"状态迁移完成：导入 {result.imported_count}/{result.source_count} 条；旧 JSON 备份已保留。"
             self._state.migration = MigrationInfo(1, 1, (), message)
             self._append_log(LogLevel.INFO, "migration", message)
@@ -4242,7 +4243,8 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                 self._custom_rule_reconciliation_completed = False
                 self._shipment_rule_reconciliation_completed = False
                 self._load_configuration()
-                self._refresh_persistent_rows(force=True)
+                self._custom_rows_signature = None
+                self._shipment_rows_signature = None
             except Exception as exc:
                 detail = " ".join(str(exc).split())[:500] or type(exc).__name__
                 message = (
@@ -4297,7 +4299,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                     reason=reason,
                     actor="desktop_user",
                 )
-                self._refresh_persistent_rows()
+                self._custom_rows_signature = None
             except ValueError as exc:
                 return ControlResult(False, str(exc))
             except Exception as exc:
@@ -4328,7 +4330,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                     reason=reason,
                     actor="desktop_user",
                 )
-                self._refresh_persistent_rows()
+                self._custom_rows_signature = None
             except ValueError as exc:
                 return ControlResult(False, str(exc))
             except Exception as exc:
@@ -4362,7 +4364,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                     reason=reason,
                     actor="desktop_user",
                 )
-                self._refresh_persistent_rows()
+                self._custom_rows_signature = None
             except ValueError as exc:
                 return ControlResult(False, str(exc))
             except Exception as exc:
@@ -4406,7 +4408,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                     reason=reason,
                     actor="desktop_user",
                 )
-                self._refresh_persistent_rows()
+                self._custom_rows_signature = None
                 self._clear_manual_review_locks_locked(
                     order_nos=platform_order_nos,
                 )
@@ -4473,7 +4475,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                     )
                     if changed:
                         changed_logistics_nos.append(logistics_no)
-                self._refresh_persistent_rows(force=True)
+                self._shipment_rows_signature = None
                 self._clear_manual_review_locks_locked(
                     logistics_nos=changed_logistics_nos,
                 )
@@ -4511,7 +4513,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                 summary = ShipmentWorkflowStore(
                     self._shipment_state_path()
                 ).reopen_shipments_from_stage(logistics_nos, stage, reason=reason)
-                self._refresh_persistent_rows(force=True)
+                self._shipment_rows_signature = None
                 if summary.changed_count:
                     self._clear_manual_review_locks_locked(
                         logistics_nos=logistics_nos,
@@ -4586,7 +4588,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                 queued_stopped, running_stops = self._request_shipment_task_stops_locked(
                     changed_logistics_nos
                 )
-                self._refresh_persistent_rows(force=True)
+                self._shipment_rows_signature = None
             except Exception as exc:
                 return ControlResult(False, f"取消本轮自动标发处理失败：{type(exc).__name__}。")
         message = f"已停止当前勾选的 {changed} 条自动标发任务本轮处理"
@@ -4635,7 +4637,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                     logistics_no=logistics_no,
                     reason=reason,
                 )
-                self._refresh_persistent_rows()
+                self._shipment_rows_signature = None
             except ValueError as exc:
                 return ControlResult(False, str(exc))
             except Exception as exc:
@@ -4687,7 +4689,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                     tracking_no=tracking_no,
                     reason=audit_reason,
                 )
-                self._refresh_persistent_rows(force=True)
+                self._shipment_rows_signature = None
             except ValueError as exc:
                 return ControlResult(False, str(exc))
             except Exception as exc:

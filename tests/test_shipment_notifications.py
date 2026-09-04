@@ -26,10 +26,12 @@ from shipment_automation.notification_domain import (
     CONTACT_SOURCE_WMS,
     EMAIL_PRESENCE_NOT_PROVIDED,
     EMAIL_PRESENCE_PROVIDED,
+    NOTIFICATION_ACCEPTED,
     NOTIFICATION_AWAITING_REVIEW,
     NOTIFICATION_BLOCKED,
     NOTIFICATION_CANCELLED,
     NOTIFICATION_DELIVERY_UNCONFIRMED,
+    NOTIFICATION_DELIVERED,
     NOTIFICATION_MANUALLY_COMPLETED,
     NOTIFICATION_MANUAL_EMAIL_REQUIRED,
     NOTIFICATION_REJECTED,
@@ -5141,6 +5143,48 @@ def test_receipt_refresh_reports_provider_error_reasons(tmp_path) -> None:
             "count": 1,
         }
     ]
+
+
+def test_receipt_refresh_uses_bounded_concurrency() -> None:
+    class ReceiptStore:
+        def list_notifications(self, **_kwargs: Any) -> list[dict[str, Any]]:
+            return [
+                {"id": notification_id, "state": NOTIFICATION_ACCEPTED}
+                for notification_id in range(1, 13)
+            ]
+
+        def claim_receipt_check(self, _notification_id: int, *, owner: str) -> bool:
+            return bool(owner)
+
+        def finish_receipt_check(
+            self,
+            notification_id: int,
+            *,
+            owner: str,
+            query_succeeded: bool,
+        ) -> dict[str, Any]:
+            assert owner
+            assert query_succeeded is True
+            return {"id": notification_id, "state": NOTIFICATION_DELIVERED}
+
+    service = ShipmentNotificationService(ReceiptStore(), _config())  # type: ignore[arg-type]
+    active = 0
+    maximum_active = 0
+
+    async def refresh(notification_id: int) -> dict[str, Any]:
+        nonlocal active, maximum_active
+        active += 1
+        maximum_active = max(maximum_active, active)
+        await asyncio.sleep(0.01)
+        active -= 1
+        return {"id": notification_id, "state": NOTIFICATION_DELIVERED}
+
+    service.refresh_delivery_receipt = refresh  # type: ignore[method-assign]
+    result = asyncio.run(service.refresh_pending_receipts())
+
+    assert result["checked"] == 12
+    assert result["completed"] == 12
+    assert maximum_active == 5
 
 
 def test_controller_receipt_refresh_shows_safe_provider_reason(

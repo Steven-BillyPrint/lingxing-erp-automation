@@ -37,6 +37,8 @@ from erp_automation.ui.models import (
     DesktopWriteConfirmation,
     LINGXING_BROWSER_LOGIN_TRIGGER,
     NOTIFICATION_CONTACT_REFRESH_TRIGGER,
+    NOTIFICATION_PROVIDER_TEST_TRIGGER,
+    NOTIFICATION_RECEIPT_REFRESH_TRIGGER,
     NOTIFICATION_REVIEW_RESCAN_TRIGGER,
     NOTIFICATION_SYNC_INCLUDE_DEFERRED_RETRIES_KEY,
     SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER,
@@ -1186,6 +1188,69 @@ def test_notification_contact_refresh_is_a_read_only_background_task(tmp_path) -
     assert result.payload["erp_write_calls"] == 0
     assert result.payload["external_provider_calls"] == 0
     assert result.payload["notification_contact_refresh_duration_ms"] >= 0
+
+
+def test_notification_receipt_refresh_runs_inside_background_task(tmp_path) -> None:
+    calls: list[str] = []
+
+    def refresh() -> ControlResult:
+        calls.append(threading.current_thread().name)
+        return ControlResult(
+            True,
+            "发送状态刷新完成。",
+            details={"checked": 3, "completed": 2},
+        )
+
+    runner = DesktopTaskRunner(
+        tmp_path,
+        settings_provider=lambda: _settings(tmp_path),
+        configuration_provider=lambda: {},
+        shipment_notification_receipt_refresh=refresh,
+    )
+
+    result = runner(
+        TaskCommand(
+            "刷新客户通知发送状态",
+            TaskArea.MAINTENANCE,
+            Capability.LIST_ORDERS,
+            execution_id="receipt-refresh-task",
+            payload={"trigger": NOTIFICATION_RECEIPT_REFRESH_TRIGGER},
+        )
+    )
+
+    assert result.succeeded is True
+    assert result.payload == {"checked": 3, "completed": 2}
+    assert calls and calls[0] != threading.current_thread().name
+
+
+def test_notification_provider_test_runs_inside_background_task(tmp_path) -> None:
+    providers: list[str] = []
+
+    def test_provider(provider: str) -> ControlResult:
+        providers.append(provider)
+        return ControlResult(True, "供应商连接测试成功。")
+
+    runner = DesktopTaskRunner(
+        tmp_path,
+        settings_provider=lambda: _settings(tmp_path),
+        configuration_provider=lambda: {},
+        notification_provider_test=test_provider,
+    )
+
+    result = runner(
+        TaskCommand(
+            "测试阿里邮箱连接",
+            TaskArea.MAINTENANCE,
+            Capability.LIST_ORDERS,
+            payload={
+                "trigger": NOTIFICATION_PROVIDER_TEST_TRIGGER,
+                "provider": "alimail",
+            },
+        )
+    )
+
+    assert result.succeeded is True
+    assert providers == ["alimail"]
 
 
 def test_notification_review_rescan_uses_dedicated_sync_without_shipment_scan(

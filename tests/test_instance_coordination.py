@@ -5,6 +5,7 @@ import json
 import sqlite3
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import httpx
@@ -35,6 +36,7 @@ from erp_automation.coordination.remote_controller import (
     CoordinationAuthenticationRequired,
     CoordinationClientUpdateRequired,
     CoordinationConnectionError,
+    CoordinationReadTimeout,
     RemoteBackgroundTaskController,
     _filter_snapshot_for_operator,
 )
@@ -1237,6 +1239,78 @@ def test_http_server_reports_and_enforces_required_client_version(
                 strict_registration=True,
             )
         assert update_error.value.required_version == client_version
+    finally:
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=2)
+        service.close()
+
+
+def test_http_request_status_endpoint_reports_running_and_completed(
+    tmp_path: Path,
+) -> None:
+    client_version = (
+        Path(__file__).resolve().parents[1] / "CLIENT_VERSION"
+    ).read_text(encoding="utf-8").strip()
+    store = CoordinationStore(tmp_path / "coordination.sqlite3")
+    service = CoordinatedControllerService(
+        InMemoryBackgroundTaskController(),
+        store,
+        required_client_version=client_version,
+    )
+    service.register("desktop-one", "Desktop One", client_version=client_version)
+    store.begin_request(
+        request_id="request-status-one",
+        instance_id="desktop-one",
+        method="submit_task",
+    )
+    token = "t" * 48
+    server = create_http_server(("127.0.0.1", 0), service, api_token=token)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    url = f"http://127.0.0.1:{server.server_address[1]}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "X-ERP-Client-Version": client_version,
+    }
+    request = {
+        "instance_id": "desktop-one",
+        "request_id": "request-status-one",
+        "method": "submit_task",
+    }
+    try:
+        running = httpx.post(
+            f"{url}/v1/requests/status",
+            headers=headers,
+            json=request,
+        ).json()
+        assert running["ok"] is True
+        assert running["state"] == "RUNNING"
+        assert running["response"] is None
+
+        expected = {
+            "result_type": "control_result",
+            "result": {
+                "accepted": True,
+                "message": "已提交",
+                "task_id": "task-one",
+                "details": {},
+            },
+            "revision": 3,
+        }
+        store.save_response(
+            request_id="request-status-one",
+            instance_id="desktop-one",
+            method="submit_task",
+            response=expected,
+        )
+        completed = httpx.post(
+            f"{url}/v1/requests/status",
+            headers=headers,
+            json=request,
+        ).json()
+        assert completed["state"] == "SUCCEEDED"
+        assert completed["response"] == expected
     finally:
         server.shutdown()
         server.server_close()
@@ -2771,11 +2845,11 @@ def test_remote_task_batch_starts_browser_once_and_decodes_each_result() -> None
     assert client._browser_cleanup_task_ids == {"task-0", "task-1", "task-2"}
 
 
-def test_remote_task_batch_scales_only_the_read_timeout() -> None:
+def test_remote_task_batch_uses_short_default_ack_timeout() -> None:
     client = object.__new__(RemoteBackgroundTaskController)
     client._timeout_seconds = 5.0
 
-    def timeout_for(count: int) -> httpx.Timeout:
+    def timeout_for(count: int) -> httpx.Timeout | None:
         commands = tuple(
             TaskCommand(
                 "处理定制订单",
@@ -2785,24 +2859,18 @@ def test_remote_task_batch_scales_only_the_read_timeout() -> None:
             )
             for index in range(count)
         )
-        timeout = client._rpc_request_timeout("submit_tasks", (commands,))
-        assert isinstance(timeout, httpx.Timeout)
-        return timeout
+        return client._rpc_request_timeout("submit_tasks", (commands,))
 
     one = timeout_for(1)
     forty_nine = timeout_for(49)
     two_hundred = timeout_for(200)
 
-    assert one.read == 5.25
-    assert forty_nine.read == 17.25
-    assert two_hundred.read == 55.0
-    for timeout in (one, forty_nine, two_hundred):
-        assert timeout.connect == 5.0
-        assert timeout.write == 5.0
-        assert timeout.pool == 5.0
+    assert one is None
+    assert forty_nine is None
+    assert two_hundred is None
 
 
-def test_remote_shipment_status_mutation_extends_only_the_read_timeout() -> None:
+def test_remote_shipment_status_mutation_uses_short_default_ack_timeout() -> None:
     client = object.__new__(RemoteBackgroundTaskController)
     client._timeout_seconds = 5.0
 
@@ -2811,11 +2879,7 @@ def test_remote_shipment_status_mutation_extends_only_the_read_timeout() -> None
         (("ALS00000000001",), "mark_manual_done"),
     )
 
-    assert isinstance(timeout, httpx.Timeout)
-    assert timeout.read == 30.0
-    assert timeout.connect == 5.0
-    assert timeout.write == 5.0
-    assert timeout.pool == 5.0
+    assert timeout is None
 
 
 def test_remote_task_batch_read_timeout_is_reported_as_unconfirmed_per_item() -> None:
@@ -2868,6 +2932,83 @@ def test_remote_task_batch_read_timeout_is_reported_as_unconfirmed_per_item() ->
     assert all(result.details["non_modal"] is True for result in results)
     assert all("未排队" not in result.message for result in results)
     assert all("等待" in result.message for result in results)
+
+
+def test_remote_single_task_read_timeout_is_non_modal_and_retry_suppressed() -> None:
+    client = object.__new__(RemoteBackgroundTaskController)
+    client._lock = threading.RLock()
+    client._authentication_required = False
+    client._authentication_error = ""
+    client._local_pause_requested = False
+    client._last_interactions = ()
+    client._last_snapshot = DesktopSnapshot()
+    client._revision = 0
+    client.instance_id = "desktop-one"
+    client._request = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        CoordinationReadTimeout("后台仍在处理")
+    )
+
+    result = client._rpc(
+        "submit_task",
+        TaskCommand(
+            "扫描订单",
+            TaskArea.SHIPMENT,
+            Capability.LIST_ORDERS,
+        ),
+    )
+
+    assert result.accepted is False
+    assert result.details["submission_outcome_unknown"] is True
+    assert result.details["non_modal"] is True
+    assert result.details["retry_suppressed"] is True
+    assert result.details["request_id"]
+    assert "无法连接" not in result.message
+
+
+def test_remote_repeated_click_is_suppressed_while_timeout_is_reconciled() -> None:
+    client = object.__new__(RemoteBackgroundTaskController)
+    client._lock = threading.RLock()
+    client._metadata_lock = threading.RLock()
+    client._authentication_required = False
+    client._authentication_error = ""
+    client._local_pause_requested = False
+    client._last_interactions = ()
+    client._last_snapshot = DesktopSnapshot()
+    client._revision = 0
+    client._closed = False
+    client.instance_id = "desktop-one"
+    client._pending_request_ids = set()
+    client._pending_mutation_fingerprints = {}
+    client._reconciled_request_messages = []
+    client._request_reconciliation_pool = ThreadPoolExecutor(max_workers=1)
+    rpc_calls = 0
+
+    def request(_method: str, path: str, **_kwargs):
+        nonlocal rpc_calls
+        if path == "/v1/rpc":
+            rpc_calls += 1
+            raise CoordinationReadTimeout("后台仍在处理")
+        return {"state": "RUNNING", "response": None}
+
+    client._request = request
+    command = TaskCommand(
+        "扫描订单",
+        TaskArea.SHIPMENT,
+        Capability.LIST_ORDERS,
+    )
+    try:
+        first = client._rpc("submit_task", command)
+        repeated = client._rpc("submit_task", command)
+        assert first.details["submission_outcome_unknown"] is True
+        assert repeated.details["retry_suppressed"] is True
+        assert "相同请求" in repeated.message
+        assert rpc_calls == 1
+    finally:
+        client._closed = True
+        client._request_reconciliation_pool.shutdown(
+            wait=True,
+            cancel_futures=True,
+        )
 
 
 def test_alibaba_order_prepare_opens_quote_directly_without_blank_page() -> None:
@@ -3252,7 +3393,7 @@ def test_remote_scan_submission_does_not_open_unused_prewarm_page() -> None:
     assert host.opened == []
 
 
-def test_remote_notification_send_rpc_scales_only_the_read_timeout() -> None:
+def test_remote_legacy_notification_send_rpc_uses_short_default_ack_timeout() -> None:
     client = object.__new__(RemoteBackgroundTaskController)
     client._browser_host = None
     client.browser_endpoint = ""
@@ -3260,7 +3401,7 @@ def test_remote_notification_send_rpc_scales_only_the_read_timeout() -> None:
     client._last_snapshot = DesktopSnapshot()
     client._lock = threading.RLock()
     client._revision = 0
-    client._timeout_seconds = 30.0
+    client._timeout_seconds = 5.0
     client.instance_id = "desktop-one"
     captured: dict[str, object] = {}
 
@@ -3283,12 +3424,7 @@ def test_remote_notification_send_rpc_scales_only_the_read_timeout() -> None:
     assert result.accepted is True
     assert captured["method"] == "POST"
     assert captured["path"] == "/v1/rpc"
-    timeout = captured["timeout"]
-    assert isinstance(timeout, httpx.Timeout)
-    assert timeout.connect == 30.0
-    assert timeout.write == 30.0
-    assert timeout.pool == 30.0
-    assert timeout.read == 345.0
+    assert "timeout" not in captured
     queue_timeout = client._rpc_request_timeout("list_shipment_notifications", ())
     assert isinstance(queue_timeout, httpx.Timeout)
     assert queue_timeout.read == 30.0
@@ -3651,6 +3787,125 @@ def test_emergency_stop_activation_bypasses_busy_rpc_lock(tmp_path: Path) -> Non
         service.close()
 
 
+def test_task_admission_bypasses_busy_legacy_rpc_lock(tmp_path: Path) -> None:
+    controller, _store, service = _service(tmp_path)
+    service.register("desktop-one", "Desktop One")
+    lock_acquired = threading.Event()
+    release_lock = threading.Event()
+    submission_finished = threading.Event()
+    response: dict[str, object] = {}
+
+    def hold_legacy_rpc_lock() -> None:
+        with service._call_lock:
+            lock_acquired.set()
+            assert release_lock.wait(2)
+
+    def submit() -> None:
+        response.update(
+            service.invoke(
+                instance_id="desktop-one",
+                request_id="submit-while-provider-busy",
+                method="submit_task",
+                raw_args=to_jsonable(
+                    [
+                        TaskCommand(
+                            "扫描订单",
+                            TaskArea.SHIPMENT,
+                            Capability.LIST_ORDERS,
+                        )
+                    ]
+                ),
+                raw_kwargs={},
+            )
+        )
+        submission_finished.set()
+
+    blocker = threading.Thread(target=hold_legacy_rpc_lock)
+    submission = threading.Thread(target=submit)
+    blocker.start()
+    assert lock_acquired.wait(1)
+    submission.start()
+    try:
+        assert submission_finished.wait(0.5)
+        assert response["result"]["accepted"] is True
+    finally:
+        release_lock.set()
+        blocker.join(timeout=2)
+        submission.join(timeout=2)
+        service.close()
+
+
+def test_mutation_request_journal_reconciles_late_success_without_duplicate(
+    tmp_path: Path,
+) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+
+    class SlowAdmissionController(InMemoryBackgroundTaskController):
+        calls = 0
+
+        def submit_task(self, command: TaskCommand) -> ControlResult:
+            self.calls += 1
+            entered.set()
+            assert release.wait(2)
+            return super().submit_task(command)
+
+    controller = SlowAdmissionController()
+    store = CoordinationStore(tmp_path / "coordination.sqlite3")
+    service = CoordinatedControllerService(controller, store)
+    service.register("desktop-one", "Desktop One")
+    response: dict[str, object] = {}
+    command = TaskCommand(
+        "扫描订单",
+        TaskArea.SHIPMENT,
+        Capability.LIST_ORDERS,
+    )
+
+    def invoke() -> None:
+        response.update(
+            service.invoke(
+                instance_id="desktop-one",
+                request_id="late-success-request",
+                method="submit_task",
+                raw_args=to_jsonable([command]),
+                raw_kwargs={},
+            )
+        )
+
+    worker = threading.Thread(target=invoke)
+    worker.start()
+    assert entered.wait(1)
+    running = service.request_status_payload(
+        instance_id="desktop-one",
+        request_id="late-success-request",
+        method="submit_task",
+    )
+    assert running["state"] == "RUNNING"
+    assert running["response"] is None
+
+    release.set()
+    worker.join(timeout=2)
+    assert not worker.is_alive()
+    completed = service.request_status_payload(
+        instance_id="desktop-one",
+        request_id="late-success-request",
+        method="submit_task",
+    )
+    assert completed["state"] == "SUCCEEDED"
+    assert completed["response"]["result"]["accepted"] is True
+
+    replay = service.invoke(
+        instance_id="desktop-one",
+        request_id="late-success-request",
+        method="submit_task",
+        raw_args=to_jsonable([command]),
+        raw_kwargs={},
+    )
+    assert replay == response
+    assert controller.calls == 1
+    service.close()
+
+
 def test_remote_configuration_export_and_import_transfer_local_files(
     tmp_path: Path,
 ) -> None:
@@ -3703,6 +3958,65 @@ def test_remote_configuration_export_and_import_transfer_local_files(
         server.server_close()
         server_thread.join(timeout=2)
         service.close()
+
+
+def test_remote_configuration_export_recovers_after_read_timeout(
+    tmp_path: Path,
+) -> None:
+    client = object.__new__(RemoteBackgroundTaskController)
+    client._lock = threading.RLock()
+    client._metadata_lock = threading.RLock()
+    client._closed = False
+    client._revision = 0
+    client.instance_id = "desktop-one"
+    client._pending_request_ids = set()
+    client._reconciled_request_messages = []
+    client._request_reconciliation_pool = ThreadPoolExecutor(max_workers=1)
+    package = b"encrypted-settings-package"
+    target = tmp_path / "settings.erp-migrate"
+    request_ids: list[str] = []
+
+    def request(_method: str, path: str, **kwargs):
+        if path == "/v1/configuration/export":
+            request_ids.append(str(kwargs["json"]["request_id"]))
+            raise CoordinationReadTimeout("后台仍在处理")
+        assert path == "/v1/requests/status"
+        assert kwargs["json"]["request_id"] == request_ids[0]
+        assert kwargs["json"]["method"] == "export_portable_configuration"
+        return {
+            "state": "SUCCEEDED",
+            "response": {
+                "revision": 7,
+                "result_type": "control_result",
+                "result": {
+                    "accepted": True,
+                    "message": "设置包已生成",
+                    "details": {},
+                },
+                "package_base64": base64.b64encode(package).decode("ascii"),
+            },
+        }
+
+    client._request = request
+    try:
+        result = client.export_portable_migration(
+            str(target),
+            "long-enough-passphrase",
+            include_state=False,
+        )
+        assert result.accepted is False
+        assert result.details["submission_outcome_unknown"] is True
+        deadline = time.monotonic() + 2
+        while not target.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert target.read_bytes() == package
+        assert client.revision == 7
+    finally:
+        client._closed = True
+        client._request_reconciliation_pool.shutdown(
+            wait=True,
+            cancel_futures=True,
+        )
 
 
 def test_portable_configuration_result_names_verified_target_account(

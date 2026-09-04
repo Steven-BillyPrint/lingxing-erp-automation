@@ -460,6 +460,10 @@ def create_default_controller(
         shipment_notification_contact_refresh=(
             api_services.refresh_shipment_notification_contacts
         ),
+        shipment_notification_receipt_refresh=(
+            controller.refresh_shipment_notification_receipts
+        ),
+        notification_provider_test=controller.test_notification_provider,
         api_test=api_services.test_connection,
         custom_order_api_factory=api_services.custom_order_operations,
         custom_order_status_check=api_services.get_custom_order_processing_status,

@@ -7,6 +7,7 @@ import hmac
 import json
 import logging
 import ssl
+import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -88,6 +89,19 @@ class CoordinationRequestHandler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         self.wfile.write(body)
+
+    def _record_rpc_failure(self, path: str, payload: Any, error: str) -> None:
+        if path != "/v1/rpc" or not isinstance(payload, dict):
+            return
+        try:
+            self.server.coordination_service.fail_request(
+                instance_id=str(payload.get("instance_id") or ""),
+                request_id=str(payload.get("request_id") or ""),
+                method=str(payload.get("method") or ""),
+                error=error,
+            )
+        except Exception:
+            LOGGER.exception("Failed to persist coordination RPC failure")
 
     def _send_instance_registration_expired(
         self,
@@ -402,6 +416,19 @@ class CoordinationRequestHandler(BaseHTTPRequestHandler):
                     identity=self._operator_identity,
                 )
                 result = {}
+            elif path == "/v1/requests/status":
+                instance_id = str(payload.get("instance_id") or "")
+                self.server.coordination_service.authorize_client_request(
+                    self._client_version(),
+                    instance_id=instance_id,
+                    allow_active_task_drain=True,
+                )
+                result = self.server.coordination_service.request_status_payload(
+                    instance_id=instance_id,
+                    request_id=str(payload.get("request_id") or ""),
+                    method=str(payload.get("method") or ""),
+                    identity=self._operator_identity,
+                )
             elif path == "/v1/configuration/export":
                 self.server.coordination_service.authorize_client_request(
                     self._client_version(),
@@ -432,6 +459,7 @@ class CoordinationRequestHandler(BaseHTTPRequestHandler):
             elif path == "/v1/rpc":
                 instance_id = str(payload.get("instance_id") or "")
                 method = str(payload.get("method") or "")
+                request_id = str(payload.get("request_id") or "")
                 raw_args = payload.get("args")
                 drain_method_allowed = (
                     method in ROLLING_UPDATE_DRAIN_RPC_METHODS
@@ -455,9 +483,10 @@ class CoordinationRequestHandler(BaseHTTPRequestHandler):
                         allow_active_task_drain=drain_method_allowed,
                     )
                 )
+                rpc_started = time.monotonic()
                 result = self.server.coordination_service.invoke(
                     instance_id=instance_id,
-                    request_id=str(payload.get("request_id") or ""),
+                    request_id=request_id,
                     method=method,
                     raw_args=raw_args,
                     raw_kwargs=payload.get("kwargs"),
@@ -466,6 +495,12 @@ class CoordinationRequestHandler(BaseHTTPRequestHandler):
                 result["client_update_deferred"] = update_deferred
                 result["required_version"] = (
                     self.server.coordination_service.required_client_version
+                )
+                LOGGER.info(
+                    "coordination_rpc method=%s request_id=%s handler_ms=%s",
+                    method,
+                    request_id,
+                    round((time.monotonic() - rpc_started) * 1000),
                 )
             else:
                 self._send(
@@ -479,8 +514,14 @@ class CoordinationRequestHandler(BaseHTTPRequestHandler):
         except InstanceRegistrationExpiredError as exc:
             self._send_instance_registration_expired(exc)
         except (KeyError, TypeError, ValueError) as exc:
+            self._record_rpc_failure(path, locals().get("payload"), str(exc))
             self._send(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
-        except Exception:
+        except Exception as exc:
+            self._record_rpc_failure(
+                path,
+                locals().get("payload"),
+                f"{type(exc).__name__}: 请求执行失败。",
+            )
             LOGGER.exception("Coordination request failed: %s", path)
             self._send(
                 HTTPStatus.INTERNAL_SERVER_ERROR,

@@ -48,6 +48,8 @@ from .models import (
     LINGXING_BROWSER_LOGIN_TRIGGER,
     LogEntry,
     NOTIFICATION_CONTACT_REFRESH_TRIGGER,
+    NOTIFICATION_PROVIDER_TEST_TRIGGER,
+    NOTIFICATION_RECEIPT_REFRESH_TRIGGER,
     NOTIFICATION_REVIEW_RESCAN_TRIGGER,
     SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER,
     SHIPMENT_NOTIFICATION_SEND_TRIGGER,
@@ -9180,10 +9182,21 @@ if PYSIDE6_AVAILABLE:
                     ControlResult(False, "请先保存加密配置，再测试供应商连接。")
                 )
                 return
+            provider_key = str(provider or "").strip().lower()
+            provider_label = "阿里邮箱" if provider_key == "alimail" else "ClickSend"
+            command = TaskCommand(
+                name=f"测试{provider_label}连接",
+                area=TaskArea.MAINTENANCE,
+                capability=Capability.LIST_ORDERS,
+                payload={
+                    "trigger": NOTIFICATION_PROVIDER_TEST_TRIGGER,
+                    "provider": provider_key,
+                },
+            )
             _run_control_result_responsive(
                 self,
                 self._controller,
-                lambda: self._controller.test_notification_provider(provider),
+                lambda: self._controller.submit_task(command),
                 self._result_handler,
             )
 
@@ -11922,10 +11935,16 @@ if PYSIDE6_AVAILABLE:
                 self._result_handler(result)
                 self._reload(navigation=False)
 
+            command = TaskCommand(
+                name="刷新客户通知发送状态",
+                area=TaskArea.MAINTENANCE,
+                capability=Capability.LIST_ORDERS,
+                payload={"trigger": NOTIFICATION_RECEIPT_REFRESH_TRIGGER},
+            )
             _run_control_result_responsive(
                 self,
                 self._controller,
-                self._controller.refresh_shipment_notification_receipts,
+                lambda: self._controller.submit_task(command),
                 finish,
             )
 

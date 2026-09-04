@@ -193,6 +193,8 @@ class TaskArea(str, Enum):
 
 NOTIFICATION_REVIEW_RESCAN_TRIGGER = "notification_review_rescan"
 NOTIFICATION_CONTACT_REFRESH_TRIGGER = "notification_contact_refresh"
+NOTIFICATION_RECEIPT_REFRESH_TRIGGER = "notification_receipt_refresh"
+NOTIFICATION_PROVIDER_TEST_TRIGGER = "notification_provider_test"
 SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER = "shipment_notification_compensation"
 SHIPMENT_NOTIFICATION_SEND_TRIGGER = "shipment_notification_send"
 LINGXING_BROWSER_LOGIN_TRIGGER = "lingxing_browser_login"
