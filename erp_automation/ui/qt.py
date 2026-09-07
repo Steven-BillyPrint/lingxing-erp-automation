@@ -11,12 +11,13 @@ from time import monotonic
 from uuid import uuid4
 
 from erp_automation.contracts.controller import TaskSubmissionReceipt
+from erp_automation.contracts.operation_feedback import operation_rejection
 from erp_automation.contracts.models import CUSTOM_ORDER_SUBMISSION_ID_PAYLOAD_KEY, SHIPMENT_SUBMISSION_ID_PAYLOAD_KEY
 from erp_automation.coordination.remote_controller import (
     CoordinationClientUpdateRequired,
 )
 from erp_automation.client_version import CLIENT_VERSION
-from erp_automation.operations.scan_audit import scan_audit_directory_name
+from erp_automation.operations.scan_audit import redact_audit_text, scan_audit_directory_name
 from erp_automation.runtime_mode import (
     is_local_test_mode,
     is_local_test_shared_server_mode,
@@ -24,6 +25,7 @@ from erp_automation.runtime_mode import (
 )
 from lingxing_automation.products.catalog import preferred_product_type
 from shipment_automation.models import shipment_tracking_attention_notice
+from shipment_automation.alibaba_logistics import REAL_OVERSEAS_CARRIER_DISPLAY_NAMES
 from shipment_automation.notification_queue import (
     STATUS_INCONSISTENT_PROVIDER_EVIDENCE,
     notification_has_inconsistent_provider_evidence,
@@ -1223,8 +1225,21 @@ if PYSIDE6_AVAILABLE:
         dialog.exec()
 
 
+    def _control_operation_result(operation: Callable[[], ControlResult]) -> ControlResult:
+        try:
+            return operation()
+        except Exception as exc:
+            reason = redact_audit_text(str(exc), redact_phone=False).strip()
+            return ControlResult(
+                False,
+                f"操作失败：{reason or type(exc).__name__}",
+                details={"operation_failed": True},
+            )
+
+
     class _ControlResultThread(QThread):
         result_ready = Signal(object)
+        delivery_finished = Signal()
 
         def __init__(self, operation: Callable[[], ControlResult], parent=None) -> None:
             super().__init__(parent)
@@ -1242,20 +1257,14 @@ if PYSIDE6_AVAILABLE:
             )
 
         def run(self) -> None:
-            try:
-                result = self._operation()
-            except Exception as exc:  # pragma: no cover - defensive UI boundary
-                result = ControlResult(
-                    False,
-                    f"后台操作失败：{type(exc).__name__}。",
-                )
-            self._result = result
+            self._result = _control_operation_result(self._operation)
 
         def _publish_result(self) -> None:
             result = self._result
             self._result = None
             if result is not None:
                 self.result_ready.emit(result)
+            self.delivery_finished.emit()
 
 
     class _ValueThread(QThread):
@@ -1622,7 +1631,7 @@ if PYSIDE6_AVAILABLE:
             getattr(controller, "snapshot_runs_in_background", False)
             or getattr(controller, "control_calls_run_in_background", False)
         ):
-            result_handler(operation())
+            result_handler(_control_operation_result(operation))
             return
         threads = getattr(owner, "_responsive_control_threads", None)
         if threads is None:
@@ -1639,7 +1648,9 @@ if PYSIDE6_AVAILABLE:
                 QTimer.singleShot(0, window.close)
 
         thread.result_ready.connect(result_handler)
-        thread.finished.connect(cleanup)
+        # The finished signal only schedules publication on the GUI thread.
+        # Keep ownership until the result callback (including its dialog) ran.
+        thread.delivery_finished.connect(cleanup)
         thread.start()
 
 
@@ -3766,7 +3777,7 @@ if PYSIDE6_AVAILABLE:
                     # when finished schedules deletion of its signal sender.
                     Qt.ConnectionType.DirectConnection,
                 )
-                thread.finished.connect(thread.deleteLater)
+                thread.delivery_finished.connect(thread.deleteLater)
                 self._submission_thread = thread
                 thread.start()
                 return
@@ -3998,6 +4009,9 @@ if PYSIDE6_AVAILABLE:
                     f"已排队 {len(accepted_order_nos)} 张，未排队 {len(rejected)} 张。\n\n"
                     f"{rejected_preview}",
                 )
+                result = replace(result, details={
+                    **dict(result.details), "rejection_notice_shown": True,
+                })
             self._update_active_order_cells(set(self._order_submissions))
             self._refresh_visible_row_caches()
             self._apply_status_filter()
@@ -5539,21 +5553,7 @@ if PYSIDE6_AVAILABLE:
 
 
     class _ConfirmedShipmentTrackingDialog(QDialog):
-        CARRIERS = (
-            "UPS",
-            "FedEx",
-            "DHL",
-            "USPS",
-            "GOFO",
-            "Yanwen",
-            "SpeedX",
-            "泛远",
-            "UniUni",
-            "1ST",
-            "SwiftX",
-            "Canada Post",
-            "Aramex",
-        )
+        CARRIERS = tuple(REAL_OVERSEAS_CARRIER_DISPLAY_NAMES.values())
 
         def __init__(
             self,
@@ -6605,17 +6605,13 @@ if PYSIDE6_AVAILABLE:
                     self._clear_checked_shipments(changed)
                 skipped = dict(result.details.get("skipped_reasons") or {})
                 if skipped:
-                    detail = "\n".join(
-                        f"• {display_by_key.get(identifier, identifier)}：{message}"
-                        for identifier, message in list(skipped.items())[:10]
-                    )
-                    if len(skipped) > 10:
-                        detail += f"\n• ……另有 {len(skipped) - 10} 条"
-                    QMessageBox.warning(
-                        self,
-                        "部分任务未修改",
-                        f"以下任务保留勾选：\n\n{detail}",
-                    )
+                    result = replace(result, details={
+                        **dict(result.details),
+                        "skipped_reasons": {
+                            display_by_key.get(key, key): value
+                            for key, value in skipped.items()
+                        },
+                    })
                 self._result_handler(result)
 
             _run_control_result_responsive(
@@ -6809,7 +6805,7 @@ if PYSIDE6_AVAILABLE:
                 self._update_selection_summary()
                 thread = _ControlResultThread(submit, self)
                 thread.result_ready.connect(self._finish_shipment_submission)
-                thread.finished.connect(thread.deleteLater)
+                thread.delivery_finished.connect(thread.deleteLater)
                 self._submission_thread = thread
                 thread.start()
                 return
@@ -6961,7 +6957,7 @@ if PYSIDE6_AVAILABLE:
                     self,
                 )
                 thread.result_ready.connect(self._finish_shipment_submission)
-                thread.finished.connect(thread.deleteLater)
+                thread.delivery_finished.connect(thread.deleteLater)
                 self._submission_thread = thread
                 thread.start()
                 return
@@ -9629,7 +9625,7 @@ if PYSIDE6_AVAILABLE:
                         False,
                         result.message,
                         result.task_id,
-                        details={**dict(result.details), "non_modal": True},
+                        details={**dict(result.details), "non_modal": True, "rejection_notice_shown": True},
                     )
                 )
 
@@ -10945,7 +10941,7 @@ if PYSIDE6_AVAILABLE:
                     False,
                     result.message,
                     result.task_id,
-                    details={**dict(result.details), "non_modal": True},
+                    details={**dict(result.details), "non_modal": True, "rejection_notice_shown": True},
                 )
             )
             return True
@@ -13529,7 +13525,7 @@ if PYSIDE6_AVAILABLE:
             )
             self._cleanup_thread = thread
             thread.result_ready.connect(self._finish_log_cleanup)
-            thread.finished.connect(thread.deleteLater)
+            thread.delivery_finished.connect(thread.deleteLater)
             thread.start()
 
         def _finish_log_cleanup(self, result: ControlResult) -> None:
@@ -13850,7 +13846,7 @@ if PYSIDE6_AVAILABLE:
                     requested,
                 )
             )
-            thread.finished.connect(thread.deleteLater)
+            thread.delivery_finished.connect(thread.deleteLater)
             self._execution_pause_thread = thread
             thread.start()
 
@@ -14163,6 +14159,10 @@ if PYSIDE6_AVAILABLE:
                 QTimer.singleShot(0, self.refresh)
 
         def _apply_snapshot(self, snapshot: DesktopSnapshot) -> None:
+            take_rejections = getattr(self._controller, "take_operation_rejections", None)
+            if callable(take_rejections):
+                for result in take_rejections():
+                    self._show_operation_rejection(result)
             self.custom_orders_page.update_sync_status()
             self._sync_scheduled_scan_timers(snapshot)
             unchanged = snapshot is self._latest_snapshot
@@ -14482,7 +14482,7 @@ if PYSIDE6_AVAILABLE:
                 thread.result_ready.connect(
                     self._handle_local_logistics_followup_result
                 )
-                thread.finished.connect(
+                thread.delivery_finished.connect(
                     self._finish_local_logistics_followup_thread
                 )
                 self._active_local_logistics_followup_scan_id = scan_task_id
@@ -14854,9 +14854,13 @@ if PYSIDE6_AVAILABLE:
             if bool(result.details.get("authentication_required")):
                 self._request_cloudflare_reauthentication(result.message)
                 return
-            if not result.accepted and not bool(result.details.get("non_modal")):
-                QMessageBox.warning(self, "操作未执行", result.message)
+            self._show_operation_rejection(result)
             self.refresh()
+
+        def _show_operation_rejection(self, result: ControlResult) -> None:
+            notice = operation_rejection(result)
+            if notice is not None:
+                QMessageBox.warning(self, notice.title, notice.message)
 
         def _request_cloudflare_reauthentication(self, reason: str) -> None:
             if (
@@ -14890,7 +14894,7 @@ if PYSIDE6_AVAILABLE:
             )
             thread = _ControlResultThread(reauthenticate, self)
             thread.result_ready.connect(self._finish_cloudflare_reauthentication)
-            thread.finished.connect(
+            thread.delivery_finished.connect(
                 self._clear_cloudflare_reauthentication_thread
             )
             self._authentication_thread = thread

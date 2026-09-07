@@ -154,6 +154,9 @@ TRACKING_NUMBER_PATTERNS = {
         re.compile(r"\d{9}"),
         re.compile(r"\d{10}"),
         re.compile(r"\d{11}"),
+        # DHL eCommerce UK shipment number / domestic German Express.
+        re.compile(r"\d{14}"),
+        re.compile(r"\d{20}"),
         re.compile(r"\d{16}"),
         re.compile(r"\d[A-Z]{2}\d{5}"),
         re.compile(r"[A-Z]{3}\d{6}"),
@@ -175,6 +178,9 @@ TRACKING_NUMBER_PATTERNS = {
     "YANWEN": (
         re.compile(r"[A-Z]{2}\d{9}(?:YP|YW|CN)"),
         re.compile(r"YW(?:[A-Z]{2,3})?\d{8,12}"),
+        # Operator-confirmed Yanwen Express last-mile number family. Keep
+        # its distinct prefix and observed 14-digit suffix narrowly scoped.
+        re.compile(r"YWE\d{14}"),
         re.compile(r"(?:YWPT|YE|YT|SY|YL|LP)[A-Z0-9]{8,24}"),
     ),
     "SPEEDX": (
@@ -190,6 +196,11 @@ TRACKING_NUMBER_PATTERNS = {
     ),
     "SWIFTX": (
         re.compile(r"SWX\d{15,18}"),
+    ),
+    "FANYUAN": (
+        # Native identifier verified on FAR's public tracking page. The
+        # shipment may transfer to a separate final-mile carrier (see below).
+        re.compile(r"FAREX\d{10}YQ"),
     ),
     "WANB": (
         # Wanb's own handling/tracking numbers use the WNBAA prefix.  The
@@ -220,7 +231,9 @@ TRACKING_NUMBER_PATTERNS = {
 # Aramex publishes a deliberately broad alphanumeric AWB contract.  It is
 # useful for validating a known carrier, but not distinctive enough to infer
 # the carrier when Alibaba reports Unknown.
-TRACKING_INFERENCE_EXCLUDED_CARRIERS = frozenset({"ARAMEX"})
+# A FAR identifier can lead to a separate FedEx/other final-mile waybill;
+# validate it only when FAR was explicitly supplied as the carrier.
+TRACKING_INFERENCE_EXCLUDED_CARRIERS = frozenset({"ARAMEX", "FANYUAN"})
 
 TRACKING_MISMATCH_REASON_PREFIX = "国际物流单号与承运商不匹配："
 
