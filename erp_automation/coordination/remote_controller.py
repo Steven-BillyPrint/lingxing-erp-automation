@@ -12,6 +12,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from copy import deepcopy
+from dataclasses import replace
 from datetime import datetime, timezone
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
@@ -22,9 +23,10 @@ from uuid import uuid4
 import httpx
 
 from erp_automation.configuration import atomic_write_bytes, backup_path_for
-from erp_automation.contracts.controller import ControlResult
+from erp_automation.contracts.controller import ControlResult, TaskSubmissionReceipt
 from erp_automation.contracts.models import (
     Capability,
+    CUSTOM_ORDER_SUBMISSION_ID_PAYLOAD_KEY,
     CustomOrderPage,
     DESKTOP_INSTANCE_ID_PAYLOAD_KEY,
     DesktopInteractionRequest,
@@ -284,6 +286,7 @@ class RemoteBackgroundTaskController:
         self._pending_request_ids: set[str] = set()
         self._pending_mutation_fingerprints: dict[str, str] = {}
         self._reconciled_request_messages: list[str] = []
+        self._task_submission_receipts: dict[str, TaskSubmissionReceipt] = {}
         self._snapshot_revision: int | None = None
         self._startup_snapshot_pending = False
         self._prefetched_custom_order_pages: dict[
@@ -1133,6 +1136,56 @@ class RemoteBackgroundTaskController:
             messages.clear()
             return message
 
+    def take_task_submission_receipts(
+        self, submission_ids: Sequence[str],
+    ) -> tuple[TaskSubmissionReceipt, ...]:
+        """Drain only requested UI attempts; never perform network I/O here."""
+
+        with self._metadata_guard():
+            receipts = self.__dict__.setdefault("_task_submission_receipts", {})
+            return tuple(
+                receipts.pop(submission_id)
+                for submission_id in submission_ids
+                if submission_id in receipts
+            )
+
+    def _record_task_submission_receipts(
+        self,
+        request_id: str,
+        commands: Sequence[TaskCommand],
+        results: Sequence[ControlResult],
+    ) -> None:
+        with self._metadata_guard():
+            receipts = self.__dict__.setdefault("_task_submission_receipts", {})
+            for command, result in zip(commands, results):
+                submission_id = str(command.payload.get(
+                    CUSTOM_ORDER_SUBMISSION_ID_PAYLOAD_KEY
+                ) or "")
+                if command.area is TaskArea.CUSTOMIZATION and submission_id:
+                    receipts[submission_id] = TaskSubmissionReceipt(
+                        submission_id, str(command.order_no or ""), request_id, result,
+                    )
+
+    @staticmethod
+    def _decode_submission_response(
+        response: Mapping[str, Any], commands: Sequence[TaskCommand],
+    ) -> tuple[ControlResult, ...]:
+        raw = response.get("result")
+        result_type = response.get("result_type")
+        if result_type == "control_result" and len(commands) == 1:
+            raw_results = [raw]
+        elif result_type == "control_results" and isinstance(raw, list):
+            raw_results = raw
+        else:
+            raise ValueError("共享后台返回了无效的任务提交结果。")
+        if len(raw_results) != len(commands) or any(
+            not isinstance(value, Mapping)
+            or not isinstance(value.get("accepted"), bool)
+            for value in raw_results
+        ):
+            raise ValueError("共享后台返回的任务提交结果不完整。")
+        return tuple(decode_control_result(value) for value in raw_results)
+
     def _schedule_request_reconciliation(
         self,
         request_id: str,
@@ -1191,23 +1244,25 @@ class RemoteBackgroundTaskController:
                         continue
                     if state == "SUCCEEDED":
                         response = status.get("response")
+                        if not isinstance(response, Mapping):
+                            continue
                         if isinstance(response, Mapping):
                             self._advance_revision(response.get("revision"))
                             if submitted_commands:
-                                raw_result = response.get("result")
-                                result_type = str(response.get("result_type") or "")
-                                raw_results = (
-                                    list(raw_result)
-                                    if result_type == "control_results"
-                                    and isinstance(raw_result, list)
-                                    else [raw_result]
+                                try:
+                                    results = self._decode_submission_response(
+                                        response, submitted_commands,
+                                    )
+                                except (TypeError, ValueError):
+                                    continue
+                                self._record_task_submission_receipts(
+                                    request_id, submitted_commands, results,
                                 )
                                 with self._lock:
-                                    for command, encoded_result in zip(
+                                    for command, result in zip(
                                         submitted_commands,
-                                        raw_results,
+                                        results,
                                     ):
-                                        result = decode_control_result(encoded_result)
                                         if (
                                             result.accepted
                                             and result.task_id
@@ -1253,7 +1308,26 @@ class RemoteBackgroundTaskController:
                         "后台确认请求失败："
                         + str(status.get("error") or "未返回失败原因。")
                     )
-                    return
+                    if not submitted_commands:
+                        return
+                    # A failed RPC journal is not proof that no task entered
+                    # the queue before the exception. Keep submission guarded.
+                    break
+                unresolved = ControlResult(
+                    False,
+                    "提交结果待核对；尚未确认是否入队，请勿重复提交。",
+                    details={
+                        "request_id": request_id,
+                        "submission_outcome_unknown": True,
+                        "reconciliation_exhausted": True,
+                        "non_modal": True,
+                        "retry_suppressed": True,
+                    },
+                )
+                self._record_task_submission_receipts(
+                    request_id, submitted_commands,
+                    tuple(unresolved for _command in submitted_commands),
+                )
                 self._record_reconciled_request_message(
                     "后台请求结果仍未确认；请在任务或状态列表核对，勿重复操作。"
                 )
@@ -1297,6 +1371,8 @@ class RemoteBackgroundTaskController:
 
     def _rpc(self, method: str, *args: Any, **kwargs: Any) -> Any:
         request_id = uuid4().hex
+        submitted_commands: tuple[TaskCommand, ...] = ()
+        request_sent = False
         batch_command_count = (
             len(args[0])
             if method == "submit_tasks"
@@ -1351,7 +1427,6 @@ class RemoteBackgroundTaskController:
                 )
                 if fallback_error is not None:
                     return fallback_error
-                submitted_commands: tuple[TaskCommand, ...] = ()
                 if method == "submit_task" and args and isinstance(args[0], TaskCommand):
                     submitted_commands = (args[0],)
                 elif (
@@ -1480,6 +1555,7 @@ class RemoteBackgroundTaskController:
                 request_timeout = self._rpc_request_timeout(method, args)
                 if request_timeout is not None:
                     request_options["timeout"] = request_timeout
+                request_sent = True
                 payload = self._request(
                     "POST",
                     "/v1/rpc",
@@ -1488,8 +1564,19 @@ class RemoteBackgroundTaskController:
                 self._advance_revision(payload.get("revision"))
                 result_type = str(payload.get("result_type") or "json")
                 result = payload.get("result")
+                if submitted_commands:
+                    submission_results = self._decode_submission_response(
+                        payload, submitted_commands,
+                    )
+                    self._record_task_submission_receipts(
+                        request_id, submitted_commands, submission_results,
+                    )
                 if result_type == "control_result":
                     control_result = decode_control_result(result)
+                    if submitted_commands:
+                        control_result = replace(control_result, details={
+                            **dict(control_result.details), "request_id": request_id,
+                        })
                     if (
                         method == "submit_task"
                         and args
@@ -1537,7 +1624,11 @@ class RemoteBackgroundTaskController:
                     if not isinstance(result, list):
                         raise TypeError("共享后台返回了无效的批量任务结果。")
                     control_results = tuple(
-                        decode_control_result(value) for value in result
+                        replace(decoded, details={
+                            **dict(decoded.details), "request_id": request_id,
+                        })
+                        for value in result
+                        for decoded in (decode_control_result(value),)
                     )
                     if len(control_results) != len(submitted_commands):
                         raise ValueError("共享后台返回的批量任务数量不一致。")
@@ -1584,7 +1675,14 @@ class RemoteBackgroundTaskController:
                 while cause is not None and not read_timed_out:
                     read_timed_out = isinstance(cause, httpx.ReadTimeout)
                     cause = cause.__cause__
-                if method in MUTATION_METHODS and read_timed_out:
+                if method in MUTATION_METHODS and (
+                    read_timed_out
+                    or (
+                        submitted_commands
+                        and request_sent
+                        and isinstance(exc, (TypeError, ValueError))
+                    )
+                ):
                     self._schedule_request_reconciliation(
                         request_id,
                         method,

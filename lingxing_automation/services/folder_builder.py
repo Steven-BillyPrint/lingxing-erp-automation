@@ -1044,18 +1044,27 @@ def _frame_component(
 
 
 def _wall_only_text(kind: str, quantity: int, pairs: dict[str, str]) -> list[str]:
-    """独立墙体 ASIN 按数量生成全高/半高墙面片段，可能因双面打印限制拆分为多段。"""
+    """先校验独立墙体的单件印刷配置，再乘当前订单行的购买数量。"""
     double_value = pairs.get(TITLE_DOUBLE_SIDE)
-    base_text = f"{quantity}全高背墙" if kind == "full_wall" else f"{quantity}半高侧墙"
-    components = _apply_double_side_wall_counts(
+    # 独立墙体每件只有一面墙；“1 Half Wall”是单件配置，不是整行双面数量。
+    # 必须在放大购买数量前校验，避免把多买的双面墙错误拆成剩余单面墙。
+    base_text = "1全高背墙" if kind == "full_wall" else "1半高侧墙"
+    unit_components = _apply_double_side_wall_counts(
         (WallRuleComponent(kind=kind, text=base_text),),
         double_value,
     )
-    if kind == "full_wall":
-        # B0D6KZ7G88 是单卖 3x3m 帐篷全围，不包含帐篷顶；
-        # 文件夹名要直接说明“3x3m帐篷的全高背墙”，并按双面数量拆分。
-        return [f"{component[0]}个3x3m帐篷的{component[1:]}" for component in components]
-    return components
+    result: list[str] = []
+    for component in unit_components:
+        match = re.fullmatch(r"(\d+)(.+)", component)
+        assert match is not None
+        count = int(match.group(1)) * quantity
+        suffix = match.group(2)
+        if kind == "full_wall":
+            # B0D6KZ7G88 是单卖 3x3m 全墙；保留完整数量，不能只取首位数字。
+            result.append(f"{count}个3x3m帐篷的{suffix}")
+        else:
+            result.append(f"{count}{suffix}")
+    return result
 
 
 def _is_expedited_order(

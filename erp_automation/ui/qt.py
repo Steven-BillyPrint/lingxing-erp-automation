@@ -7,8 +7,11 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from time import monotonic
 from uuid import uuid4
 
+from erp_automation.contracts.controller import TaskSubmissionReceipt
+from erp_automation.contracts.models import CUSTOM_ORDER_SUBMISSION_ID_PAYLOAD_KEY
 from erp_automation.coordination.remote_controller import (
     CoordinationClientUpdateRequired,
 )
@@ -32,6 +35,7 @@ from shipment_automation.notification_queue import (
 )
 
 from .controller import BackgroundTaskController, ControlResult
+from .custom_order_submission import CustomOrderSubmission
 from .models import (
     Capability,
     CapabilityMode,
@@ -464,6 +468,13 @@ _CUSTOM_WORKFLOW_STATUS_ORDER = (
     "已忽略",
 )
 _CUSTOM_WORKFLOW_STATUS_LABELS = {
+    "submission_check_pending": "提交结果待核对",
+    "task_check_pending": "任务状态待核对",
+    "package_split_review": "拆包待复核",
+    "manual_review": "待人工复核",
+    "task_succeeded": "本次任务已完成",
+    "failed": "本次任务失败",
+    "paused": "已暂停",
     "processing": "正在处理",
     "waiting": "等待处理",
     "product_identity_pending": "等待 ASIN 同步",
@@ -3288,8 +3299,14 @@ if PYSIDE6_AVAILABLE:
             self._last_page_sync_at: datetime | None = None
             self._active_page_task_ids: tuple[str, ...] = ()
             self._optimistic_waiting_order_nos: set[str] = set()
+            self._order_submissions: dict[str, CustomOrderSubmission] = {}
+            self._latest_submission_tasks: tuple[TaskRecord, ...] = ()
+            self._submission_check_timer = QTimer(self)
+            self._submission_check_timer.setInterval(1000)
+            self._submission_check_timer.timeout.connect(self._refresh_submission_states)
             self._row_index_by_order_no: dict[str, int] = {}
             self._submission_thread: _ControlResultThread | None = None
+            self._submission_generation = 0
             self._server_pagination_enabled = False
             self._server_page_loader = _QueuePageRequestCoordinator(
                 self,
@@ -3652,10 +3669,11 @@ if PYSIDE6_AVAILABLE:
                     details={"non_modal": True},
                 ))
                 return
+            guarded_order_nos = self._optimistic_waiting_order_nos | self._active_order_nos
             unconfirmed_rows = tuple(
                 row
                 for row in rows
-                if row.platform_order_no in self._optimistic_waiting_order_nos
+                if row.platform_order_no in guarded_order_nos
             )
             if unconfirmed_rows:
                 self._clear_checked_orders(
@@ -3665,14 +3683,14 @@ if PYSIDE6_AVAILABLE:
                     row
                     for row in rows
                     if row.platform_order_no
-                    not in self._optimistic_waiting_order_nos
+                    not in guarded_order_nos
                 ]
             if not rows:
                 self._result_handler(
                     ControlResult(
                         False,
                         (
-                            "所选定制订单正在等待服务器确认，请勿重复提交。"
+                            "所选定制订单已有处理任务或提交结果待核对，请勿重复提交。"
                             if unconfirmed_rows
                             else "请先勾选至少一张定制订单。"
                         ),
@@ -3683,12 +3701,22 @@ if PYSIDE6_AVAILABLE:
             if self._review_enabled and not self._confirm_processing_review(rows):
                 return
             selected_rows = tuple(rows)
+            self._submission_generation += 1
+            submission_generation = self._submission_generation
             selected_order_nos = {
                 row.platform_order_no for row in selected_rows
             }
             # Re-sort the complete filtered queue before slicing the first
             # page so newly submitted rows become visible at the front.
             self._optimistic_waiting_order_nos.update(selected_order_nos)
+            submission_ids = {order_no: uuid4().hex for order_no in selected_order_nos}
+            for order_no, submission_id in submission_ids.items():
+                self._order_submissions[order_no] = CustomOrderSubmission(
+                    submission_id, order_no, monotonic(),
+                )
+            self._submission_check_timer.start()
+            self._update_active_order_cells(selected_order_nos)
+            self._refresh_visible_row_caches()
             self._apply_status_filter()
             self.process_button.setEnabled(False)
             self.process_button.setText(f"正在提交 {len(selected_rows)} 张…")
@@ -3702,16 +3730,24 @@ if PYSIDE6_AVAILABLE:
                 )
             ):
                 thread = _ControlResultThread(
-                    lambda selected=selected_rows: self._submit_checked_order_batch(selected),
+                    lambda selected=selected_rows, ids=submission_ids: (
+                        self._submit_checked_order_batch(selected, ids)
+                    ),
                     self,
                 )
-                thread.result_ready.connect(self._finish_checked_order_submission)
+                thread.result_ready.connect(
+                    lambda result, generation=submission_generation: (
+                        self._finish_checked_order_submission(result, generation)
+                    ),
+                    Qt.ConnectionType.QueuedConnection,
+                )
                 thread.finished.connect(thread.deleteLater)
                 self._submission_thread = thread
                 thread.start()
                 return
             self._finish_checked_order_submission(
-                self._submit_checked_order_batch(selected_rows)
+                self._submit_checked_order_batch(selected_rows, submission_ids),
+                submission_generation,
             )
 
         def _confirm_processing_review(
@@ -3736,6 +3772,7 @@ if PYSIDE6_AVAILABLE:
         def _submit_checked_order_batch(
             self,
             rows: Sequence[CustomOrderRow],
+            submission_ids: Mapping[str, str],
         ) -> ControlResult:
             accepted_rows: list[CustomOrderRow] = []
             accepted_task_ids_by_order_no: dict[str, str] = {}
@@ -3759,6 +3796,9 @@ if PYSIDE6_AVAILABLE:
                         order_no=row.platform_order_no,
                         payload={
                             "system_order_no": row.system_order_no,
+                            CUSTOM_ORDER_SUBMISSION_ID_PAYLOAD_KEY: (
+                                submission_ids[row.platform_order_no]
+                            ),
                             DESKTOP_CONFIRMATION_PAYLOAD_KEY: confirmation.to_payload(),
                         },
                     )
@@ -3846,6 +3886,10 @@ if PYSIDE6_AVAILABLE:
                 message,
                 first_task_id,
                 details={
+                    "submission_results": tuple(
+                        (row.platform_order_no, submission_ids[row.platform_order_no], result)
+                        for row, result in zip(rows, results)
+                    ),
                     "accepted_order_nos": tuple(
                         row.platform_order_no for row in accepted_rows
                     ),
@@ -3864,19 +3908,27 @@ if PYSIDE6_AVAILABLE:
                 },
             )
 
-        def _finish_checked_order_submission(self, result: ControlResult) -> None:
+        def _finish_checked_order_submission(
+            self, result: ControlResult, generation: int | None = None,
+        ) -> None:
+            if generation is not None and generation != self._submission_generation:
+                return
             self._submission_thread = None
             self.process_button.setText("处理勾选订单")
             accepted_order_nos = tuple(
                 result.details.get("accepted_order_nos") or ()
             )
-            self._optimistic_waiting_order_nos.difference_update(
-                str(order_no) for order_no in result.details.get("accepted_order_nos", ())
-            )
-            self._optimistic_waiting_order_nos.difference_update(
-                str(order_no)
-                for order_no, _reason in result.details.get("rejected_orders", ())
-            )
+            for order_no, submission_id, submission_result in result.details.get(
+                "submission_results", ()
+            ):
+                pending = self._order_submissions.get(order_no)
+                if pending is not None:
+                    pending.apply_receipt(TaskSubmissionReceipt(
+                        submission_id, order_no,
+                        str(submission_result.details.get("request_id") or ""),
+                        submission_result,
+                    ), now=monotonic())
+            self._refresh_submission_states(render=False)
             unconfirmed_order_nos = tuple(
                 str(order_no)
                 for order_no in result.details.get("unconfirmed_order_nos", ())
@@ -3885,8 +3937,14 @@ if PYSIDE6_AVAILABLE:
                 result.details.get("accepted_task_ids_by_order_no") or ()
             )
             for order_no, task_id in accepted_task_ids_by_order_no.items():
-                self._active_order_nos.add(str(order_no))
-                self._active_task_ids_by_order_no[str(order_no)] = (str(task_id),)
+                pending = self._order_submissions.get(str(order_no))
+                if (
+                    pending is not None
+                    and pending.awaiting_task
+                    and pending.task_id == str(task_id)
+                ):
+                    self._active_order_nos.add(str(order_no))
+                    self._active_task_ids_by_order_no[str(order_no)] = (str(task_id),)
             if accepted_order_nos or unconfirmed_order_nos:
                 self._clear_checked_orders(
                     (*accepted_order_nos, *unconfirmed_order_nos)
@@ -3915,6 +3973,8 @@ if PYSIDE6_AVAILABLE:
                     f"已排队 {len(accepted_order_nos)} 张，未排队 {len(rejected)} 张。\n\n"
                     f"{rejected_preview}",
                 )
+            self._update_active_order_cells(set(self._order_submissions))
+            self._refresh_visible_row_caches()
             self._apply_status_filter()
             self._result_handler(result)
 
@@ -4007,19 +4067,9 @@ if PYSIDE6_AVAILABLE:
             active = self._active_tasks_by_order_no.get(row.platform_order_no, ())
             return (
                 max(active, key=lambda task: task.updated_at) if active
-                else self._terminal_tasks_pending_refresh.get(row.platform_order_no)
+                else self._submission_terminal_task(row)
+                or self._terminal_tasks_pending_refresh.get(row.platform_order_no)
             )
-
-        def _row_detail(self, row: CustomOrderRow) -> str:
-            task = self._display_task(row)
-            if task is not None:
-                suffix = "；订单资料同步中。" if task.status.terminal else ""
-                return f"{task.status.label} · {task.progress_percent}% · {task.message}{suffix}"
-            if row.platform_order_no in self._active_order_nos:
-                return "已加入处理队列，等待后台任务更新。"
-            if row.platform_order_no in self._optimistic_waiting_order_nos:
-                return "正在提交本批订单，等待服务器确认排队。"
-            return row.last_error or row.result_detail
 
         def _row_stage(self, row: CustomOrderRow) -> str:
             return (
@@ -4030,6 +4080,127 @@ if PYSIDE6_AVAILABLE:
         def _row_status_time(self, row: CustomOrderRow) -> str:
             task = self._display_task(row)
             return _format_status_timestamp(task.updated_at if task else row.status_updated_at)
+
+        def _refresh_submission_states(self, *, render: bool = True) -> set[str]:
+            """Consume transport receipts on the UI thread, without RPC calls."""
+
+            changed: set[str] = set()
+            take_receipts = getattr(self._controller, "take_task_submission_receipts", None)
+            if callable(take_receipts):
+                receipts = take_receipts(tuple(
+                    pending.submission_id for pending in self._order_submissions.values()
+                ))
+                for receipt in receipts:
+                    pending = self._order_submissions.get(receipt.order_no)
+                    if pending is not None and pending.apply_receipt(
+                        receipt, now=monotonic(),
+                    ):
+                        changed.add(pending.order_no)
+            tasks_by_order: dict[str, list[TaskRecord]] = {}
+            for task in self._latest_submission_tasks:
+                tasks_by_order.setdefault(str(task.order_no or ""), []).append(task)
+            for order_no, pending in self._order_submissions.items():
+                for task in tasks_by_order.get(order_no, ()):
+                    if pending.observe_task(task):
+                        changed.add(order_no)
+                if pending.expire(monotonic()):
+                    changed.add(order_no)
+                if pending.task is not None:
+                    remaining = tuple(
+                        task for task in self._active_tasks_by_order_no.get(order_no, ())
+                        if task.task_id != pending.task_id
+                    )
+                    if not pending.task.status.terminal:
+                        remaining = (*remaining, pending.task)
+                    if remaining:
+                        self._active_tasks_by_order_no[order_no] = remaining
+                        self._active_task_ids_by_order_no[order_no] = tuple(
+                            task.task_id for task in remaining
+                        )
+                    else:
+                        self._active_tasks_by_order_no.pop(order_no, None)
+                        self._active_task_ids_by_order_no.pop(order_no, None)
+                elif pending.awaiting_task:
+                    self._active_task_ids_by_order_no[order_no] = (pending.task_id,)
+            self._optimistic_waiting_order_nos = {
+                order_no for order_no, pending in self._order_submissions.items()
+                if pending.awaiting_ack
+            }
+            self._active_order_nos = set(self._active_task_ids_by_order_no)
+            if not any(
+                pending.awaiting_ack or pending.awaiting_task
+                for pending in self._order_submissions.values()
+            ):
+                self._submission_check_timer.stop()
+            if render and changed:
+                self._update_active_order_cells(changed)
+                self._refresh_visible_row_caches()
+                if not self._server_pagination_enabled:
+                    self._apply_status_filter(reset_page=False)
+            return changed
+
+        def _submission_terminal_task(self, row: CustomOrderRow) -> TaskRecord | None:
+            pending = self._order_submissions.get(row.platform_order_no)
+            task = pending.task if pending else None
+            if task is None or not task.status.terminal:
+                return None
+            # A later server-side stage/manual correction supersedes this task.
+            if _status_timestamp_value(row.status_updated_at) > task.updated_at.timestamp():
+                return None
+            return task
+
+        def _order_detail(self, row: CustomOrderRow) -> str:
+            order_no = row.platform_order_no
+            active_tasks = self._active_tasks_by_order_no.get(order_no, ())
+            if active_tasks:
+                task = max(active_tasks, key=lambda value: value.updated_at)
+                return f"{task.status.label} · {task.progress_percent}% · {task.message}"
+            pending = self._order_submissions.get(order_no)
+            if pending is not None and pending.awaiting_ack:
+                message = (
+                    "提交结果待核对；尚未确认是否入队，请勿重复提交。"
+                    if pending.check_required
+                    else "正在提交本批订单，等待服务器确认排队。"
+                )
+                return "\n".join(filter(None, (row.last_error, message)))
+            if pending is not None and pending.awaiting_task:
+                return (
+                    "已确认入队，任务状态待核对；请勿重复提交。"
+                    if pending.check_required
+                    else "已加入处理队列，等待后台任务更新。"
+                )
+            task = self._submission_terminal_task(row)
+            if task is not None:
+                return task.message or row.last_error or row.result_detail
+            terminal = self._terminal_tasks_pending_refresh.get(order_no)
+            if terminal is not None:
+                return (
+                    f"{terminal.status.label} · {terminal.progress_percent}% · "
+                    f"{terminal.message}；订单资料同步中。"
+                )
+            if order_no in self._active_order_nos:
+                return "已加入处理队列，等待后台任务更新。"
+            if (
+                pending is not None
+                and pending.task is None
+                and pending.result
+                and not pending.result.accepted
+            ):
+                return "\n".join(filter(None, (
+                    row.last_error, "提交未入队：" + pending.result.message,
+                )))
+            return row.last_error or row.result_detail
+
+        def _order_quick_select_eligibility(self, row: CustomOrderRow) -> tuple[bool, str]:
+            if (
+                self._submission_terminal_task(row) is not None
+                or row.platform_order_no in self._terminal_tasks_pending_refresh
+            ):
+                return False, "请核对本次任务结果后再处理"
+            return _custom_order_quick_select_eligibility(
+                row,
+                active_order_nos=self._active_order_nos | self._optimistic_waiting_order_nos,
+            )
 
         def _status_value(self, row: CustomOrderRow) -> str:
             active_tasks = self._active_tasks_by_order_no.get(
@@ -4046,10 +4217,22 @@ if PYSIDE6_AVAILABLE:
                 for task in active_tasks
             ):
                 return "processing"
-            if (
-                row.platform_order_no in self._active_order_nos
-                or row.platform_order_no in self._optimistic_waiting_order_nos
-            ):
+            if active_tasks:
+                return "waiting"
+            pending = self._order_submissions.get(row.platform_order_no)
+            if pending is not None and pending.awaiting_task:
+                return "task_check_pending" if pending.check_required else "waiting"
+            task = self._submission_terminal_task(row)
+            if row.retry_confirmation_required or (task and task.status is TaskStatus.BLOCKED):
+                return (
+                    "package_split_review" if row.workflow_stage == "package_split_pending"
+                    else "manual_review"
+                )
+            if pending is not None and pending.awaiting_ack:
+                return "submission_check_pending" if pending.check_required else "waiting"
+            if task is not None:
+                return "task_succeeded" if task.status is TaskStatus.SUCCEEDED else task.status.value
+            if row.platform_order_no in self._active_order_nos:
                 return "waiting"
             terminal = self._terminal_tasks_pending_refresh.get(row.platform_order_no)
             if terminal is not None:
@@ -4152,14 +4335,7 @@ if PYSIDE6_AVAILABLE:
             self._visible_pending_order_nos_cache = frozenset(
                 row.platform_order_no
                 for row in self._rows
-                if _custom_order_quick_select_eligibility(
-                    row,
-                    active_order_nos=(
-                        self._active_order_nos
-                        | self._optimistic_waiting_order_nos
-                        | set(self._terminal_tasks_pending_refresh)
-                    ),
-                )[0]
+                if self._order_quick_select_eligibility(row)[0]
             )
             self._checked_order_nos.intersection_update(self._visible_order_nos)
             self._update_quick_select_button()
@@ -4505,14 +4681,7 @@ if PYSIDE6_AVAILABLE:
             self._visible_pending_order_nos_cache = frozenset(
                 row.platform_order_no
                 for row in self._rows
-                if _custom_order_quick_select_eligibility(
-                    row,
-                    active_order_nos=(
-                        self._active_order_nos
-                        | self._optimistic_waiting_order_nos
-                        | set(self._terminal_tasks_pending_refresh)
-                    ),
-                )[0]
+                if self._order_quick_select_eligibility(row)[0]
             )
             self._checked_order_nos.intersection_update(self._visible_order_nos)
             self._update_quick_select_button()
@@ -4613,11 +4782,10 @@ if PYSIDE6_AVAILABLE:
                         6,
                         _readonly_item(self._row_status_time(row)),
                     )
-                    detail = self._row_detail(row)
                     self.table.setItem(
                         row_index,
                         7,
-                        _status_detail_item(detail),
+                        _status_detail_item(self._order_detail(row)),
                     )
                     self.table.setItem(
                         row_index,
@@ -4664,11 +4832,10 @@ if PYSIDE6_AVAILABLE:
                     )
                     self.table.setItem(row_index, 4, _workflow_status_item(self._row_stage(row)))
                     self.table.setItem(row_index, 6, _readonly_item(self._row_status_time(row)))
-                    detail = self._row_detail(row)
                     self.table.setItem(
                         row_index,
                         7,
-                        _status_detail_item(detail),
+                        _status_detail_item(self._order_detail(row)),
                     )
             finally:
                 self.table.blockSignals(previous)
@@ -4748,17 +4915,11 @@ if PYSIDE6_AVAILABLE:
             self._visible_pending_order_nos_cache = frozenset(
                 row.platform_order_no
                 for row in self._rows
-                if _custom_order_quick_select_eligibility(
-                    row,
-                    active_order_nos=(
-                        self._active_order_nos
-                        | self._optimistic_waiting_order_nos
-                        | set(self._terminal_tasks_pending_refresh)
-                    ),
-                )[0]
+                if self._order_quick_select_eligibility(row)[0]
             )
             self._checked_order_nos.intersection_update(self._visible_order_nos)
             self._update_quick_select_button()
+            self._update_selection_summary()
 
         def _target_orders(self) -> tuple[list[CustomOrderRow], bool]:
             checked_rows = self._checked_orders()
@@ -5090,7 +5251,13 @@ if PYSIDE6_AVAILABLE:
                 row.platform_order_no: self._status_value(row)
                 for row in self._all_rows
             }
-            previous_active_tasks = self._active_tasks_by_order_no
+            previous_active_tasks = dict(self._active_tasks_by_order_no)
+            previous_active_ids = dict(self._active_task_ids_by_order_no)
+            previous_submission_task_states = {
+                order_no: (pending.task.task_id, pending.task.status)
+                for order_no, pending in self._order_submissions.items()
+                if pending.task is not None
+            }
             next_rows = (
                 list(self._all_rows)
                 if server_pagination
@@ -5115,44 +5282,37 @@ if PYSIDE6_AVAILABLE:
                         task.task_id
                     )
                     active_tasks_by_order_no.setdefault(order_no, []).append(task)
-            next_active_task_ids_by_order_no = {
+            self._active_task_ids_by_order_no = {
                 order_no: tuple(task_ids)
                 for order_no, task_ids in active_task_ids_by_order_no.items()
             }
-            next_active_order_nos = set(next_active_task_ids_by_order_no)
-            confirmed_optimistic_order_nos = (
-                self._optimistic_waiting_order_nos & next_active_order_nos
-            )
-            self._optimistic_waiting_order_nos.difference_update(
-                confirmed_optimistic_order_nos
-            )
-            next_active_tasks_by_order_no = {
+            self._active_tasks_by_order_no = {
                 order_no: tuple(tasks)
                 for order_no, tasks in active_tasks_by_order_no.items()
             }
-            changed_order_nos = {
-                order_no
-                for order_no in set(previous_active_tasks) | set(next_active_tasks_by_order_no)
-                if previous_active_tasks.get(order_no)
-                != next_active_tasks_by_order_no.get(order_no)
-            }
-            changed_order_nos.update(confirmed_optimistic_order_nos)
+            self._latest_submission_tasks = tuple(
+                task for task in (*snapshot.tasks, *snapshot.today_tasks)
+                if task.area is TaskArea.CUSTOMIZATION
+            )
+            submission_changed_order_nos = self._refresh_submission_states(render=False)
+            next_active_task_ids_by_order_no = self._active_task_ids_by_order_no
+            next_active_tasks_by_order_no = self._active_tasks_by_order_no
             # Keep terminal task results visible until a page requested after
             # that transition returns. Progress must not depend on a slow page.
             if server_pagination:
-                for task in sorted(snapshot.tasks, key=lambda task: task.updated_at):
+                for task in sorted(self._latest_submission_tasks, key=lambda task: task.updated_at):
                     order_no = str(task.order_no or "").strip()
                     if (
                         task.area is TaskArea.CUSTOMIZATION
                         and task.status.terminal
                         and order_no in previous_active_tasks
-                        and order_no not in next_active_order_nos
+                        and order_no not in self._active_order_nos
                         and task.task_id in {
                             active.task_id for active in previous_active_tasks[order_no]
                         }
                     ):
                         self._terminal_tasks_pending_refresh[order_no] = task
-                for order_no in next_active_order_nos:
+                for order_no in self._active_order_nos:
                     self._terminal_tasks_pending_refresh.pop(order_no, None)
             else:
                 self._terminal_tasks_pending_refresh.clear()
@@ -5164,28 +5324,38 @@ if PYSIDE6_AVAILABLE:
                 order_no: tuple((task.task_id, task.status) for task in tasks)
                 for order_no, tasks in next_active_tasks_by_order_no.items()
             }
+            task_ordering_changed |= previous_active_ids != next_active_task_ids_by_order_no
+            task_ordering_changed |= previous_submission_task_states != {
+                order_no: (pending.task.task_id, pending.task.status)
+                for order_no, pending in self._order_submissions.items()
+                if pending.task is not None
+            }
             rows_changed = next_rows != self._all_rows
             active_changed = (
                 next_active_task_ids_by_order_no
-                != self._active_task_ids_by_order_no
-                or next_active_tasks_by_order_no != self._active_tasks_by_order_no
+                != previous_active_ids
+                or next_active_tasks_by_order_no != previous_active_tasks
                 or next_active_page_task_ids != self._active_page_task_ids
             )
             if (
                 not server_pagination
                 and not rows_changed
                 and not active_changed
-                and not confirmed_optimistic_order_nos
+                and not submission_changed_order_nos
             ):
                 return
-            self._active_order_nos = next_active_order_nos
-            self._active_task_ids_by_order_no = next_active_task_ids_by_order_no
-            self._active_tasks_by_order_no = next_active_tasks_by_order_no
             self._active_page_task_ids = next_active_page_task_ids
             if server_pagination:
+                changed_order_nos = {
+                    order_no
+                    for order_no in set(previous_active_tasks) | set(next_active_tasks_by_order_no)
+                    if previous_active_tasks.get(order_no) != next_active_tasks_by_order_no.get(order_no)
+                } | submission_changed_order_nos
                 self._checked_order_nos.difference_update(
                     self._terminal_tasks_pending_refresh
                 )
+                # Paint known task/receipt changes now, even if the paged read
+                # is slow or fails. Both rendering paths use _order_detail().
                 self._update_active_order_cells(changed_order_nos)
                 self._refresh_visible_row_caches()
                 self._refresh_visible_checkboxes()
@@ -5237,7 +5407,7 @@ if PYSIDE6_AVAILABLE:
                     if previous_active_tasks.get(order_no)
                     != next_active_tasks_by_order_no.get(order_no)
                 }
-                changed_order_nos.update(confirmed_optimistic_order_nos)
+                changed_order_nos.update(submission_changed_order_nos)
                 self._update_active_order_cells(changed_order_nos)
 
 

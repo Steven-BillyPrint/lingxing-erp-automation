@@ -6,12 +6,16 @@ from datetime import datetime, timedelta, timezone
 import os
 import threading
 import time
+from dataclasses import replace
+from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from erp_automation.client_version import CLIENT_VERSION
+from erp_automation.contracts.controller import TaskSubmissionReceipt
+from erp_automation.contracts.models import CUSTOM_ORDER_SUBMISSION_ID_PAYLOAD_KEY
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 pytest.importorskip("PySide6")
@@ -3630,6 +3634,294 @@ def test_process_batch_keeps_checks_when_all_submissions_fail(app, monkeypatch):
     page.deleteLater()
 
 
+def _unknown_submission_page(*order_nos):
+    unknown = ControlResult(False, "等待确认", details={
+        "request_id": "request-one", "submission_outcome_unknown": True,
+        "non_modal": True,
+    })
+    controller = RecordingController(task_results={order: unknown for order in order_nos})
+    receipts = {}
+    controller.take_task_submission_receipts = lambda ids: tuple(
+        receipts.pop(key) for key in ids if key in receipts
+    )
+    page = CustomOrdersPage(controller, lambda _result: None)
+    snapshot = _snapshot(*order_nos)
+    page.update_snapshot(snapshot)
+    page._check_header.check_state_changed.emit(Qt.CheckState.Checked.value)
+    page._process_checked_orders()
+    return page, controller, snapshot, receipts
+
+
+def _submission_receipt(page, order_no, result, request_id="request-one"):
+    pending = page._order_submissions[order_no]
+    return TaskSubmissionReceipt(pending.submission_id, order_no, request_id, result)
+
+
+@pytest.mark.parametrize("status", [
+    TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.CANCELLED,
+    TaskStatus.BLOCKED, TaskStatus.PAUSED,
+])
+@pytest.mark.parametrize("history_only", [False, True])
+def test_submission_direct_terminal_snapshot_clears_waiting(app, status, history_only):
+    order = "112-2429335-3197045"
+    page, controller, snapshot, _receipts = _unknown_submission_page(order)
+    task = TaskRecord(
+        "current-task", "处理定制订单", TaskArea.CUSTOMIZATION, Capability.UPDATE_CONTACT,
+        order_no=order, payload=controller.submitted_commands[0].payload,
+        status=status, message="拆单结果不明确，必须读回或人工核对。", progress_percent=100,
+    )
+    snapshot.custom_orders = [replace(
+        snapshot.custom_orders[0], workflow_stage="package_split_pending",
+        status_text="package_split_pending",
+        retry_confirmation_required=status is TaskStatus.BLOCKED,
+        last_error=task.message,
+    )]
+    snapshot.today_tasks = [task] if history_only else []
+    snapshot.tasks = [] if history_only else [task]
+    page.update_snapshot(snapshot)
+    assert page._optimistic_waiting_order_nos == set()
+    assert order not in page._active_order_nos
+    assert "等待" not in page.table.item(0, 5).text()
+    assert page.table.item(0, 7).text() == task.message
+    if status is TaskStatus.BLOCKED:
+        assert page.table.item(0, 5).text() == "拆包待复核"
+    # A stale nonterminal snapshot must not resurrect the task or its overlay.
+    snapshot.tasks = [replace(task, status=TaskStatus.QUEUED,
+                              updated_at=task.updated_at - timedelta(seconds=1))]
+    snapshot.today_tasks = []
+    page.update_snapshot(snapshot)
+    page._apply_status_filter()
+    assert "等待" not in page.table.item(0, 5).text()
+    assert len(controller.submitted_commands) == 1
+    page.deleteLater()
+
+
+def test_submission_old_task_does_not_acknowledge_new_attempt(app):
+    page, controller, snapshot, receipts = _unknown_submission_page("ORDER")
+    snapshot.tasks = [TaskRecord(
+        "old-task", "处理定制订单", TaskArea.CUSTOMIZATION, Capability.UPDATE_CONTACT,
+        order_no="ORDER", status=TaskStatus.BLOCKED,
+        payload={CUSTOM_ORDER_SUBMISSION_ID_PAYLOAD_KEY: "old-submission"},
+    )]
+    page.update_snapshot(snapshot)
+    assert page._optimistic_waiting_order_nos == {"ORDER"}
+    pending = page._order_submissions["ORDER"]
+    # A receipt for another RPC must not release the current duplicate guard.
+    receipts[pending.submission_id] = _submission_receipt(
+        page, "ORDER", ControlResult(False, "拒绝旧请求"), request_id="old-request",
+    )
+    page._refresh_submission_states()
+    assert page._optimistic_waiting_order_nos == {"ORDER"}
+    page.table.item(0, 0).setCheckState(Qt.CheckState.Checked)
+    page._process_checked_orders()
+    assert len(controller.submitted_commands) == 1
+    page.deleteLater()
+
+
+def test_submission_terminal_overlay_yields_to_newer_server_workflow(app):
+    page, controller, snapshot, _receipts = _unknown_submission_page("ORDER")
+    task = TaskRecord(
+        "task-one", "处理定制订单", TaskArea.CUSTOMIZATION, Capability.UPDATE_CONTACT,
+        order_no="ORDER", payload=controller.submitted_commands[0].payload,
+        status=TaskStatus.BLOCKED, message="旧的拆包复核原因",
+    )
+    snapshot.tasks = [task]
+    page.update_snapshot(snapshot)
+    snapshot.custom_orders = [replace(
+        snapshot.custom_orders[0], status_text="instruction_remark_pending",
+        workflow_stage="instruction_remark_pending", retry_confirmation_required=False,
+        status_updated_at=(task.updated_at + timedelta(seconds=5)).isoformat(),
+        result_detail="服务器已确认拆包完成，等待下一阶段", last_error="",
+    )]
+    page.update_snapshot(snapshot)
+    assert page.table.item(0, 5).text() == "说明书备注待处理"
+    assert page.table.item(0, 7).text() == snapshot.custom_orders[0].result_detail
+    assert page._visible_pending_order_nos() == {"ORDER"}
+    page.deleteLater()
+
+
+def test_submission_batch_receipts_are_applied_per_order(app):
+    page, controller, snapshot, receipts = _unknown_submission_page("ACCEPT", "REJECT", "UNKNOWN")
+    outcomes = {
+        "ACCEPT": ControlResult(True, "已入队", "accepted-task"),
+        "REJECT": ControlResult(False, "服务器明确拒绝，未创建任务"),
+        "UNKNOWN": ControlResult(False, "仍未确认", details={
+            "submission_outcome_unknown": True, "reconciliation_exhausted": True,
+        }),
+    }
+    for order, result in outcomes.items():
+        receipt = _submission_receipt(page, order, result)
+        receipts[receipt.submission_id] = receipt
+    page._refresh_submission_states()
+    assert page._optimistic_waiting_order_nos == {"UNKNOWN"}
+    assert page._active_order_nos == {"ACCEPT"}
+    assert "提交未入队" in page._order_detail(snapshot.custom_orders[1])
+    assert page._status_value(snapshot.custom_orders[2]) == "submission_check_pending"
+    # Empty/task-limited snapshots do not turn an acknowledged task into a retry.
+    page.update_snapshot(snapshot)
+    assert page._active_order_nos == {"ACCEPT"}
+    page._checked_order_nos = {"ACCEPT", "UNKNOWN"}
+    page._process_checked_orders()
+    assert len(controller.submitted_commands) == 3
+    # A later history-only task can be matched by returned task_id on old servers.
+    snapshot.today_tasks = [TaskRecord(
+        "accepted-task", "处理定制订单", TaskArea.CUSTOMIZATION, Capability.UPDATE_CONTACT,
+        order_no="ACCEPT", status=TaskStatus.FAILED, message="真实失败原因",
+    )]
+    page.update_snapshot(snapshot)
+    assert "ACCEPT" not in page._active_order_nos
+    assert page._order_detail(snapshot.custom_orders[0]) == "真实失败原因"
+    page.deleteLater()
+
+
+def test_submission_timeout_changes_text_but_keeps_duplicate_guard(app, monkeypatch):
+    page, controller, snapshot, _receipts = _unknown_submission_page("ORDER")
+    pending = page._order_submissions["ORDER"]
+    assert pending.request_id == "request-one"
+    monkeypatch.setattr(qt_module, "monotonic", lambda: pending.started_at + 121)
+    page._refresh_submission_states()
+    assert page.table.item(0, 5).text() == "提交结果待核对"
+    assert "请勿重复提交" in page.table.item(0, 7).text()
+    snapshot.custom_orders = [replace(
+        snapshot.custom_orders[0], workflow_stage="package_split_pending",
+        retry_confirmation_required=True, last_error="拆单结果不明确，必须读回或人工核对。",
+    )]
+    page.update_snapshot(snapshot)
+    assert page.table.item(0, 5).text() == "拆包待复核"
+    assert "拆单结果不明确" in page.table.item(0, 7).text()
+    assert "提交结果待核对" in page.table.item(0, 7).text()
+    page.table.item(0, 0).setCheckState(Qt.CheckState.Checked)
+    page._process_checked_orders()
+    assert len(controller.submitted_commands) == 1
+    page.deleteLater()
+
+
+def test_submission_late_acceptance_starts_a_new_task_status_check_window(app, monkeypatch):
+    page, _controller, snapshot, receipts = _unknown_submission_page("ORDER")
+    pending = page._order_submissions["ORDER"]
+    monkeypatch.setattr(qt_module, "monotonic", lambda: pending.started_at + 121)
+    page._refresh_submission_states()
+    assert pending.check_required
+    receipt = _submission_receipt(page, "ORDER", ControlResult(True, "已入队", "task-one"))
+    receipts[receipt.submission_id] = receipt
+    page._refresh_submission_states()
+    assert page.table.item(0, 5).text() == "等待处理"
+    assert page._optimistic_waiting_order_nos == set()
+    assert page._active_order_nos == {"ORDER"}
+    monkeypatch.setattr(qt_module, "monotonic", lambda: pending.started_at + 242)
+    page._refresh_submission_states()
+    assert page.table.item(0, 5).text() == "任务状态待核对"
+    assert "已确认入队" in page.table.item(0, 7).text()
+    page.deleteLater()
+
+
+def test_submission_old_batch_callback_does_not_clear_new_batch(app):
+    page, _controller, _snapshot_value, receipts = _unknown_submission_page("ORDER")
+    old_generation = page._submission_generation
+    old_submission = page._order_submissions["ORDER"]
+    rejected = _submission_receipt(page, "ORDER", ControlResult(False, "明确拒绝"))
+    receipts[rejected.submission_id] = rejected
+    page._refresh_submission_states()
+    page.table.item(0, 0).setCheckState(Qt.CheckState.Checked)
+    page._process_checked_orders()
+    current = page._order_submissions["ORDER"]
+    assert current.submission_id != old_submission.submission_id
+    page._finish_checked_order_submission(ControlResult(True, "旧回调", details={
+        "accepted_order_nos": ("ORDER",),
+        "accepted_task_ids_by_order_no": (("ORDER", "old-task"),),
+    }), old_generation)
+    assert page._optimistic_waiting_order_nos == {"ORDER"}
+    assert page._order_submissions["ORDER"] is current
+    assert "ORDER" not in page._active_order_nos
+    page.deleteLater()
+
+
+def test_submission_current_running_task_overrides_previous_business_error(app):
+    page, controller, snapshot, _receipts = _unknown_submission_page("ORDER")
+    snapshot.custom_orders = [replace(
+        snapshot.custom_orders[0], retry_confirmation_required=True,
+        workflow_stage="package_split_pending", last_error="旧的拆单复核原因",
+    )]
+    snapshot.tasks = [TaskRecord(
+        "new-task", "处理定制订单", TaskArea.CUSTOMIZATION, Capability.UPDATE_CONTACT,
+        order_no="ORDER", payload=controller.submitted_commands[0].payload,
+        status=TaskStatus.RUNNING, message="新的任务正在读取订单", progress_percent=10,
+    )]
+    page.update_snapshot(snapshot)
+    assert page.table.item(0, 5).text() == "正在处理"
+    assert "新的任务正在读取订单" in page.table.item(0, 7).text()
+    assert "旧的拆单" not in page.table.item(0, 7).text()
+    page.deleteLater()
+
+
+def test_submission_terminal_arrives_before_original_timeout_callback(app):
+    started = threading.Event()
+    release = threading.Event()
+    controller = RecordingController()
+    controller.control_calls_run_in_background = True
+
+    def submit(commands):
+        controller.submitted_commands.extend(commands)
+        started.set()
+        assert release.wait(3)
+        return tuple(ControlResult(False, "延迟的超时回调", details={
+            "request_id": "request-one", "submission_outcome_unknown": True,
+        }) for _command in commands)
+
+    controller.submit_tasks = submit
+    page = CustomOrdersPage(controller, lambda _result: None)
+    snapshot = _snapshot("ORDER")
+    page.update_snapshot(snapshot)
+    try:
+        page._check_header.check_state_changed.emit(Qt.CheckState.Checked.value)
+        page._process_checked_orders()
+        assert started.wait(1)
+        snapshot.tasks = [TaskRecord(
+            "fast-task", "处理定制订单", TaskArea.CUSTOMIZATION, Capability.UPDATE_CONTACT,
+            order_no="ORDER", payload=controller.submitted_commands[0].payload,
+            status=TaskStatus.BLOCKED, message="真实阻塞原因",
+        )]
+        page.update_snapshot(snapshot)
+        assert page._optimistic_waiting_order_nos == set()
+        release.set()
+        deadline = time.monotonic() + 2
+        while page._submission_thread is not None and time.monotonic() < deadline:
+            QTest.qWait(5)
+        assert page._submission_thread is None
+        assert page._optimistic_waiting_order_nos == set()
+        assert page.table.item(0, 7).text() == "真实阻塞原因"
+    finally:
+        release.set()
+        if page._submission_thread is not None:
+            page._submission_thread.wait(3000)
+        page.deleteLater()
+
+
+def test_submission_terminal_paints_before_paged_refresh_returns(app, monkeypatch):
+    page, controller, snapshot, _receipts = _unknown_submission_page("ORDER")
+    requests = []
+    # Hold the page request at the async boundary: only a task/history snapshot
+    # is available while the authoritative order page has not returned.
+    monkeypatch.setattr(page, "_load_server_page", lambda **kw: requests.append(kw))
+    snapshot.server_features = ("custom_order_pagination_v1",)
+    snapshot.custom_orders_summary = DatasetSummary(1, "revision-two")
+    snapshot.tasks = [TaskRecord(
+        "current-task", "处理定制订单", TaskArea.CUSTOMIZATION, Capability.UPDATE_CONTACT,
+        order_no="ORDER", payload=controller.submitted_commands[0].payload,
+        status=TaskStatus.BLOCKED, message="拆单结果不明确，必须读回或人工核对。",
+    )]
+    page.update_snapshot(snapshot)
+    assert requests
+    assert page._optimistic_waiting_order_nos == set()
+    assert page.table.item(0, 7).text() == snapshot.tasks[0].message
+    assert "等待" not in page.table.item(0, 5).text()
+    assert page._visible_pending_order_nos() == set()
+    # A subsequently rendered stale page uses the same task-aware display rules.
+    page._render_rows()
+    assert page.table.item(0, 7).text() == snapshot.tasks[0].message
+    page.deleteLater()
+
+
 def test_process_batch_timeout_stays_non_modal_until_snapshot_confirms(
     app,
     monkeypatch,
@@ -3693,6 +3985,10 @@ def test_process_batch_timeout_stays_non_modal_until_snapshot_confirms(
                     Capability.UPDATE_CONTACT,
                     status=TaskStatus.QUEUED,
                     order_no=order_no,
+                    payload=next(
+                        command.payload for command in controller.submitted_commands
+                        if command.order_no == order_no
+                    ),
                 )
                 for order_no in ("111-1", "112-2")
             ],
