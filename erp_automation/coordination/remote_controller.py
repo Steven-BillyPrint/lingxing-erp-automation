@@ -9,6 +9,7 @@ import os
 import re
 import socket
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from copy import deepcopy
@@ -27,6 +28,7 @@ from erp_automation.contracts.controller import ControlResult, TaskSubmissionRec
 from erp_automation.contracts.models import (
     Capability,
     CUSTOM_ORDER_SUBMISSION_ID_PAYLOAD_KEY,
+    SHIPMENT_SUBMISSION_ID_PAYLOAD_KEY,
     CustomOrderPage,
     DESKTOP_INSTANCE_ID_PAYLOAD_KEY,
     DesktopInteractionRequest,
@@ -647,6 +649,7 @@ class RemoteBackgroundTaskController:
         return snapshot
 
     def snapshot(self) -> DesktopSnapshot:
+        self._resume_submission_reconciliations()
         with self._lock:
             try:
                 if bool(getattr(self, "_startup_snapshot_pending", False)):
@@ -1141,6 +1144,7 @@ class RemoteBackgroundTaskController:
     ) -> tuple[TaskSubmissionReceipt, ...]:
         """Drain only requested UI attempts; never perform network I/O here."""
 
+        self._resume_submission_reconciliations()
         with self._metadata_guard():
             receipts = self.__dict__.setdefault("_task_submission_receipts", {})
             return tuple(
@@ -1158,12 +1162,17 @@ class RemoteBackgroundTaskController:
         with self._metadata_guard():
             receipts = self.__dict__.setdefault("_task_submission_receipts", {})
             for command, result in zip(commands, results):
+                key = (
+                    SHIPMENT_SUBMISSION_ID_PAYLOAD_KEY if command.area is TaskArea.SHIPMENT
+                    else CUSTOM_ORDER_SUBMISSION_ID_PAYLOAD_KEY
+                )
                 submission_id = str(command.payload.get(
-                    CUSTOM_ORDER_SUBMISSION_ID_PAYLOAD_KEY
+                    key
                 ) or "")
-                if command.area is TaskArea.CUSTOMIZATION and submission_id:
+                if command.area in {TaskArea.CUSTOMIZATION, TaskArea.SHIPMENT} and submission_id:
                     receipts[submission_id] = TaskSubmissionReceipt(
                         submission_id, str(command.order_no or ""), request_id, result,
+                        str(command.payload.get("logistics_no") or ""),
                     )
 
     @staticmethod
@@ -1185,6 +1194,24 @@ class RemoteBackgroundTaskController:
         ):
             raise ValueError("共享后台返回的任务提交结果不完整。")
         return tuple(decode_control_result(value) for value in raw_results)
+
+    def _resume_submission_reconciliations(self) -> None:
+        # The UI timer and snapshot polling only schedule bounded background
+        # reads. Keep the original request identity across a long outage.
+        with self._metadata_guard():
+            due = tuple(
+                (request_id, context)
+                for request_id, context in self.__dict__.get("_unresolved_submission_reconciliations", {}).items()
+                if context["retry_at"] <= time.monotonic()
+                and request_id not in self.__dict__.get("_pending_request_ids", set())
+            )
+        for request_id, context in due:
+            self._schedule_request_reconciliation(
+                request_id, context["method"],
+                submitted_commands=context["commands"],
+                request_fingerprint=context["fingerprint"],
+                success_handler=context["success_handler"],
+            )
 
     def _schedule_request_reconciliation(
         self,
@@ -1209,6 +1236,7 @@ class RemoteBackgroundTaskController:
                 )[request_fingerprint] = request_id
 
         def reconcile() -> None:
+            keep_pending = False
             stop_event = self.__dict__.get("_request_reconciliation_stop")
             if stop_event is None:
                 stop_event = threading.Event()
@@ -1295,9 +1323,11 @@ class RemoteBackgroundTaskController:
                                 self._record_reconciled_request_message(
                                     "后台已确认执行结果：" + result.message
                                 )
-                            elif result_type == "control_results":
+                            elif result_type == "control_results" and submitted_commands:
+                                accepted_count = sum(result.accepted for result in results)
                                 self._record_reconciled_request_message(
-                                    "后台已确认批量请求执行完成；任务列表将自动刷新。"
+                                    f"后台已确认批量提交：{accepted_count} 张已入队、"
+                                    f"{len(results) - accepted_count} 张拒绝；请查看对应订单行。"
                                 )
                             else:
                                 self._record_reconciled_request_message(
@@ -1328,6 +1358,14 @@ class RemoteBackgroundTaskController:
                     request_id, submitted_commands,
                     tuple(unresolved for _command in submitted_commands),
                 )
+                if submitted_commands:
+                    keep_pending = True
+                    with self._metadata_guard():
+                        self.__dict__.setdefault("_unresolved_submission_reconciliations", {})[request_id] = {
+                            "method": method, "commands": tuple(submitted_commands),
+                            "fingerprint": request_fingerprint, "success_handler": success_handler,
+                            "retry_at": time.monotonic() + 30.0,
+                        }
                 self._record_reconciled_request_message(
                     "后台请求结果仍未确认；请在任务或状态列表核对，勿重复操作。"
                 )
@@ -1341,8 +1379,10 @@ class RemoteBackgroundTaskController:
                         "_pending_mutation_fingerprints",
                         {},
                     )
-                    if fingerprints.get(request_fingerprint) == request_id:
-                        fingerprints.pop(request_fingerprint, None)
+                    if not keep_pending:
+                        self.__dict__.setdefault("_unresolved_submission_reconciliations", {}).pop(request_id, None)
+                        if fingerprints.get(request_fingerprint) == request_id:
+                            fingerprints.pop(request_fingerprint, None)
 
         pool = self.__dict__.get("_request_reconciliation_pool")
         if pool is None:

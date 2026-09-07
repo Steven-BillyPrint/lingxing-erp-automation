@@ -19,6 +19,8 @@ from erp_automation.coordination.remote_controller import (
     CoordinationReadTimeout, RemoteBackgroundTaskController,
 )
 from erp_automation.ui.custom_order_submission import CustomOrderSubmission
+from erp_automation.ui.custom_order_submission import ShipmentSubmission
+from erp_automation.contracts.models import SHIPMENT_SUBMISSION_ID_PAYLOAD_KEY
 
 
 def _command(order="ORDER", submission_id="attempt-one"):
@@ -64,6 +66,83 @@ def _response(*results):
         "revision": 7, "result_type": "control_results",
         "result": [to_jsonable(result) for result in results],
     }}
+
+
+@pytest.mark.parametrize("capability", [Capability.OUTBOUND_ORDER, Capability.REMARK_SHIPMENT])
+@pytest.mark.parametrize("accepted_count", [0, 18])
+def test_shipment_mixed_batch_receipts_after_timeout(capability, accepted_count):
+    results = tuple(
+        ControlResult(True, "已入队", f"task-{i}") if i < accepted_count
+        else ControlResult(False, "需复核", "old-custom-task", details={"manual_review_lock": True})
+        for i in range(19)
+    )
+    client, operations, calls = _client(_response(*results))
+    commands = tuple(TaskCommand(
+        "标发", TaskArea.SHIPMENT, capability, order_no=f"ORDER-{i}",
+        payload={"logistics_no": f"ALS-{i}", SHIPMENT_SUBMISSION_ID_PAYLOAD_KEY: f"batch:{i}"},
+    ) for i in range(19))
+    initial = client.submit_tasks(commands)
+    assert all(r.details["submission_outcome_unknown"] for r in initial)
+    operations.pop()()
+    receipts = client.take_task_submission_receipts(tuple(f"batch:{i}" for i in range(19)))
+    assert len(receipts) == 19
+    for i, receipt in enumerate(receipts):
+        pending = ShipmentSubmission(f"batch:{i}", f"ORDER-{i}", 0, logistics_no=f"ALS-{i}")
+        assert pending.apply_receipt(receipt)
+        assert not pending.awaiting_ack
+        assert pending.awaiting_task == (i < accepted_count)
+        if i >= accepted_count:
+            assert pending.task_id == ""  # Historical lock task is not a new shipment.
+    assert f"{accepted_count} 张已入队、{19-accepted_count} 张拒绝" in client._take_reconciled_request_message()
+    assert sum(path == "/v1/rpc" for path, _ in calls) == 1
+
+
+def test_shipment_reconciliation_resumes_after_long_outage_without_resubmitting():
+    response = {"state": "RUNNING"}
+    client, operations, calls = _client(response)
+    command = TaskCommand(
+        "标发", TaskArea.SHIPMENT, Capability.OUTBOUND_ORDER, order_no="ORDER",
+        payload={"logistics_no": "ALS", SHIPMENT_SUBMISSION_ID_PAYLOAD_KEY: "attempt"},
+    )
+    result, = client.submit_tasks((command,))
+    request_id = result.details["request_id"]
+    operations.pop()()
+    unresolved, = client.take_task_submission_receipts(("attempt",))
+    assert unresolved.result.details["reconciliation_exhausted"]
+    blocked, = client.submit_tasks((command,))
+    assert blocked.details["retry_suppressed"]
+    response.clear()
+    response.update(_response(ControlResult(False, "复核锁", "old-task")))
+    client._unresolved_submission_reconciliations[request_id]["retry_at"] = 0
+    assert client.take_task_submission_receipts(("attempt",)) == ()
+    assert len(operations) == 1
+    operations.pop()()
+    final, = client.take_task_submission_receipts(("attempt",))
+    assert final.request_id == request_id
+    assert final.result.message == "复核锁"
+    assert not client._unresolved_submission_reconciliations
+    assert not client._pending_mutation_fingerprints
+    assert sum(path == "/v1/rpc" for path, _ in calls) == 1
+    assert {payload["request_id"] for path, payload in calls if path.endswith("/status")} == {request_id}
+
+
+def test_shipment_attempt_ignores_old_task_wrong_parcel_and_late_unknown():
+    pending = ShipmentSubmission("new", "ORDER", 0, logistics_no="ALS")
+    task = TaskRecord(
+        "finished", "标发", TaskArea.SHIPMENT, Capability.OUTBOUND_ORDER,
+        order_no="ORDER", status=TaskStatus.SUCCEEDED, progress_percent=100,
+        payload={"logistics_no": "ALS", SHIPMENT_SUBMISSION_ID_PAYLOAD_KEY: "new"},
+    )
+    assert not pending.observe_task(replace(task, payload={"logistics_no": "ALS"}))
+    assert not pending.observe_task(replace(task, area=TaskArea.CUSTOMIZATION))
+    assert not pending.observe_task(replace(task, payload={**task.payload, "logistics_no": "OTHER"}))
+    assert not pending.apply_receipt(TaskSubmissionReceipt("new", "ORDER", "r", ControlResult(True, "入队"), "OTHER"))
+    assert pending.observe_task(task)
+    assert not pending.awaiting_ack and not pending.awaiting_task
+    assert not pending.apply_receipt(TaskSubmissionReceipt(
+        "new", "ORDER", "r", ControlResult(False, "超时", details={"submission_outcome_unknown": True}), "ALS",
+    ))
+    assert not pending.observe_task(replace(task, status=TaskStatus.QUEUED))
 
 
 def test_timeout_receipts_keep_per_order_outcomes_and_original_request_id():

@@ -765,6 +765,7 @@ class CoordinatedControllerService:
         self._global_capability_modes: dict[Any, Any] = {}
         self._global_emergency_stop: bool | None = None
         self.store = store
+        self._configure_shipment_review_projection(controller)
         self.store.reset_instance_execution_pauses()
         self._global_emergency_stop = self.store.emergency_stop_writes()
         self.settings = settings or CoordinationSettings()
@@ -1120,6 +1121,11 @@ class CoordinatedControllerService:
                 self._task_owners.pop(task_id, None)
                 self._task_controllers.pop(task_id, None)
 
+    def _configure_shipment_review_projection(self, controller: BackgroundTaskController | None) -> None:
+        setter = getattr(controller, "set_shipment_review_lock_provider", None)
+        if callable(setter):
+            setter(self.store.order_review_locks)
+
     def _controller_for(
         self,
         identity: OperatorIdentity | None,
@@ -1140,6 +1146,7 @@ class CoordinatedControllerService:
                 controller = self._operator_controllers.get(key)
                 if controller is None:
                     controller = self._controller_factory(identity)
+                    self._configure_shipment_review_projection(controller)
                     summary_reader = getattr(controller, "summary_snapshot", None)
                     policy = (
                         summary_reader()
@@ -1628,6 +1635,7 @@ class CoordinatedControllerService:
                             _manual_review_resources_for_task(task),
                             task_id=task_id,
                             reason=task.message,
+                            source_area=task.area.value,
                         )
                     # Keep tracking metadata until the monitor records follow-up
                     # terminal state, but release the scheduler/business lease as
@@ -2401,7 +2409,7 @@ class CoordinatedControllerService:
     ) -> None:
         reader = getattr(controller, "coordination_state_token", None)
         token = reader() if callable(reader) else controller.snapshot()
-        fingerprint = self._fingerprint(token)
+        fingerprint = self._fingerprint((token, self.store.order_review_locks()))
         # Never acquire the controller lock while holding the coordination lock.
         with self._snapshot_lock:
             previous = self._last_snapshot_fingerprints.get(key)
@@ -3640,6 +3648,7 @@ class CoordinatedControllerService:
                                 _manual_review_resources_for_task(task),
                                 task_id=task_id,
                                 reason=task.message,
+                                source_area=task.area.value,
                             )
                         self.store.release_task(task_id)
                         self._tracked_tasks.discard(task_id)

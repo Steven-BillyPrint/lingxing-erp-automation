@@ -11,7 +11,7 @@ from time import monotonic
 from uuid import uuid4
 
 from erp_automation.contracts.controller import TaskSubmissionReceipt
-from erp_automation.contracts.models import CUSTOM_ORDER_SUBMISSION_ID_PAYLOAD_KEY
+from erp_automation.contracts.models import CUSTOM_ORDER_SUBMISSION_ID_PAYLOAD_KEY, SHIPMENT_SUBMISSION_ID_PAYLOAD_KEY
 from erp_automation.coordination.remote_controller import (
     CoordinationClientUpdateRequired,
 )
@@ -35,7 +35,7 @@ from shipment_automation.notification_queue import (
 )
 
 from .controller import BackgroundTaskController, ControlResult
-from .custom_order_submission import CustomOrderSubmission
+from .custom_order_submission import CustomOrderSubmission, ShipmentSubmission
 from .models import (
     Capability,
     CapabilityMode,
@@ -777,6 +777,8 @@ def _format_status_timestamp(value: object) -> str:
 
 
 def _shipment_status_timestamp(row: ShipmentRow) -> str:
+    if row.manual_review_reason:
+        return row.manual_review_created_at
     if str(row.scan_issue_code or "").strip():
         return (
             row.scan_issue_state_changed_at
@@ -899,6 +901,11 @@ def _shipment_progress_label(row: ShipmentRow) -> str:
 
 
 def _shipment_business_status(row: ShipmentRow, *, now: datetime | None = None) -> str:
+    if row.manual_review_reason and (
+        str(row.erp_state).upper() != "DONE"
+        or str(row.re_mark_state).upper() not in {"", "COMPLETED", "CANCELLED"}
+    ):
+        return "标发需人工复核"
     if str(row.scan_issue_code or "").strip():
         scan_state = str(row.scan_issue_state or "ACTIVE").strip().upper()
         if scan_state == "MANUAL_REVIEW":
@@ -986,6 +993,8 @@ def _shipment_execution_eligibility(
     now: datetime | None = None,
 ) -> tuple[bool, str]:
     status = _shipment_business_status(row, now=now)
+    if row.manual_review_reason:
+        return False, "标发需人工复核"
     if str(row.scan_issue_code or "").strip():
         return False, "扫描错误记录不能执行标发"
     if row.logistics_no in (active_logistics_nos or set()):
@@ -1000,6 +1009,12 @@ def _shipment_execution_eligibility(
 
 
 def _shipment_status_explanation(row: ShipmentRow, status: str) -> str:
+    if row.manual_review_reason:
+        source = {"customization": "定制订单", "shipment": "自动标发"}.get(
+            row.manual_review_source, row.manual_review_source or "历史任务",
+        )
+        created = _format_status_timestamp(row.manual_review_created_at)
+        return f"人工复核锁 · {source} · {created}：{row.manual_review_reason}"
     if str(row.scan_issue_code or "").strip():
         original_error = str(
             row.last_error or "自动标发扫描字段错误，请检查领星订单数据。"
@@ -5131,6 +5146,7 @@ if PYSIDE6_AVAILABLE:
                     title="确认全部完成定制订单",
                     action_text=(
                         f"即将把 {len(rows)} 张定制订单的本地工作流标记为 completed。"
+                        "这不会解除外部写入未确认产生的人工复核锁；复核后须另行重开对应阶段。"
                         "当前阶段选择将被忽略："
                     ),
                 )
@@ -6058,6 +6074,11 @@ if PYSIDE6_AVAILABLE:
             self._active_logistics_nos: set[str] = set()
             self._optimistic_waiting_logistics_nos: set[str] = set()
             self._unconfirmed_logistics_nos: set[str] = set()
+            self._shipment_submissions: dict[str, ShipmentSubmission] = {}
+            self._latest_submission_tasks: tuple[TaskRecord, ...] = ()
+            self._submission_check_timer = QTimer(self)
+            self._submission_check_timer.setInterval(500)
+            self._submission_check_timer.timeout.connect(self._refresh_submission_states)
             self._active_task_ids_by_logistics_no: dict[str, tuple[str, ...]] = {}
             self._active_tasks_by_logistics_no: dict[
                 str,
@@ -6536,6 +6557,11 @@ if PYSIDE6_AVAILABLE:
                     result.details.get("changed_logistics_nos") or ()
                 )
                 if changed:
+                    if action.startswith("reopen:"):
+                        for logistics_no in changed:
+                            pending = self._shipment_submissions.get(logistics_no)
+                            if pending and not pending.awaiting_ack and not pending.awaiting_task:
+                                self._shipment_submissions.pop(logistics_no, None)
                     self._clear_checked_shipments(changed)
                 skipped = dict(result.details.get("skipped_reasons") or {})
                 if skipped:
@@ -6577,7 +6603,7 @@ if PYSIDE6_AVAILABLE:
             eligible_rows: list[ShipmentRow] = []
             skipped: list[tuple[ShipmentRow, str]] = []
             for row in rows:
-                eligible, reason = _shipment_execution_eligibility(
+                eligible, reason = self._execution_eligibility(
                     row,
                     active_logistics_nos=active_logistics_nos,
                 )
@@ -6596,6 +6622,9 @@ if PYSIDE6_AVAILABLE:
                 row
                 for row in rows
                 if row.scan_issue_code
+                or row.manual_review_reason
+                or self._submission_review_locked(row)
+                or row.logistics_no in self._active_logistics_nos
                 or _shipment_business_status(row) != "重新标发"
                 or int(row.re_mark_cycle_id or 0) <= 0
             ]
@@ -6646,6 +6675,7 @@ if PYSIDE6_AVAILABLE:
 
         def _submit_re_mark_rows(self, rows: Sequence[ShipmentRow]) -> None:
             batch_id = uuid4().hex
+            self._begin_shipment_submissions(rows, batch_id)
             self._submission_in_progress = True
             self._optimistic_waiting_logistics_nos.update(
                 row.logistics_no for row in rows if row.logistics_no
@@ -6674,6 +6704,7 @@ if PYSIDE6_AVAILABLE:
                                 "re_mark_cycle_id": int(row.re_mark_cycle_id),
                                 "shipment_batch_id": batch_id,
                                 "shipment_batch_position": position,
+                                SHIPMENT_SUBMISSION_ID_PAYLOAD_KEY: f"{batch_id}:{position}",
                                 DESKTOP_CONFIRMATION_PAYLOAD_KEY: confirmation.to_payload(),
                             },
                         )
@@ -6724,6 +6755,11 @@ if PYSIDE6_AVAILABLE:
                             row.logistics_no for row, _reason in unknown
                         ),
                         "submission_outcome_unknown": bool(unknown),
+                        "submission_receipts": tuple(
+                            TaskSubmissionReceipt(str(command.payload[SHIPMENT_SUBMISSION_ID_PAYLOAD_KEY]),
+                                row.platform_order_no, str(result.details.get("request_id") or ""), result, row.logistics_no)
+                            for row, command, result in zip(rows, commands, results)
+                        ),
                     },
                 )
 
@@ -6780,6 +6816,13 @@ if PYSIDE6_AVAILABLE:
                 )
                 return
             row = rows[0]
+            if (
+                row.logistics_no in self._active_logistics_nos
+                or row.manual_review_reason
+                or self._submission_review_locked(row)
+            ):
+                self._result_handler(ControlResult(False, "该订单仍在等待提交确认、执行或人工复核，暂不能再次标发。"))
+                return
             dialog = _ConfirmedShipmentTrackingDialog(row, self)
             if dialog.exec() != QDialog.DialogCode.Accepted:
                 return
@@ -6857,6 +6900,7 @@ if PYSIDE6_AVAILABLE:
             skipped: Sequence[tuple[ShipmentRow, str]] = (),
         ) -> None:
             batch_id = uuid4().hex
+            self._begin_shipment_submissions(eligible_rows, batch_id)
             self._optimistic_waiting_logistics_nos.update(
                 row.logistics_no for row in eligible_rows if row.logistics_no
             )
@@ -6921,6 +6965,7 @@ if PYSIDE6_AVAILABLE:
                             "logistics_no": row.logistics_no,
                             "shipment_batch_id": batch_id,
                             "shipment_batch_position": batch_position,
+                            SHIPMENT_SUBMISSION_ID_PAYLOAD_KEY: f"{batch_id}:{batch_position}",
                             DESKTOP_CONFIRMATION_PAYLOAD_KEY: confirmation.to_payload(),
                         },
                     )
@@ -6982,10 +7027,96 @@ if PYSIDE6_AVAILABLE:
                         row.logistics_no for row, _reason in unconfirmed
                     ),
                     "submission_outcome_unknown": bool(unconfirmed),
+                    "submission_receipts": tuple(
+                        TaskSubmissionReceipt(str(command.payload[SHIPMENT_SUBMISSION_ID_PAYLOAD_KEY]),
+                            row.platform_order_no, str(result.details.get("request_id") or ""), result, row.logistics_no)
+                        for row, command, result in zip(eligible_rows, commands, results)
+                    ),
                 },
             )
 
+        def _adopt_shipment_rows(self, rows: Sequence[ShipmentRow]) -> None:
+            # Once the authoritative row carries the lock, it owns its lifetime;
+            # a later audited unlock must not be masked by an old rejection.
+            for row in rows:
+                if row.manual_review_reason and self._submission_review_locked(row):
+                    self._shipment_submissions.pop(row.logistics_no, None)
+            self._all_rows = list(rows)
+
+        def _submission_review_locked(self, row: ShipmentRow) -> bool:
+            pending = self._shipment_submissions.get(row.logistics_no)
+            return bool(pending and (
+                (pending.task and pending.task.payload.get("_manual_review_lock"))
+                or (pending.result and not pending.awaiting_ack
+                    and not pending.result.accepted
+                    and pending.result.details.get("manual_review_lock"))
+            ))
+
+        def _execution_eligibility(self, row: ShipmentRow, **kwargs) -> tuple[bool, str]:
+            if self._submission_review_locked(row):
+                return False, "标发需人工复核"
+            pending = self._shipment_submissions.get(row.logistics_no)
+            if pending and pending.task and pending.task.status is TaskStatus.SUCCEEDED:
+                return False, "标发任务已完成，等待资料同步"
+            return _shipment_execution_eligibility(row, **kwargs)
+
+        def _begin_shipment_submissions(self, rows: Sequence[ShipmentRow], batch_id: str) -> None:
+            for position, row in enumerate(rows, start=1):
+                self._shipment_submissions[row.logistics_no] = ShipmentSubmission(
+                    f"{batch_id}:{position}", row.platform_order_no, monotonic(),
+                    logistics_no=row.logistics_no,
+                )
+            self._submission_check_timer.start()
+
+        def _refresh_submission_states(self, *, render: bool = True) -> set[str]:
+            changed: set[str] = set()
+            take = getattr(self._controller, "take_task_submission_receipts", None)
+            if callable(take):
+                for receipt in take(tuple(p.submission_id for p in self._shipment_submissions.values())):
+                    pending = self._shipment_submissions.get(receipt.logistics_no)
+                    if pending is not None and pending.apply_receipt(receipt, now=monotonic()):
+                        changed.add(pending.logistics_no)
+            for logistics_no, pending in self._shipment_submissions.items():
+                for task in self._latest_submission_tasks:
+                    if pending.observe_task(task):
+                        changed.add(logistics_no)
+                if pending.expire(monotonic()):
+                    changed.add(logistics_no)
+                if pending.awaiting_ack:
+                    self._unconfirmed_logistics_nos.add(logistics_no)
+                else:
+                    self._unconfirmed_logistics_nos.discard(logistics_no)
+                if pending.awaiting_ack or pending.awaiting_task:
+                    self._active_logistics_nos.add(logistics_no)
+                    if pending.task_id:
+                        self._active_task_ids_by_logistics_no[logistics_no] = (pending.task_id,)
+                elif pending.task is not None and not pending.task.status.terminal:
+                    self._active_logistics_nos.add(logistics_no)
+                    self._active_tasks_by_logistics_no[logistics_no] = (pending.task,)
+                    self._active_task_ids_by_logistics_no[logistics_no] = (pending.task_id,)
+                elif not any(
+                    not task.status.terminal and str(task.payload.get("logistics_no") or "") == logistics_no
+                    and task.area is TaskArea.SHIPMENT
+                    and task.capability in {Capability.OUTBOUND_ORDER, Capability.REMARK_SHIPMENT}
+                    for task in self._latest_submission_tasks
+                ):
+                    self._active_logistics_nos.discard(logistics_no)
+                    self._active_tasks_by_logistics_no.pop(logistics_no, None)
+                    self._active_task_ids_by_logistics_no.pop(logistics_no, None)
+            if not any(p.awaiting_ack or p.awaiting_task for p in self._shipment_submissions.values()):
+                self._submission_check_timer.stop()
+            if render and changed:
+                self._update_active_shipment_cells(changed)
+                # Recompute eligibility immediately; a slow page must not keep
+                # rejected/finished attempts in the active queue.
+                self._apply_search_filter(reset_page=False)
+            return changed
+
         def _finish_shipment_submission(self, result: ControlResult) -> None:
+            for receipt in result.details.get("submission_receipts", ()):
+                pending = self._shipment_submissions.get(receipt.logistics_no)
+                if pending is not None:
+                    pending.apply_receipt(receipt, now=monotonic())
             self._submission_in_progress = False
             self._submission_thread = None
             self._optimistic_waiting_logistics_nos.clear()
@@ -7021,6 +7152,7 @@ if PYSIDE6_AVAILABLE:
             batch_id = str(result.details.get("shipment_batch_id") or "")
             if submitted_task_ids and batch_id and self._batch_handler is not None:
                 self._batch_handler(batch_id, submitted_task_ids)
+            self._refresh_submission_states(render=False)
             self._apply_search_filter()
             self._result_handler(result)
 
@@ -7104,7 +7236,7 @@ if PYSIDE6_AVAILABLE:
                 row for row in selected_rows if not row.scan_issue_code
             ]
             all_selected_queue_rows_executable = bool(selected_queue_rows) and all(
-                _shipment_execution_eligibility(
+                self._execution_eligibility(
                     row,
                     active_logistics_nos=active_logistics_nos,
                 )[0]
@@ -7112,6 +7244,7 @@ if PYSIDE6_AVAILABLE:
             )
             all_selected_queue_rows_re_markable = bool(selected_queue_rows) and all(
                 _shipment_business_status(row) == "重新标发"
+                and not self._submission_review_locked(row)
                 and int(row.re_mark_cycle_id or 0) > 0
                 and row.logistics_no not in active_logistics_nos
                 for row in selected_queue_rows
@@ -7500,7 +7633,7 @@ if PYSIDE6_AVAILABLE:
             self._visible_ready_logistics_nos_cache = frozenset(
                 row.logistics_no
                 for row in self._rows
-                if _shipment_execution_eligibility(
+                if self._execution_eligibility(
                     row,
                     active_logistics_nos=(
                         self._active_logistics_nos
@@ -7822,7 +7955,7 @@ if PYSIDE6_AVAILABLE:
             self._page = result.page
             self._page_size = result.page_size
             self._page_count = result.page_count
-            self._all_rows = list(result.items)
+            self._adopt_shipment_rows(result.items)
             self._filtered_rows = list(result.items)
             self._rows = list(result.items)
             self.product_type_filter_combo.set_available_values(
@@ -7854,7 +7987,7 @@ if PYSIDE6_AVAILABLE:
             self._visible_ready_logistics_nos_cache = frozenset(
                 row.logistics_no
                 for row in self._rows
-                if _shipment_execution_eligibility(
+                if self._execution_eligibility(
                     row,
                     active_logistics_nos=(
                         self._active_logistics_nos
@@ -8099,6 +8232,18 @@ if PYSIDE6_AVAILABLE:
             persisted_status = _shipment_business_status(row)
             if persisted_status in {"已完成", "重新标发完成"}:
                 return persisted_status
+            if row.manual_review_reason:
+                return "标发需人工复核"
+            pending = self._shipment_submissions.get(row.logistics_no)
+            if pending is not None:
+                if pending.task is not None and pending.task.status.terminal:
+                    return "任务已完成，资料同步中" if pending.task.status is TaskStatus.SUCCEEDED else pending.task.status.label
+                if pending.awaiting_ack and pending.check_required:
+                    return "提交结果待核对"
+                if pending.awaiting_task and pending.check_required:
+                    return "任务状态待核对"
+                if pending.result and not pending.awaiting_ack and not pending.result.accepted:
+                    return "标发需人工复核" if pending.result.details.get("manual_review_lock") else "提交未入队"
             active_tasks = self._active_tasks_by_logistics_no.get(
                 row.logistics_no,
                 (),
@@ -8133,6 +8278,22 @@ if PYSIDE6_AVAILABLE:
         ) -> str:
             if business_status in {"已完成", "重新标发完成"}:
                 return _shipment_status_explanation(row, business_status)
+            if row.manual_review_reason:
+                return _shipment_status_explanation(row, business_status)
+            pending = self._shipment_submissions.get(row.logistics_no)
+            if pending is not None:
+                if pending.task is not None:
+                    return f"{pending.task.status.label} · {pending.task.progress_percent}% · {pending.task.message}"
+                if pending.awaiting_ack:
+                    return (
+                        "提交结果待核对，正在继续查询原请求，请勿重复提交。"
+                        if pending.check_required else "提交请求已发送，正在等待服务器确认，请勿重复提交。"
+                    )
+                if pending.awaiting_task:
+                    return "已确认入队，等待后台任务更新；请勿重复提交。"
+                if pending.result is not None and not pending.result.accepted:
+                    reason = str(pending.result.details.get("reason") or "")
+                    return "提交未入队：" + pending.result.message + (f"；{reason}" if reason else "")
             active_tasks = self._active_tasks_by_logistics_no.get(
                 row.logistics_no,
                 (),
@@ -8196,13 +8357,19 @@ if PYSIDE6_AVAILABLE:
                 and not task.status.terminal
                 and str(task.payload.get("logistics_no") or "").strip()
             }
+            self._latest_submission_tasks = tuple((*snapshot.tasks, *snapshot.today_tasks))
+            submission_changed = self._refresh_submission_states(render=False)
             confirmed_unconfirmed_logistics_nos = (
                 self._unconfirmed_logistics_nos & next_active_logistics_nos
-            )
+            ) - self._shipment_submissions.keys()
             self._unconfirmed_logistics_nos.difference_update(
                 confirmed_unconfirmed_logistics_nos
             )
             next_active_logistics_nos.update(self._unconfirmed_logistics_nos)
+            next_active_logistics_nos.update(
+                logistics_no for logistics_no, pending in self._shipment_submissions.items()
+                if pending.awaiting_task
+            )
             active_tasks_by_logistics_no: dict[str, list[TaskRecord]] = {}
             for task in snapshot.tasks:
                 logistics_no = str(task.payload.get("logistics_no") or "").strip()
@@ -8224,8 +8391,11 @@ if PYSIDE6_AVAILABLE:
                 logistics_no: tuple(task.task_id for task in tasks)
                 for logistics_no, tasks in next_active_tasks_by_logistics_no.items()
             }
+            for logistics_no, pending in self._shipment_submissions.items():
+                if pending.awaiting_task and pending.task_id:
+                    next_active_task_ids_by_logistics_no.setdefault(logistics_no, (pending.task_id,))
             rows_changed = next_rows != self._all_rows
-            active_changed = (
+            active_changed = bool(submission_changed) or (
                 next_active_logistics_nos != self._active_logistics_nos
                 or next_active_task_ids_by_logistics_no
                 != self._active_task_ids_by_logistics_no
@@ -8242,6 +8412,11 @@ if PYSIDE6_AVAILABLE:
             self._active_tasks_by_logistics_no = next_active_tasks_by_logistics_no
             self._active_page_task_ids = next_active_page_task_ids
             if server_pagination:
+                changed_logistics_nos = {
+                    logistics_no for logistics_no in set(previous_active_tasks_by_logistics_no) | set(next_active_tasks_by_logistics_no)
+                    if previous_active_tasks_by_logistics_no.get(logistics_no) != next_active_tasks_by_logistics_no.get(logistics_no)
+                } | submission_changed | (previous_active_logistics_nos ^ next_active_logistics_nos)
+                self._update_active_shipment_cells(changed_logistics_nos | submission_changed)
                 self._expected_server_total = int(
                     snapshot.shipments_summary.total or 0
                 )
@@ -8266,7 +8441,7 @@ if PYSIDE6_AVAILABLE:
             self._server_page_retry_timer.stop()
             self._set_server_page_state("success")
             if rows_changed:
-                self._all_rows = next_rows
+                self._adopt_shipment_rows(next_rows)
                 self.product_type_filter_combo.set_available_values(
                     [row.product_type for row in self._all_rows]
                 )
@@ -8297,7 +8472,7 @@ if PYSIDE6_AVAILABLE:
                     if previous_active_tasks_by_logistics_no.get(logistics_no)
                     != next_active_tasks_by_logistics_no.get(logistics_no)
                 }
-                self._update_active_shipment_cells(changed_logistics_nos)
+                self._update_active_shipment_cells(changed_logistics_nos | submission_changed)
 
 
     class StateManagementPage(QWidget):
