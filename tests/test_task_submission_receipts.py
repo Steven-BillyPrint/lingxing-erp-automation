@@ -5,6 +5,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
+import httpx
 
 from erp_automation.contracts.controller import ControlResult, TaskSubmissionReceipt
 from erp_automation.contracts.models import (
@@ -124,6 +125,41 @@ def test_shipment_reconciliation_resumes_after_long_outage_without_resubmitting(
     assert not client._pending_mutation_fingerprints
     assert sum(path == "/v1/rpc" for path, _ in calls) == 1
     assert {payload["request_id"] for path, payload in calls if path.endswith("/status")} == {request_id}
+
+
+@pytest.mark.parametrize("failure", ["read_disconnect", "write_disconnect", "server_error", "invalid_json"])
+def test_shipment_interrupted_response_uses_original_request_receipt(failure):
+    client, operations, _calls = _client({})
+    requests = []
+
+    def transport(request):
+        requests.append(request)
+        if request.url.path == "/v1/rpc":
+            if failure == "read_disconnect":
+                raise httpx.ReadError("connection closed", request=request)
+            if failure == "write_disconnect":
+                raise httpx.WriteError("partial request", request=request)
+            if failure == "server_error":
+                return httpx.Response(500)
+            return httpx.Response(200, content=b"{broken")
+        assert request.url.path == "/v1/requests/status"
+        return httpx.Response(200, json=_response(ControlResult(False, "锁拒绝", "old")))
+
+    client._client = httpx.Client(base_url="https://coordinator.test", transport=httpx.MockTransport(transport))
+    client._request = RemoteBackgroundTaskController._request.__get__(client)
+    try:
+        command = TaskCommand("标发", TaskArea.SHIPMENT, Capability.OUTBOUND_ORDER, order_no="ORDER",
+                              payload={"logistics_no": "ALS", SHIPMENT_SUBMISSION_ID_PAYLOAD_KEY: "attempt"})
+        first, = client.submit_tasks((command,))
+        assert first.details["submission_outcome_unknown"]
+        operations.pop()()
+        receipt, = client.take_task_submission_receipts(("attempt",))
+        assert not receipt.result.accepted
+        assert receipt.result.message == "锁拒绝"
+        assert [r.url.path for r in requests] == ["/v1/rpc", "/v1/requests/status"]
+        assert receipt.request_id == first.details["request_id"]
+    finally:
+        client._client.close()
 
 
 def test_shipment_attempt_ignores_old_task_wrong_parcel_and_late_unknown():

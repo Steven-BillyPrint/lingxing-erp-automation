@@ -124,7 +124,11 @@ class CoordinationConnectionError(RuntimeError):
     """The shared controller could not be reached or authenticated."""
 
 
-class CoordinationReadTimeout(CoordinationConnectionError):
+class CoordinationResponseUnconfirmed(CoordinationConnectionError):
+    """The submitted request may have taken effect despite a missing response."""
+
+
+class CoordinationReadTimeout(CoordinationResponseUnconfirmed):
     """The server accepted a connection but did not confirm an outcome in time."""
 
 
@@ -537,15 +541,22 @@ class RemoteBackgroundTaskController:
                 f"无法连接共享 ERP 后台：{exc}"
             ) from exc
         except httpx.HTTPError as exc:
+            if (
+                isinstance(exc, (httpx.ReadError, httpx.WriteError, httpx.WriteTimeout, httpx.RemoteProtocolError))
+                or (isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code >= 500)
+            ):
+                raise CoordinationResponseUnconfirmed(
+                    "共享 ERP 后台响应中断，执行结果尚未确认。"
+                ) from exc
             raise CoordinationConnectionError(
                 f"共享 ERP 后台通信失败：{exc}"
             ) from exc
         except ValueError as exc:
-            raise CoordinationConnectionError(
+            raise CoordinationResponseUnconfirmed(
                 f"共享 ERP 后台响应解析失败：{exc}"
             ) from exc
         if not isinstance(payload, dict):
-            raise CoordinationConnectionError("共享 ERP 后台返回了无效响应。")
+            raise CoordinationResponseUnconfirmed("共享 ERP 后台返回了无效响应。")
         if payload.get("ok") is False:
             raise CoordinationConnectionError(
                 str(payload.get("error") or "共享 ERP 后台拒绝了请求。")
@@ -1720,7 +1731,7 @@ class RemoteBackgroundTaskController:
                     or (
                         submitted_commands
                         and request_sent
-                        and isinstance(exc, (TypeError, ValueError))
+                        and isinstance(exc, (TypeError, ValueError, CoordinationResponseUnconfirmed))
                     )
                 ):
                     self._schedule_request_reconciliation(
