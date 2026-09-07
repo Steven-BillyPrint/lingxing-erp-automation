@@ -36,6 +36,7 @@ from erp_automation.contracts.models import (
     SHIPMENT_NOTIFICATION_SEND_TRIGGER,
     TaskArea,
     TaskCommand,
+    TaskRecord,
     TaskStatus,
     task_requires_visible_browser,
 )
@@ -55,6 +56,12 @@ from .store import CoordinationStore
 
 
 LOGGER = logging.getLogger(__name__)
+_SNAPSHOT_MAX_CACHE_SECONDS = 15.0
+
+
+def _task_records(controller: BackgroundTaskController) -> tuple[TaskRecord, ...]:
+    reader = getattr(controller, "task_snapshot", None)
+    return tuple(reader() if callable(reader) else controller.snapshot().tasks)
 
 
 MAX_PORTABLE_CONFIGURATION_PACKAGE_BYTES = 4 * 1024 * 1024
@@ -858,6 +865,7 @@ class CoordinatedControllerService:
         self._call_lock = threading.RLock()
         self._snapshot_lock = threading.RLock()
         self._last_snapshot_fingerprints: dict[str, str] = {}
+        self._snapshot_body_times: dict[tuple[str, bool], float] = {}
         self._tracked_tasks: set[str] = set()
         self._task_owners: dict[str, str] = {}
         self._task_controllers: dict[str, BackgroundTaskController] = {}
@@ -1207,7 +1215,7 @@ class CoordinatedControllerService:
         evicted = 0
         for key, controller, observed_last_used in candidates:
             try:
-                if any(not task.status.terminal for task in controller.snapshot().tasks):
+                if any(not task.status.terminal for task in _task_records(controller)):
                     continue
             except Exception:
                 continue
@@ -1528,7 +1536,7 @@ class CoordinatedControllerService:
         controllers.update(controller for _key, controller in self._all_controllers())
         for controller in controllers:
             try:
-                tasks.update({task.task_id: task for task in controller.snapshot().tasks})
+                tasks.update({task.task_id: task for task in _task_records(controller)})
             except Exception:
                 continue
         stopping = 0
@@ -2117,6 +2125,9 @@ class CoordinatedControllerService:
                 identity=identity,
             )
         released_scheduler = self.store.deregister(instance_id)
+        with self._snapshot_lock:
+            self._snapshot_body_times.pop((instance_id, True), None)
+            self._snapshot_body_times.pop((instance_id, False), None)
         with self._instance_lock:
             self._browser_endpoints.pop(instance_id, None)
             self._logistics_browser_endpoints.pop(instance_id, None)
@@ -2275,8 +2286,21 @@ class CoordinatedControllerService:
     ) -> dict[str, Any]:
         heartbeat = self.heartbeat(instance_id, identity=identity)
         controller = self._controller_for(identity)
+        key = identity.email.casefold() if self._controller_factory else "shared"
+        # Do not let a slow lease/follow-up monitor conceal a worker transition.
+        # This checks the local task revision and queue markers, not full rows.
+        self._publish_controller_changes(key, controller)
         revision = self.store.current_revision()
-        if known_revision is not None and known_revision == revision:
+        body_key = (instance_id, summary_only)
+        checked_at = time.monotonic()
+        with self._snapshot_lock:
+            body_age = checked_at - self._snapshot_body_times.get(body_key, float("-inf"))
+        if (
+            known_revision is not None
+            and known_revision == revision
+            and not include_queue_pages
+            and body_age < _SNAPSHOT_MAX_CACHE_SECONDS
+        ):
             return {
                 "revision": revision,
                 "unchanged": True,
@@ -2368,7 +2392,26 @@ class CoordinatedControllerService:
         if custom_order_page is not None and shipment_page is not None:
             response["custom_order_page"] = to_jsonable(custom_order_page)
             response["shipment_page"] = to_jsonable(shipment_page)
+        with self._snapshot_lock:
+            self._snapshot_body_times[body_key] = checked_at
         return response
+
+    def _publish_controller_changes(
+        self, key: str, controller: BackgroundTaskController,
+    ) -> None:
+        reader = getattr(controller, "coordination_state_token", None)
+        token = reader() if callable(reader) else controller.snapshot()
+        fingerprint = self._fingerprint(token)
+        # Never acquire the controller lock while holding the coordination lock.
+        with self._snapshot_lock:
+            previous = self._last_snapshot_fingerprints.get(key)
+            if previous is not None and fingerprint != previous:
+                self.store.publish_event(
+                    instance_id="server",
+                    operation="background_state_changed",
+                    summary="Task or shared state changed.",
+                )
+            self._last_snapshot_fingerprints[key] = fingerprint
 
     def request_status_payload(
         self,
@@ -3542,6 +3585,7 @@ class CoordinatedControllerService:
         while not self._closed.wait(self.settings.monitor_interval_seconds):
             try:
                 active_instances = self.store.active_instance_ids()
+                tasks_by_controller: dict[int, dict[str, TaskRecord] | None] = {}
                 for task_id in tuple(self._tracked_tasks):
                     controller = self._task_controllers.get(task_id)
                     if controller is None:
@@ -3574,11 +3618,17 @@ class CoordinatedControllerService:
                             task_id,
                             ttl_seconds=self.settings.task_lease_seconds,
                         )
-                    try:
-                        snapshot = controller.snapshot()
-                    except Exception:
+                    controller_id = id(controller)
+                    if controller_id not in tasks_by_controller:
+                        try:
+                            tasks_by_controller[controller_id] = {
+                                task.task_id: task for task in _task_records(controller)
+                            }
+                        except Exception:
+                            tasks_by_controller[controller_id] = None
+                    tasks = tasks_by_controller[controller_id]
+                    if tasks is None:
                         continue
-                    tasks = {task.task_id: task for task in snapshot.tasks}
                     task = tasks.get(task_id)
                     if task is None or task.status.terminal:
                         if (
@@ -3647,19 +3697,14 @@ class CoordinatedControllerService:
                 self._process_persistent_task_followups()
                 for key, controller in self._all_controllers():
                     try:
-                        snapshot = controller.snapshot()
+                        self._publish_controller_changes(key, controller)
                     except Exception:
                         continue
-                    fingerprint = self._fingerprint(snapshot)
-                    with self._snapshot_lock:
-                        previous = self._last_snapshot_fingerprints.get(key, "")
-                        if previous and fingerprint != previous:
-                            self.store.publish_event(
-                                instance_id="server",
-                                operation="background_state_changed",
-                                summary="Task or shared state changed.",
-                            )
-                        self._last_snapshot_fingerprints[key] = fingerprint
+                with self._snapshot_lock:
+                    self._snapshot_body_times = {
+                        key: timestamp for key, timestamp in self._snapshot_body_times.items()
+                        if key[0] in active_instances
+                    }
                 # Task leases are released only after a terminal snapshot. A
                 # delayed monitor iteration must not erase a still-running
                 # task's deployment guard merely because its TTL elapsed.

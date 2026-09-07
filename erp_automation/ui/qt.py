@@ -3292,6 +3292,11 @@ if PYSIDE6_AVAILABLE:
             self._active_order_nos: set[str] = set()
             self._active_task_ids_by_order_no: dict[str, tuple[str, ...]] = {}
             self._active_tasks_by_order_no: dict[str, tuple[TaskRecord, ...]] = {}
+            self._terminal_tasks_pending_refresh: dict[str, TaskRecord] = {}
+            self._server_page_terminal_ids: dict[str, str] = {}
+            self._server_page_refresh_pending = False
+            self._last_task_sync_at: datetime | None = None
+            self._last_page_sync_at: datetime | None = None
             self._active_page_task_ids: tuple[str, ...] = ()
             self._optimistic_waiting_order_nos: set[str] = set()
             self._order_submissions: dict[str, CustomOrderSubmission] = {}
@@ -3346,6 +3351,9 @@ if PYSIDE6_AVAILABLE:
                 heading_row.addWidget(button)
             self._page_action_row_layout = heading_row
             layout.addLayout(heading_row)
+            self.sync_status_label = QLabel("任务状态：未同步 · 订单列表：未同步")
+            self.sync_status_label.setObjectName("queueLoadState")
+            layout.addWidget(self.sync_status_label)
             self.scan_schedule_label = QLabel()
             self.scan_schedule_label.setObjectName("queueStatusBanner")
             self.scan_schedule_label.setWordWrap(True)
@@ -3652,6 +3660,15 @@ if PYSIDE6_AVAILABLE:
             if self._submission_thread is not None:
                 return
             rows = self._checked_orders()
+            if any(
+                row.platform_order_no in self._terminal_tasks_pending_refresh
+                for row in rows
+            ):
+                self._result_handler(ControlResult(
+                    False, "所选订单的处理任务已结束，正在同步订单资料，请稍后再操作。",
+                    details={"non_modal": True},
+                ))
+                return
             guarded_order_nos = self._optimistic_waiting_order_nos | self._active_order_nos
             unconfirmed_rows = tuple(
                 row
@@ -4020,6 +4037,50 @@ if PYSIDE6_AVAILABLE:
                 )
             )
 
+        def update_sync_status(self) -> None:
+            confirmed = getattr(self._controller, "snapshot_last_success_at", None)
+            if confirmed is not None:
+                self._last_task_sync_at = confirmed
+            task_time = (
+                self._last_task_sync_at.astimezone(_CHINA_TIMEZONE).strftime("%H:%M:%S")
+                if self._last_task_sync_at else "未同步"
+            )
+            page_time = (
+                self._last_page_sync_at.astimezone(_CHINA_TIMEZONE).strftime("%H:%M:%S")
+                if self._last_page_sync_at else "未同步"
+            )
+            task_delayed = bool(
+                self._last_task_sync_at
+                and (datetime.now(timezone.utc) - self._last_task_sync_at).total_seconds() > 5
+            ) or bool(getattr(self._controller, "snapshot_is_stale", False))
+            page_suffix = (
+                "（更新中，显示上次数据）" if self._server_page_state == "loading"
+                else "（读取失败，显示上次数据）" if self._server_page_state == "error"
+                else ""
+            )
+            self.sync_status_label.setText(
+                f"任务状态：{task_time}{'（同步延迟）' if task_delayed else ''} · "
+                f"订单列表：{page_time}{page_suffix}"
+            )
+
+        def _display_task(self, row: CustomOrderRow) -> TaskRecord | None:
+            active = self._active_tasks_by_order_no.get(row.platform_order_no, ())
+            return (
+                max(active, key=lambda task: task.updated_at) if active
+                else self._submission_terminal_task(row)
+                or self._terminal_tasks_pending_refresh.get(row.platform_order_no)
+            )
+
+        def _row_stage(self, row: CustomOrderRow) -> str:
+            return (
+                "订单资料同步中" if row.platform_order_no in self._terminal_tasks_pending_refresh
+                else row.workflow_stage
+            )
+
+        def _row_status_time(self, row: CustomOrderRow) -> str:
+            task = self._display_task(row)
+            return _format_status_timestamp(task.updated_at if task else row.status_updated_at)
+
         def _refresh_submission_states(self, *, render: bool = True) -> set[str]:
             """Consume transport receipts on the UI thread, without RPC calls."""
 
@@ -4111,6 +4172,12 @@ if PYSIDE6_AVAILABLE:
             task = self._submission_terminal_task(row)
             if task is not None:
                 return task.message or row.last_error or row.result_detail
+            terminal = self._terminal_tasks_pending_refresh.get(order_no)
+            if terminal is not None:
+                return (
+                    f"{terminal.status.label} · {terminal.progress_percent}% · "
+                    f"{terminal.message}；订单资料同步中。"
+                )
             if order_no in self._active_order_nos:
                 return "已加入处理队列，等待后台任务更新。"
             if (
@@ -4125,7 +4192,10 @@ if PYSIDE6_AVAILABLE:
             return row.last_error or row.result_detail
 
         def _order_quick_select_eligibility(self, row: CustomOrderRow) -> tuple[bool, str]:
-            if self._submission_terminal_task(row) is not None:
+            if (
+                self._submission_terminal_task(row) is not None
+                or row.platform_order_no in self._terminal_tasks_pending_refresh
+            ):
                 return False, "请核对本次任务结果后再处理"
             return _custom_order_quick_select_eligibility(
                 row,
@@ -4164,6 +4234,9 @@ if PYSIDE6_AVAILABLE:
                 return "task_succeeded" if task.status is TaskStatus.SUCCEEDED else task.status.value
             if row.platform_order_no in self._active_order_nos:
                 return "waiting"
+            terminal = self._terminal_tasks_pending_refresh.get(row.platform_order_no)
+            if terminal is not None:
+                return "completed" if terminal.status is TaskStatus.SUCCEEDED else terminal.status.label
             return str(row.status_text or row.workflow_stage or "")
 
         def _status_sort_key(
@@ -4353,6 +4426,7 @@ if PYSIDE6_AVAILABLE:
 
         def _set_server_page_state(self, state: str, message: str = "") -> None:
             self._server_page_state = state
+            self.update_sync_status()
             if state == "success":
                 self._server_first_page_painted = True
                 self._set_server_page_navigation_loading(False)
@@ -4452,6 +4526,11 @@ if PYSIDE6_AVAILABLE:
         ) -> None:
             if not self._server_pagination_enabled:
                 return
+            self._server_page_refresh_pending = False
+            self._server_page_terminal_ids = {
+                order_no: task.task_id
+                for order_no, task in self._terminal_tasks_pending_refresh.items()
+            }
             page_query = dict(query or self._server_query(page=page))
             request_key = self._server_query_key(page_query)
             navigation_loading = bool(
@@ -4565,6 +4644,13 @@ if PYSIDE6_AVAILABLE:
                 )
                 return
             navigation_changed = request_key != self._server_page_loaded_key
+            # A response requested before a terminal transition cannot clear
+            # that newer task overlay. A coalesced refresh will read it next.
+            for order_no, task_id in self._server_page_terminal_ids.items():
+                task = self._terminal_tasks_pending_refresh.get(order_no)
+                if task is not None and task.task_id == task_id:
+                    self._terminal_tasks_pending_refresh.pop(order_no, None)
+            self._last_page_sync_at = datetime.now(timezone.utc)
             self._page = result.page
             self._page_size = result.page_size
             self._page_count = result.page_count
@@ -4610,6 +4696,10 @@ if PYSIDE6_AVAILABLE:
             self._server_last_failed_revision = ""
             self._server_last_failed_navigation_loading = False
             self._set_server_page_state("success")
+            if self._server_page_refresh_pending:
+                self._server_page_loader.invalidate()
+                self._load_server_page(page=self._page, navigation=False)
+                return
             self._prefetch_adjacent_server_pages(
                 request_query,
                 result,
@@ -4677,7 +4767,7 @@ if PYSIDE6_AVAILABLE:
                     self.table.setItem(
                         row_index,
                         4,
-                        _workflow_status_item(row.workflow_stage),
+                        _workflow_status_item(self._row_stage(row)),
                     )
                     self.table.setItem(
                         row_index,
@@ -4690,7 +4780,7 @@ if PYSIDE6_AVAILABLE:
                     self.table.setItem(
                         row_index,
                         6,
-                        _readonly_item(_format_status_timestamp(row.status_updated_at)),
+                        _readonly_item(self._row_status_time(row)),
                     )
                     self.table.setItem(
                         row_index,
@@ -4740,6 +4830,8 @@ if PYSIDE6_AVAILABLE:
                             sort_key=self._status_sort_key(row),
                         ),
                     )
+                    self.table.setItem(row_index, 4, _workflow_status_item(self._row_stage(row)))
+                    self.table.setItem(row_index, 6, _readonly_item(self._row_status_time(row)))
                     self.table.setItem(
                         row_index,
                         7,
@@ -5147,6 +5239,9 @@ if PYSIDE6_AVAILABLE:
             server_pagination = (
                 "custom_order_pagination_v1" in snapshot.server_features
             )
+            if not hasattr(self._controller, "snapshot_last_success_at"):
+                self._last_task_sync_at = datetime.now(timezone.utc)
+            self.update_sync_status()
             feature_changed = server_pagination != self._server_pagination_enabled
             self._server_pagination_enabled = server_pagination
             self._review_enabled = bool(
@@ -5158,6 +5253,11 @@ if PYSIDE6_AVAILABLE:
             }
             previous_active_tasks = dict(self._active_tasks_by_order_no)
             previous_active_ids = dict(self._active_task_ids_by_order_no)
+            previous_submission_task_states = {
+                order_no: (pending.task.task_id, pending.task.status)
+                for order_no, pending in self._order_submissions.items()
+                if pending.task is not None
+            }
             next_rows = (
                 list(self._all_rows)
                 if server_pagination
@@ -5197,6 +5297,39 @@ if PYSIDE6_AVAILABLE:
             submission_changed_order_nos = self._refresh_submission_states(render=False)
             next_active_task_ids_by_order_no = self._active_task_ids_by_order_no
             next_active_tasks_by_order_no = self._active_tasks_by_order_no
+            # Keep terminal task results visible until a page requested after
+            # that transition returns. Progress must not depend on a slow page.
+            if server_pagination:
+                for task in sorted(self._latest_submission_tasks, key=lambda task: task.updated_at):
+                    order_no = str(task.order_no or "").strip()
+                    if (
+                        task.area is TaskArea.CUSTOMIZATION
+                        and task.status.terminal
+                        and order_no in previous_active_tasks
+                        and order_no not in self._active_order_nos
+                        and task.task_id in {
+                            active.task_id for active in previous_active_tasks[order_no]
+                        }
+                    ):
+                        self._terminal_tasks_pending_refresh[order_no] = task
+                for order_no in self._active_order_nos:
+                    self._terminal_tasks_pending_refresh.pop(order_no, None)
+            else:
+                self._terminal_tasks_pending_refresh.clear()
+                self._last_page_sync_at = datetime.now(timezone.utc)
+            task_ordering_changed = {
+                order_no: tuple((task.task_id, task.status) for task in tasks)
+                for order_no, tasks in previous_active_tasks.items()
+            } != {
+                order_no: tuple((task.task_id, task.status) for task in tasks)
+                for order_no, tasks in next_active_tasks_by_order_no.items()
+            }
+            task_ordering_changed |= previous_active_ids != next_active_task_ids_by_order_no
+            task_ordering_changed |= previous_submission_task_states != {
+                order_no: (pending.task.task_id, pending.task.status)
+                for order_no, pending in self._order_submissions.items()
+                if pending.task is not None
+            }
             rows_changed = next_rows != self._all_rows
             active_changed = (
                 next_active_task_ids_by_order_no
@@ -5218,28 +5351,28 @@ if PYSIDE6_AVAILABLE:
                     for order_no in set(previous_active_tasks) | set(next_active_tasks_by_order_no)
                     if previous_active_tasks.get(order_no) != next_active_tasks_by_order_no.get(order_no)
                 } | submission_changed_order_nos
+                self._checked_order_nos.difference_update(
+                    self._terminal_tasks_pending_refresh
+                )
                 # Paint known task/receipt changes now, even if the paged read
                 # is slow or fails. Both rendering paths use _order_detail().
                 self._update_active_order_cells(changed_order_nos)
                 self._refresh_visible_row_caches()
+                self._refresh_visible_checkboxes()
                 self._expected_server_total = int(
                     snapshot.custom_orders_summary.total or 0
                 )
                 dataset_revision = snapshot.custom_orders_summary.revision
                 dataset_changed = dataset_revision != self._last_dataset_revision
                 self._last_dataset_revision = dataset_revision
-                if feature_changed or dataset_changed or active_changed:
+                if feature_changed or dataset_changed or task_ordering_changed:
                     self._server_page_loader.invalidate()
-                    target_page = (
-                        int(self._server_page_request_key[0])
-                        if self._server_page_navigation_loading
-                        and self._server_page_request_key
-                        else self._page
-                    )
-                    self._load_server_page(
-                        page=target_page,
-                        navigation=False,
-                    )
+                    if self._server_page_state == "loading":
+                        self._server_page_refresh_pending = True
+                    elif self._server_page_state == "error" and self._server_last_failed_key:
+                        self._retry_server_page()
+                    else:
+                        self._load_server_page(page=self._page, navigation=False)
                 else:
                     self.ensure_loaded()
                 return
@@ -13702,6 +13835,7 @@ if PYSIDE6_AVAILABLE:
             self.local_connection_state.setToolTip(tooltip)
 
         def refresh(self) -> None:
+            self.custom_orders_page.update_sync_status()
             if self._background_snapshots:
                 if self._snapshot_thread is not None:
                     self._refresh_queued = True
@@ -13814,6 +13948,7 @@ if PYSIDE6_AVAILABLE:
                 QTimer.singleShot(0, self.refresh)
 
         def _apply_snapshot(self, snapshot: DesktopSnapshot) -> None:
+            self.custom_orders_page.update_sync_status()
             self._sync_scheduled_scan_timers(snapshot)
             unchanged = snapshot is self._latest_snapshot
             self.custom_orders_page.set_scan_countdown(
@@ -13875,7 +14010,8 @@ if PYSIDE6_AVAILABLE:
             if 0 <= index < len(self._page_widgets):
                 self._page_widgets[index].update_snapshot(snapshot)
             self.statusBar().showMessage(
-                "状态已同步  ·  定制订单 "
+                ("显示上次同步数据" if getattr(self._controller, "snapshot_is_stale", False)
+                 else "任务状态已同步") + "  ·  定制订单 "
                 f"{snapshot.custom_orders_summary.total if 'snapshot_summary_v1' in snapshot.server_features else len(snapshot.custom_orders)}"
                 "  ·  自动标发 "
                 f"{snapshot.shipments_summary.total if 'snapshot_summary_v1' in snapshot.server_features else len(snapshot.shipments)}"

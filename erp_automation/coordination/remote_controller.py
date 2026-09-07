@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from copy import deepcopy
 from dataclasses import replace
+from datetime import datetime, timezone
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -191,6 +192,8 @@ class RemoteBackgroundTaskController:
             or ""
         ).strip()
         self._metadata_lock = threading.RLock()
+        self.snapshot_last_success_at: datetime | None = None
+        self.snapshot_is_stale = True
         self.operator_name = ""
         self.operator_email = ""
         self._access_token_provider = access_token_provider
@@ -597,6 +600,8 @@ class RemoteBackgroundTaskController:
                 snapshot = deepcopy(self._last_snapshot)
                 snapshot.backend_message = reconciled_message
                 self._last_snapshot = snapshot
+            self.snapshot_last_success_at = datetime.now(timezone.utc)
+            self.snapshot_is_stale = False
             return self._last_snapshot
 
         snapshot = decode_snapshot(payload.get("snapshot"))
@@ -637,6 +642,8 @@ class RemoteBackgroundTaskController:
         self._last_snapshot = snapshot
         self._last_error = ""
         self._cleanup_browser_after_terminal_tasks(snapshot)
+        self.snapshot_last_success_at = datetime.now(timezone.utc)
+        self.snapshot_is_stale = False
         return snapshot
 
     def snapshot(self) -> DesktopSnapshot:
@@ -666,6 +673,7 @@ class RemoteBackgroundTaskController:
             except CoordinationClientUpdateRequired:
                 raise
             except (CoordinationConnectionError, TypeError, ValueError) as exc:
+                self.snapshot_is_stale = True
                 self._last_error = str(exc)
                 stale = deepcopy(self._last_snapshot)
                 stale.backend_message = (

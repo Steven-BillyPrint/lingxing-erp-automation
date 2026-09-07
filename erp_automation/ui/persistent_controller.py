@@ -809,6 +809,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                     message=_INTERRUPTED_TASK_MESSAGE,
                     updated_at=recovered_at,
                 )
+                self._task_revision += 1
         recovered = [
             task
             for task in self._today_task_history()
@@ -823,6 +824,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             for task in recovered:
                 if task.task_id not in current_task_ids:
                     self._state.tasks.append(task)
+                    self._task_revision += 1
                     current_task_ids.add(task.task_id)
                 self._set_manual_review_lock_locked(
                     task.task_id,
@@ -1806,6 +1808,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             payload.pop(_MANUAL_REVIEW_LOCK_PAYLOAD_KEY, None)
             payload.pop("_manual_review_reason", None)
         self._state.tasks[index] = replace(task, payload=payload, updated_at=utc_now())
+        self._task_revision += 1
         self._write_task_snapshot(self._state.tasks[index])
 
     def _clear_manual_review_locks_locked(
@@ -3299,6 +3302,24 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         )
         snapshot.server_features = QUEUE_PAGINATION_FEATURES
         return snapshot
+
+    def coordination_state_token(self) -> object:
+        # No queue materialization, configuration decryption or journal replay.
+        # Worker transitions increment the task revision under the state lock;
+        # database markers also detect writes from other operator controllers.
+        with self._lock:
+            state = self._coordination_state_token(include_queue_rows=False)
+            # Requests have immutable, unique IDs. Track additions/removals
+            # without hashing their potentially large ephemeral action data.
+            interactions = tuple(self._pending_interactions)
+            custom_path = self._custom_state_path()
+            shipment_path = self._shipment_state_path()
+        return (
+            state,
+            interactions,
+            sqlite_dataset_revision(custom_path),
+            sqlite_dataset_revision(shipment_path),
+        )
 
     def summary_snapshot(self) -> DesktopSnapshot:
         """Return current policy/settings and O(1) queue summaries only."""

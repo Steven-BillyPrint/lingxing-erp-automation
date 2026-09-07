@@ -79,6 +79,7 @@ class InMemoryBackgroundTaskController:
     ) -> None:
         self._state = deepcopy(initial) if initial is not None else DesktopSnapshot()
         self._lock = RLock()
+        self._task_revision = 0
         if log_initial_backend_message and not self._state.logs:
             self._append_log(LogLevel.WARNING, "desktop", self._state.backend_message)
 
@@ -86,6 +87,31 @@ class InMemoryBackgroundTaskController:
         with self._lock:
             self._state.today_tasks = list(self._state.tasks)
             return deepcopy(self._state)
+
+    def task_snapshot(self) -> tuple[TaskRecord, ...]:
+        """Read task state without loading business queues or task history."""
+        with self._lock:
+            return deepcopy(tuple(self._state.tasks))
+
+    def _coordination_state_token(self, *, include_queue_rows: bool) -> object:
+        with self._lock:
+            return deepcopy((
+                self._task_revision,
+                self._state.policy,
+                self._state.settings,
+                self._state.migration,
+                self._state.backend_message,
+                self._state.logs[:1],
+                self._state.custom_orders if include_queue_rows else (),
+                self._state.shipments if include_queue_rows else (),
+                self._state.custom_orders_summary,
+                self._state.shipments_summary,
+                self._state.notifications_summary,
+            ))
+
+    def coordination_state_token(self) -> object:
+        """Local-only invalidation token; never sent to a desktop client."""
+        return self._coordination_state_token(include_queue_rows=True)
 
     def list_custom_order_page(
         self,
@@ -312,6 +338,7 @@ class InMemoryBackgroundTaskController:
                 ),
             )
             self._state.tasks.insert(0, task)
+            self._task_revision += 1
             message = f"任务“{command.name}”已进入{self._queue_label}。"
             self._append_log(LogLevel.INFO, command.area.value, message, task_id=task_id)
             return ControlResult(True, message, task_id)
@@ -349,6 +376,7 @@ class InMemoryBackgroundTaskController:
                 message="用户已取消。",
                 updated_at=utc_now(),
             )
+            self._task_revision += 1
             self._append_log(LogLevel.WARNING, task.area.value, f"任务已取消：{task.name}")
             return ControlResult(True, "任务已取消。", task_id)
 
@@ -402,6 +430,7 @@ class InMemoryBackgroundTaskController:
                 message=f"等待重试；执行模式：{mode.label}。",
                 updated_at=utc_now(),
             )
+            self._task_revision += 1
             self._append_log(LogLevel.INFO, task.area.value, f"任务已重新排队：{task.name}")
             return ControlResult(True, "任务已重新排队。", task_id)
 
@@ -489,6 +518,7 @@ class InMemoryBackgroundTaskController:
                     message=normalized_reason,
                     updated_at=now,
                 )
+                self._task_revision += 1
                 stopped += 1
             message = f"已暂停 {stopped} 个本机任务。"
             self._append_log(LogLevel.WARNING, "safety", message)
@@ -901,6 +931,7 @@ class InMemoryBackgroundTaskController:
                 progress_percent=progress,
                 updated_at=utc_now(),
             )
+            self._task_revision += 1
             return ControlResult(True, "任务状态已更新。", task_id)
 
     def _find_task(self, task_id: str) -> tuple[int, TaskRecord] | None:

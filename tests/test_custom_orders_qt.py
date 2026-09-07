@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
+
 import os
 import threading
 import time
@@ -3917,6 +3920,47 @@ def test_submission_terminal_paints_before_paged_refresh_returns(app, monkeypatc
     page._render_rows()
     assert page.table.item(0, 7).text() == snapshot.tasks[0].message
     page.deleteLater()
+
+
+@pytest.mark.parametrize("terminal_status", [TaskStatus.SUCCEEDED, TaskStatus.BLOCKED])
+def test_reconciled_submission_progress_coalesces_pages_but_terminal_refreshes(app, monkeypatch, terminal_status):
+    page, controller, snapshot, _receipts = _unknown_submission_page("ORDER")
+    requests = []
+    monkeypatch.setattr(page, "_load_server_page", lambda **kw: requests.append(kw))
+    monkeypatch.setattr(page, "ensure_loaded", lambda: None)
+    snapshot.server_features = ("custom_order_pagination_v1",)
+    snapshot.custom_orders_summary = DatasetSummary(1, "unchanged-revision")
+    task = TaskRecord(
+        "reconciled-task", "处理定制订单", TaskArea.CUSTOMIZATION, Capability.UPDATE_CONTACT,
+        order_no="ORDER", payload=controller.submitted_commands[0].payload,
+        status=TaskStatus.RUNNING, progress_percent=10,
+    )
+    try:
+        snapshot.tasks = [task]
+        page.update_snapshot(snapshot)
+        initial_requests = len(requests)
+        assert initial_requests == 1
+        assert not page._optimistic_waiting_order_nos
+        for progress in range(40, 83):
+            task = replace(task, progress_percent=progress,
+                           updated_at=task.updated_at + timedelta(milliseconds=100))
+            snapshot.tasks = [task]
+            page.update_snapshot(snapshot)
+            assert f"{progress}%" in page.table.item(0, 7).text()
+        assert len(requests) == initial_requests
+        snapshot.tasks = [replace(
+            task, status=terminal_status, progress_percent=100,
+            message="已收到真实任务结果", updated_at=task.updated_at + timedelta(seconds=1),
+        )]
+        page.update_snapshot(snapshot)
+        assert len(requests) == initial_requests + 1
+        assert page.table.item(0, 7).text() == "已收到真实任务结果"
+        assert "ORDER" not in page._active_order_nos
+        assert "ORDER" not in page._visible_pending_order_nos()
+        page._render_rows()
+        assert page.table.item(0, 7).text() == "已收到真实任务结果"
+    finally:
+        page.deleteLater()
 
 
 def test_process_batch_timeout_stays_non_modal_until_snapshot_confirms(
@@ -8472,3 +8516,110 @@ def test_alibaba_and_state_pages_stop_every_active_page_task(app, monkeypatch):
 
     alibaba_page.deleteLater()
     state_page.deleteLater()
+
+
+@pytest.mark.parametrize("terminal_status", [TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.CANCELLED])
+def test_custom_progress_and_cutover_remain_visible_while_page_is_blocked(app, terminal_status):
+    class SlowPages(InMemoryBackgroundTaskController):
+        def __init__(self, snapshot):
+            super().__init__(snapshot)
+            self.calls = 0
+            self.started = [threading.Event(), threading.Event()]
+            self.release = [threading.Event(), threading.Event()]
+
+        def list_custom_order_page(self, **kwargs):
+            self.calls += 1
+            call = self.calls
+            result = super().list_custom_order_page(**kwargs)
+            if call in (2, 3):
+                self.started[call - 2].set()
+                assert self.release[call - 2].wait(5)
+            return result
+
+    tasks = [
+        TaskRecord("tent", "Process tent", TaskArea.CUSTOMIZATION, Capability.UPDATE_CONTACT,
+                   order_no="TENT", status=TaskStatus.RUNNING, progress_percent=82),
+        TaskRecord("cloth", "Process tablecloth", TaskArea.CUSTOMIZATION, Capability.UPDATE_CONTACT,
+                   order_no="CLOTH", status=TaskStatus.QUEUED),
+    ]
+    controller = SlowPages(DesktopSnapshot(
+        tasks=tasks,
+        custom_orders=[CustomOrderRow("TENT", workflow_stage="pending_warehouse_logistics", status_text="pending"),
+                       CustomOrderRow("CLOTH", workflow_stage="pending_contact", status_text="pending")],
+        custom_orders_summary=DatasetSummary(2, "before"),
+        server_features=("custom_order_pagination_v1", "snapshot_summary_v1"),
+    ))
+    page = CustomOrdersPage(controller, lambda _result: None)
+
+    def wait_until(predicate):
+        deadline = time.monotonic() + 3
+        while not predicate() and time.monotonic() < deadline:
+            app.processEvents()
+            QTest.qWait(5)
+        assert predicate()
+
+    def cell(order_no, column):
+        return page.table.item(page._row_index_by_order_no[order_no], column).text()
+
+    try:
+        page.update_snapshot(controller.snapshot())
+        controller.snapshot_runs_in_background = True
+        controller._state.custom_orders_summary = DatasetSummary(2, "loading")
+        page.update_snapshot(controller.snapshot())
+        assert controller.started[0].wait(2)
+        generation = page._server_page_loader.generation
+        identity_cell = page.table.item(page._row_index_by_order_no["TENT"], 1)
+        for percent in range(40, 83):
+            controller.set_task_status("tent", TaskStatus.RUNNING, progress_percent=percent)
+            page.update_snapshot(controller.snapshot())
+            assert f"{percent}%" in cell("TENT", 7)
+        assert controller.calls == 2
+        assert page._server_page_loader.generation == generation
+        assert page.table.item(page._row_index_by_order_no["TENT"], 1) is identity_cell
+
+        controller.set_task_status("tent", terminal_status, progress_percent=100)
+        controller.set_task_status("cloth", TaskStatus.RUNNING, progress_percent=10)
+        page.update_snapshot(controller.snapshot())
+        assert terminal_status.label in cell("TENT", 7)
+        assert "82%" not in cell("TENT", 7)
+        assert "10%" in cell("CLOTH", 7)
+        assert "正在处理" in cell("CLOTH", 5)
+        assert "TENT" not in page._visible_pending_order_nos_cache
+        assert page._server_page_loader.generation == generation
+        assert controller.calls == 2
+
+        controller._state.custom_orders[0] = replace(
+            controller._state.custom_orders[0], workflow_stage="completed", status_text="completed")
+        controller.release[0].set()
+        wait_until(lambda: controller.started[1].is_set())
+        # The pre-completion response must not erase the terminal task result.
+        assert terminal_status.label in cell("TENT", 7)
+        assert "TENT" in page._terminal_tasks_pending_refresh
+        controller.release[1].set()
+        wait_until(lambda: page._server_page_state == "success")
+        assert not page._terminal_tasks_pending_refresh
+        assert controller.calls == 3
+        assert page._last_task_sync_at is not None
+        assert page._last_page_sync_at is not None
+    finally:
+        for event in controller.release:
+            event.set()
+        wait_until(lambda: not page._server_page_loader.has_running_requests)
+        app.processEvents()
+        page.deleteLater()
+
+
+def test_custom_sync_label_keeps_last_confirmed_time_on_failure(app):
+    controller = InMemoryBackgroundTaskController()
+    confirmed = datetime.now(timezone.utc) - timedelta(seconds=31)
+    controller.snapshot_last_success_at = confirmed
+    controller.snapshot_is_stale = True
+    page = CustomOrdersPage(controller, lambda _result: None)
+    try:
+        page.update_snapshot(controller.snapshot())
+        page._set_server_page_state("error")
+        assert page._last_task_sync_at == confirmed
+        assert "同步延迟" in page.sync_status_label.text()
+        assert "读取失败，显示上次数据" in page.sync_status_label.text()
+    finally:
+        page.deleteLater()

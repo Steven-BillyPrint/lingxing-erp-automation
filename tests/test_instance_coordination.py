@@ -4667,7 +4667,9 @@ def test_portable_configuration_import_is_isolated_by_verified_email(
 
 def test_remote_client_reuses_cached_snapshot_for_unchanged_revision(
     tmp_path: Path,
+    caplog,
 ) -> None:
+    caplog.set_level("INFO", logger="erp_automation.coordination.http_server")
     _controller, _store, service = _service(tmp_path)
     token = "t" * 48
     server = create_http_server(("127.0.0.1", 0), service, api_token=token)
@@ -4685,6 +4687,14 @@ def test_remote_client_reuses_cached_snapshot_for_unchanged_revision(
 
         assert second is first
         assert client.pending_interactions() == ()
+        snapshot_logs = [
+            record.getMessage() for record in caplog.records
+            if record.getMessage().startswith("coordination_snapshot ")
+        ]
+        assert any("unchanged=False" in entry for entry in snapshot_logs)
+        assert any("unchanged=True" in entry for entry in snapshot_logs)
+        assert all("instance_id=one" in entry and "handler_ms=" in entry for entry in snapshot_logs)
+        assert all(token not in entry for entry in snapshot_logs)
     finally:
         client.prepare_close()
         server.shutdown()
@@ -5451,3 +5461,38 @@ def test_notification_page_rpc_rejects_invalid_active_sort_ids() -> None:
             [],
             {"active_notification_ids": [0]},
         )
+
+
+
+def test_remote_snapshot_freshness_confirms_unchanged_and_retains_failure_time():
+    client = object.__new__(RemoteBackgroundTaskController)
+    client._lock = threading.RLock()
+    client._local_pause_requested = False
+    client._last_snapshot = DesktopSnapshot()
+    client._last_interactions = ()
+    client._snapshot_revision = None
+    client._revision = 0
+    client._last_error = ""
+    client.instance_id = "desktop-one"
+    client._request = lambda *_args, **_kwargs: {
+        "revision": 2, "unchanged": False,
+        "snapshot": to_jsonable(DesktopSnapshot()), "interactions": [],
+    }
+    fresh = client.snapshot()
+    confirmed = client.snapshot_last_success_at
+    assert confirmed is not None
+    assert client.snapshot_is_stale is False
+
+    def timeout(*_args, **_kwargs):
+        raise CoordinationConnectionError("Snapshot timeout")
+
+    client._request = timeout
+    stale = client.snapshot()
+    assert stale is not fresh
+    assert client.snapshot_is_stale is True
+    assert client.snapshot_last_success_at == confirmed
+    client._request = lambda *_args, **_kwargs: {"revision": 2, "unchanged": True}
+    recovered = client.snapshot()
+    assert recovered is fresh
+    assert client.snapshot_is_stale is False
+    assert client.snapshot_last_success_at >= confirmed
