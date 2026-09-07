@@ -3854,11 +3854,22 @@ def test_submission_current_running_task_overrides_previous_business_error(app):
     page.deleteLater()
 
 
-def test_submission_terminal_arrives_before_original_timeout_callback(app):
+def test_submission_terminal_arrives_before_original_timeout_callback(app, monkeypatch):
     started = threading.Event()
     release = threading.Event()
     controller = RecordingController()
     controller.control_calls_run_in_background = True
+    published = []
+    original_publish = _ControlResultThread._publish_result
+
+    def publish(worker):
+        assert qt_module.QThread.currentThread() == app.thread()
+        original_publish(worker)
+        # The result must reach the page before finished's deleteLater can
+        # destroy the sender and drop an additional queued Python callback.
+        published.append(page._submission_thread is None)
+
+    monkeypatch.setattr(_ControlResultThread, "_publish_result", publish)
 
     def submit(commands):
         controller.submitted_commands.extend(commands)
@@ -3888,6 +3899,7 @@ def test_submission_terminal_arrives_before_original_timeout_callback(app):
         while page._submission_thread is not None and time.monotonic() < deadline:
             QTest.qWait(5)
         assert page._submission_thread is None
+        assert published == [True]
         assert page._optimistic_waiting_order_nos == set()
         assert page.table.item(0, 7).text() == "真实阻塞原因"
     finally:

@@ -3754,7 +3754,10 @@ if PYSIDE6_AVAILABLE:
                     lambda result, generation=submission_generation: (
                         self._finish_checked_order_submission(result, generation)
                     ),
-                    Qt.ConnectionType.QueuedConnection,
+                    # _ControlResultThread already publishes on the UI thread
+                    # after finishing. A second queued hop can lose this lambda
+                    # when finished schedules deletion of its signal sender.
+                    Qt.ConnectionType.DirectConnection,
                 )
                 thread.finished.connect(thread.deleteLater)
                 self._submission_thread = thread
