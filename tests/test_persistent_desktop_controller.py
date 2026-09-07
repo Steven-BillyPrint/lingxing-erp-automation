@@ -548,7 +548,14 @@ def test_shared_operator_controller_does_not_recover_another_live_task_journal(
 ) -> None:
     first = _controller(tmp_path)
     first.set_emergency_stop_writes(False)
-    last_real_update = datetime(2026, 9, 4, 7, 20, 29, tzinfo=timezone.utc)
+    last_real_update = (
+        datetime.now().astimezone().replace(
+            hour=7,
+            minute=20,
+            second=29,
+            microsecond=0,
+        )
+    ).astimezone(timezone.utc)
     task = TaskRecord(
         "other-operator-live-task",
         "其他操作员正在处理的任务",
