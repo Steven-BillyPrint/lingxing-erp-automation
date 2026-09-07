@@ -305,6 +305,7 @@ class CoordinationRequestHandler(BaseHTTPRequestHandler):
                 raise ValueError(
                     "include_queue_pages requires snapshot_mode=summary_v1."
                 )
+            snapshot_started = time.monotonic()
             payload = self.server.coordination_service.snapshot_payload(
                 instance_id,
                 known_revision=known_revision,
@@ -315,6 +316,13 @@ class CoordinationRequestHandler(BaseHTTPRequestHandler):
             payload["client_update_deferred"] = update_deferred
             payload["required_version"] = (
                 self.server.coordination_service.required_client_version
+            )
+            LOGGER.info(
+                "coordination_snapshot instance_id=%s revision=%s unchanged=%s handler_ms=%s",
+                instance_id,
+                payload.get("revision"),
+                payload.get("unchanged", False),
+                round((time.monotonic() - snapshot_started) * 1000),
             )
             self._send(HTTPStatus.OK, {"ok": True, **payload})
         except ClientUpdateRequiredError as exc:
@@ -497,9 +505,10 @@ class CoordinationRequestHandler(BaseHTTPRequestHandler):
                     self.server.coordination_service.required_client_version
                 )
                 LOGGER.info(
-                    "coordination_rpc method=%s request_id=%s handler_ms=%s",
+                    "coordination_rpc method=%s request_id=%s instance_id=%s handler_ms=%s",
                     method,
                     request_id,
+                    instance_id,
                     round((time.monotonic() - rpc_started) * 1000),
                 )
             else:
