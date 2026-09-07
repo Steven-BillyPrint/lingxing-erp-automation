@@ -3922,6 +3922,47 @@ def test_submission_terminal_paints_before_paged_refresh_returns(app, monkeypatc
     page.deleteLater()
 
 
+@pytest.mark.parametrize("terminal_status", [TaskStatus.SUCCEEDED, TaskStatus.BLOCKED])
+def test_reconciled_submission_progress_coalesces_pages_but_terminal_refreshes(app, monkeypatch, terminal_status):
+    page, controller, snapshot, _receipts = _unknown_submission_page("ORDER")
+    requests = []
+    monkeypatch.setattr(page, "_load_server_page", lambda **kw: requests.append(kw))
+    monkeypatch.setattr(page, "ensure_loaded", lambda: None)
+    snapshot.server_features = ("custom_order_pagination_v1",)
+    snapshot.custom_orders_summary = DatasetSummary(1, "unchanged-revision")
+    task = TaskRecord(
+        "reconciled-task", "处理定制订单", TaskArea.CUSTOMIZATION, Capability.UPDATE_CONTACT,
+        order_no="ORDER", payload=controller.submitted_commands[0].payload,
+        status=TaskStatus.RUNNING, progress_percent=10,
+    )
+    try:
+        snapshot.tasks = [task]
+        page.update_snapshot(snapshot)
+        initial_requests = len(requests)
+        assert initial_requests == 1
+        assert not page._optimistic_waiting_order_nos
+        for progress in range(40, 83):
+            task = replace(task, progress_percent=progress,
+                           updated_at=task.updated_at + timedelta(milliseconds=100))
+            snapshot.tasks = [task]
+            page.update_snapshot(snapshot)
+            assert f"{progress}%" in page.table.item(0, 7).text()
+        assert len(requests) == initial_requests
+        snapshot.tasks = [replace(
+            task, status=terminal_status, progress_percent=100,
+            message="已收到真实任务结果", updated_at=task.updated_at + timedelta(seconds=1),
+        )]
+        page.update_snapshot(snapshot)
+        assert len(requests) == initial_requests + 1
+        assert page.table.item(0, 7).text() == "已收到真实任务结果"
+        assert "ORDER" not in page._active_order_nos
+        assert "ORDER" not in page._visible_pending_order_nos()
+        page._render_rows()
+        assert page.table.item(0, 7).text() == "已收到真实任务结果"
+    finally:
+        page.deleteLater()
+
+
 def test_process_batch_timeout_stays_non_modal_until_snapshot_confirms(
     app,
     monkeypatch,
