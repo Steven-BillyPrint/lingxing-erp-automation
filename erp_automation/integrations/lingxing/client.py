@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import logging
 import re
 import time
 from dataclasses import dataclass
@@ -37,8 +38,11 @@ DEFAULT_BASE_URL = "https://openapi.lingxing.com"
 _RETRYABLE_HTTP_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
 _TOKEN_REJECTION_CODES = frozenset({"2001003", "2001005"})
 _SIGN_REJECTION_CODES = frozenset({"2001006", "2001007"})
-_READ_RETRY_API_CODES = frozenset({"3001008"})
+_RATE_LIMIT_API_CODES = frozenset({"3001008"})
+_TRANSIENT_JSON_API_CODES = frozenset({"500"})
 _RATE_LIMIT_RETRY_BASE_DELAY_SECONDS = 2.0
+_SERVICE_ERROR_RETRY_BASE_DELAY_SECONDS = 1.0
+LOGGER = logging.getLogger(__name__)
 
 
 class AsyncHTTPClient(Protocol):
@@ -218,6 +222,14 @@ def _is_transport_exception(exc: BaseException) -> bool:
     except ImportError:
         return False
     return isinstance(exc, httpx.TransportError)
+
+
+def _is_rate_limited_api_error(exc: LingxingAPIError) -> bool:
+    # The FBM detail service also returns code 103 with this message. Unlike
+    # the global 3001008 code, 103 alone does not prove a rate-limit rejection.
+    return exc.code in _RATE_LIMIT_API_CODES or (
+        exc.code == "103" and "请求过于频繁" in exc.server_message
+    )
 
 
 def _json_payload(response: object, operation: str) -> dict[str, Any]:
@@ -465,14 +477,34 @@ class LingxingOpenAPIClient:
                     # accepted. Recreate timestamp/sign exactly once.
                     sign_recovery_used = True
                     continue
+                rate_limited = _is_rate_limited_api_error(exc)
+                # HTTP 200 can carry a service-level 500. Binary download
+                # services reuse 500 for unrelated errors (including signing),
+                # so only JSON endpoints use this transient-code policy.
+                transient_service_error = (
+                    policy.response_kind is ResponseKind.JSON
+                    and exc.code in _TRANSIENT_JSON_API_CODES
+                )
                 if (
                     policy.may_retry_transport
-                    and exc.code in _READ_RETRY_API_CODES
+                    and (rate_limited or transient_service_error)
                     and read_retries_used < self._max_read_retries
                 ):
+                    LOGGER.warning(
+                        "Retrying Lingxing read operation=%s code=%s retry=%s/%s request_id=%s",
+                        policy.name,
+                        exc.code,
+                        read_retries_used + 1,
+                        self._max_read_retries,
+                        exc.request_id or "-",
+                    )
                     await self._read_retry_sleep(
                         read_retries_used,
-                        rate_limited=True,
+                        minimum_delay=(
+                            _RATE_LIMIT_RETRY_BASE_DELAY_SECONDS
+                            if rate_limited
+                            else _SERVICE_ERROR_RETRY_BASE_DELAY_SECONDS
+                        ),
                     )
                     read_retries_used += 1
                     continue
@@ -499,14 +531,9 @@ class LingxingOpenAPIClient:
         self,
         retry_number: int,
         *,
-        rate_limited: bool = False,
+        minimum_delay: float = 0.0,
     ) -> None:
-        base_delay = self._retry_base_delay
-        if rate_limited:
-            base_delay = max(
-                base_delay,
-                _RATE_LIMIT_RETRY_BASE_DELAY_SECONDS,
-            )
+        base_delay = max(self._retry_base_delay, minimum_delay)
         await self._sleeper(base_delay * (2**retry_number))
 
     async def _send_once(

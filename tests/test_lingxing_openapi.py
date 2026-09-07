@@ -470,6 +470,171 @@ def test_write_transport_failure_is_not_retried_and_is_marked_ambiguous() -> Non
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("operation", ["list_orders", "get_fbm_order_detail"])
+@pytest.mark.parametrize(
+    ("code", "message", "expected_delays"),
+    [
+        (500, "程序内部错误", [1.0, 2.0]),
+        ("500", "程序内部错误", [1.0, 2.0]),
+        (103, "请求过于频繁,请稍后再试 [upstream-trace]", [2.0, 4.0]),
+        ("103", "请求过于频繁,请稍后再试", [2.0, 4.0]),
+    ],
+)
+def test_read_recovers_from_observed_api_errors(
+    operation: str, code: object, message: str, expected_delays: list[float]
+) -> None:
+    async def run() -> None:
+        delays: list[float] = []
+        clock = MutableClock(1_700_000_000)
+
+        async def fake_sleep(delay: float) -> None:
+            delays.append(delay)
+            clock.value += delay
+
+        http = FakeHTTPClient(
+            [
+                FakeResponse(payload={"code": code, "message": message}),
+                FakeResponse(payload={"code": code, "message": message}),
+                FakeResponse(
+                    payload={"code": 0, "data": [], "request_id": "recovered"}
+                ),
+            ]
+        )
+        client = _client_with_seeded_token(http, clock=clock, sleeper=fake_sleep)
+        body = (
+            {
+                "offset": 0,
+                "length": 200,
+                "platform_order_nos": ["702-3440598-1381068"],
+            }
+            if operation == "list_orders"
+            else {"order_number": "103741202394320125"}
+        )
+
+        result = await client.call(operation, body=body)
+
+        assert result.request_id == "recovered"
+        assert len(http.requests) == 3
+        assert delays == expected_delays
+        assert all(json.loads(request["content"]) == body for request in http.requests)
+        # Retry only the read, keep the same order, and recreate timestamp/sign.
+        assert len({request["params"]["timestamp"] for request in http.requests}) == 3
+        assert len({request["params"]["sign"] for request in http.requests}) == 3
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("max_read_retries", [0, 2])
+def test_api_error_retry_exhaustion_preserves_last_request(
+    max_read_retries: int, caplog: pytest.LogCaptureFixture
+) -> None:
+    async def run() -> None:
+        delays: list[float] = []
+
+        async def fake_sleep(delay: float) -> None:
+            delays.append(delay)
+
+        http = FakeHTTPClient(
+            [
+                FakeResponse(
+                    payload={
+                        "code": 500,
+                        "message": "程序内部错误",
+                        "request_id": f"attempt-{index}",
+                    }
+                )
+                for index in range(max_read_retries + 1)
+            ]
+        )
+        client = _client_with_seeded_token(
+            http, max_read_retries=max_read_retries, sleeper=fake_sleep
+        )
+
+        with pytest.raises(LingxingAPIError) as captured:
+            await client.list_orders(platform_order_nos=["114-5509272-4631400"])
+
+        assert len(http.requests) == max_read_retries + 1
+        assert len(delays) == max_read_retries
+        assert captured.value.code == "500"
+        assert captured.value.request_id == f"attempt-{max_read_retries}"
+        for index in range(max_read_retries):
+            assert f"request_id=attempt-{index}" in caplog.text
+        for secret in (ACCESS_TOKEN, REFRESH_TOKEN, APP_SECRET):
+            assert secret not in caplog.text
+
+    asyncio.run(run())
+
+
+def test_transient_api_and_http_failures_share_one_read_retry_budget() -> None:
+    async def run() -> None:
+        delays: list[float] = []
+
+        async def fake_sleep(delay: float) -> None:
+            delays.append(delay)
+
+        http = FakeHTTPClient(
+            [
+                FakeResponse(status_code=503),
+                FakeResponse(
+                    payload={"code": 103, "message": "请求过于频繁,请稍后再试"}
+                ),
+                FakeResponse(
+                    payload={
+                        "code": 500,
+                        "message": "程序内部错误",
+                        "request_id": "last",
+                    }
+                ),
+            ]
+        )
+        client = _client_with_seeded_token(http, sleeper=fake_sleep)
+        with pytest.raises(LingxingAPIError) as captured:
+            await client.list_orders()
+        assert captured.value.request_id == "last"
+        assert len(http.requests) == 3
+        assert delays == [0.01, 4.0]
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("code", [103, 400, 10001])
+def test_read_does_not_retry_unrecognized_business_error(code: int) -> None:
+    async def run() -> None:
+        http = FakeHTTPClient(
+            [FakeResponse(payload={"code": code, "message": "参数错误"})]
+        )
+        client = _client_with_seeded_token(http)
+        with pytest.raises(LingxingAPIError):
+            await client.list_orders()
+        assert len(http.requests) == 1
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("code", "message"),
+    [
+        (500, "程序内部错误"),
+        (103, "请求过于频繁,请稍后再试"),
+        (3001008, "requests too frequently"),
+    ],
+)
+def test_write_does_not_replay_transient_api_errors(code: int, message: str) -> None:
+    async def run() -> None:
+        http = FakeHTTPClient(
+            [FakeResponse(payload={"code": code, "message": message})]
+        )
+        client = _client_with_seeded_token(http, max_read_retries=5)
+        with pytest.raises(LingxingAPIError):
+            await client.call(
+                "set_order_remark",
+                body={"global_order_no": "103000000000000001", "remark": "test"},
+            )
+        assert len(http.requests) == 1
+
+    asyncio.run(run())
+
+
 def test_write_partial_success_raises_rich_api_error_with_request_id() -> None:
     async def run() -> None:
         http = FakeHTTPClient(
