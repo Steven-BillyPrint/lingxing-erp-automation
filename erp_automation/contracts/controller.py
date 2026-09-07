@@ -35,6 +35,7 @@ class TaskSubmissionReceipt:
     order_no: str
     request_id: str
     result: ControlResult
+    logistics_no: str = ""
 
 
 @runtime_checkable

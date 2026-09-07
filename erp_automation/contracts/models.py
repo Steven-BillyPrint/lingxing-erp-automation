@@ -205,6 +205,7 @@ DESKTOP_CONFIRMATION_PAYLOAD_KEY = "desktop_write_confirmation"
 # Correlates a UI submission with its task, including redacted snapshots.
 # This identifier is public metadata, never a write authorization.
 CUSTOM_ORDER_SUBMISSION_ID_PAYLOAD_KEY = "_custom_order_submission_id"
+SHIPMENT_SUBMISSION_ID_PAYLOAD_KEY = "_shipment_submission_id"
 DESKTOP_INSTANCE_ID_PAYLOAD_KEY = "_desktop_instance_id"
 DESKTOP_BROWSER_ENDPOINT_PAYLOAD_KEY = "_desktop_browser_endpoint"
 DESKTOP_OPERATOR_NAME_PAYLOAD_KEY = "_desktop_operator_name"
@@ -554,6 +555,9 @@ class ShipmentRow:
     re_mark_new_fee_weight_g: str = ""
     re_mark_last_error: str = ""
     re_mark_updated_at: str = ""
+    manual_review_reason: str = ""
+    manual_review_created_at: str = ""
+    manual_review_source: str = ""
 
 
 @dataclass(frozen=True)

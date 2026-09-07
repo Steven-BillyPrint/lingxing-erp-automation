@@ -3856,11 +3856,22 @@ def test_submission_current_running_task_overrides_previous_business_error(app):
     page.deleteLater()
 
 
-def test_submission_terminal_arrives_before_original_timeout_callback(app):
+def test_submission_terminal_arrives_before_original_timeout_callback(app, monkeypatch):
     started = threading.Event()
     release = threading.Event()
     controller = RecordingController()
     controller.control_calls_run_in_background = True
+    published = []
+    original_publish = _ControlResultThread._publish_result
+
+    def publish(worker):
+        assert qt_module.QThread.currentThread() == app.thread()
+        original_publish(worker)
+        # The result must reach the page before finished's deleteLater can
+        # destroy the sender and drop an additional queued Python callback.
+        published.append(page._submission_thread is None)
+
+    monkeypatch.setattr(_ControlResultThread, "_publish_result", publish)
 
     def submit(commands):
         controller.submitted_commands.extend(commands)
@@ -3890,6 +3901,7 @@ def test_submission_terminal_arrives_before_original_timeout_callback(app):
         while page._submission_thread is not None and time.monotonic() < deadline:
             QTest.qWait(5)
         assert page._submission_thread is None
+        assert published == [True]
         assert page._optimistic_waiting_order_nos == set()
         assert page.table.item(0, 7).text() == "真实阻塞原因"
     finally:
@@ -4972,7 +4984,10 @@ def test_shipment_batch_timeout_prevents_resubmit_until_snapshot_confirms(app):
                     Capability.OUTBOUND_ORDER,
                     status=TaskStatus.QUEUED,
                     order_no="111-READY",
-                    payload={"logistics_no": "ALS-READY"},
+                    payload={
+                        "logistics_no": "ALS-READY",
+                        "_shipment_submission_id": page._shipment_submissions["ALS-READY"].submission_id,
+                    },
                 )
             ],
         )
@@ -4982,6 +4997,87 @@ def test_shipment_batch_timeout_prevents_resubmit_until_snapshot_confirms(app):
     assert page._active_logistics_nos == {"ALS-READY"}
     assert "等待服务器确认" not in page.table.item(0, 11).text()
     assert TaskStatus.QUEUED.label in page.table.item(0, 11).text()
+    page.deleteLater()
+
+
+def _submission_test_row():
+    return ShipmentRow(
+        "ORDER", logistics_no="ALS", system_order_no="SYS", product_type="tent",
+        carrier="FedEx", international_tracking_no="123", actual_total="10",
+        chargeable_weight_kg="1", identity_state="ACTIVE", logistics_state="READY",
+        erp_state="PENDING", checkpoint="NONE",
+    )
+
+
+def test_shipment_rejection_receipt_clears_waiting_through_fresh_snapshots(app):
+    row = _submission_test_row()
+    controller = RecordingController(task_results={"ORDER": ControlResult(False, "超时", details={
+        "submission_outcome_unknown": True, "request_id": "request",
+    })})
+    page = ShipmentPage(controller, lambda _result: None)
+    page.update_snapshot(DesktopSnapshot(shipments=[row]))
+    page._submit_shipment_rows([row])
+    pending = page._shipment_submissions["ALS"]
+    receipts = [TaskSubmissionReceipt(
+        pending.submission_id, "ORDER", "request",
+        ControlResult(False, "人工复核锁，未入队", "historical-custom-task", details={
+            "manual_review_lock": True, "reason": "08-26 外部操作未确认",
+        }), "ALS",
+    )]
+    controller.take_task_submission_receipts = lambda _ids: tuple(receipts.pop(0) for _ in range(len(receipts)))
+    page._refresh_submission_states()
+    assert not page._unconfirmed_logistics_nos
+    assert not page._active_logistics_nos
+    assert page.table.item(0, 7).text() == "标发需人工复核"
+    assert "08-26" in page.table.item(0, 11).text()
+    assert not page._visible_ready_logistics_nos()
+    for _ in range(5):
+        page.update_snapshot(DesktopSnapshot(shipments=[row]))
+        assert page.table.item(0, 7).text() != "等待标发"
+        assert "等待服务器确认" not in page.table.item(0, 11).text()
+    locked = replace(row, manual_review_reason="外部操作未确认", manual_review_source="customization",
+                     manual_review_created_at="2026-08-26T10:10:23Z")
+    page.update_snapshot(DesktopSnapshot(shipments=[locked]))
+    assert "定制订单" in page.table.item(0, 11).text()
+    page.update_snapshot(DesktopSnapshot(shipments=[row]))
+    assert page._visible_ready_logistics_nos() == {"ALS"}
+    assert page.table.item(0, 7).text() == "可标发"
+    page.deleteLater()
+
+
+@pytest.mark.parametrize("server_pagination", [False, True])
+def test_shipment_terminal_before_first_snapshot_and_late_timeout(app, server_pagination, monkeypatch):
+    row = _submission_test_row()
+    controller = RecordingController(task_results={"ORDER": ControlResult(False, "超时", details={
+        "submission_outcome_unknown": True,
+    })})
+    page = ShipmentPage(controller, lambda _result: None)
+    page.update_snapshot(DesktopSnapshot(shipments=[row]))
+    page._submit_shipment_rows([row])
+    pending = page._shipment_submissions["ALS"]
+    task = TaskRecord(
+        "finished", "标发", TaskArea.SHIPMENT, Capability.OUTBOUND_ORDER,
+        order_no="ORDER", status=TaskStatus.SUCCEEDED, progress_percent=100, message="标发完成",
+        payload={"logistics_no": "ALS", "_shipment_submission_id": pending.submission_id},
+    )
+    if server_pagination:
+        monkeypatch.setattr(page, "_load_server_page", lambda **_kw: None)
+    snapshot = DesktopSnapshot(
+        shipments=[row], today_tasks=[task],
+        server_features=("shipment_pagination_v1",) if server_pagination else (),
+    )
+    page.update_snapshot(snapshot)
+    assert "任务已完成" in page.table.item(0, 7).text()
+    assert "100%" in page.table.item(0, 11).text()
+    assert "ALS" not in page._active_logistics_nos
+    assert not page._execution_eligibility(row)[0]
+    assert not pending.apply_receipt(TaskSubmissionReceipt(
+        pending.submission_id, "ORDER", "", ControlResult(False, "迟到超时", details={
+            "submission_outcome_unknown": True,
+        }), "ALS",
+    ))
+    page.update_snapshot(snapshot)
+    assert "等待服务器确认" not in page.table.item(0, 11).text()
     page.deleteLater()
 
 

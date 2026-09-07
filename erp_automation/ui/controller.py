@@ -3,7 +3,10 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import replace
 from threading import RLock
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
+from datetime import datetime, timezone
+import hashlib
+import json
 from uuid import uuid4
 
 from erp_automation.contracts.controller import (
@@ -24,6 +27,7 @@ from erp_automation.contracts.models import (
     LogLevel,
     CustomOrderPage,
     ShipmentPage,
+    ShipmentRow,
     MigrationInfo,
     NOTIFICATION_CONTACT_REFRESH_TRIGGER,
     NOTIFICATION_PROVIDER_TEST_TRIGGER,
@@ -80,13 +84,53 @@ class InMemoryBackgroundTaskController:
         self._state = deepcopy(initial) if initial is not None else DesktopSnapshot()
         self._lock = RLock()
         self._task_revision = 0
+        self._shipment_review_lock_provider: Callable[[], Mapping[str, Any]] | None = None
         if log_initial_backend_message and not self._state.logs:
             self._append_log(LogLevel.WARNING, "desktop", self._state.backend_message)
 
     def snapshot(self) -> DesktopSnapshot:
         with self._lock:
             self._state.today_tasks = list(self._state.tasks)
-            return deepcopy(self._state)
+            snapshot = deepcopy(self._state)
+        locks = self._shipment_review_context()
+        snapshot.shipments = list(self._shipment_rows_with_review_locks(snapshot.shipments, locks))
+        snapshot.shipments_summary = replace(
+            snapshot.shipments_summary,
+            revision=self._shipment_review_revision(snapshot.shipments_summary.revision, locks),
+        )
+        return snapshot
+
+    def set_shipment_review_lock_provider(self, provider: Callable[[], Mapping[str, Any]]) -> None:
+        self._shipment_review_lock_provider = provider
+
+    def _shipment_review_context(self) -> Mapping[str, Any]:
+        provider = self._shipment_review_lock_provider
+        return provider() if provider is not None else {}
+
+    @staticmethod
+    def _shipment_review_revision(revision: str, locks: Mapping[str, Any]) -> str:
+        if not locks:
+            return revision
+        encoded = json.dumps(locks, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        return revision + ":review:" + hashlib.sha256(encoded).hexdigest()[:16]
+
+    @staticmethod
+    def _shipment_rows_with_review_locks(
+        rows: Sequence[ShipmentRow], locks: Mapping[str, Any],
+    ) -> tuple[ShipmentRow, ...]:
+        result = []
+        for row in rows:
+            lock = locks.get(row.platform_order_no.casefold())
+            if lock:
+                row = replace(
+                    row, manual_review_reason=str(lock.get("reason") or "外部写入结果待核对。"),
+                    manual_review_created_at=datetime.fromtimestamp(
+                        float(lock["created_at"]), timezone.utc,
+                    ).isoformat(),
+                    manual_review_source=str(lock.get("source_area") or "历史任务"),
+                )
+            result.append(row)
+        return tuple(result)
 
     def task_snapshot(self) -> tuple[TaskRecord, ...]:
         """Read task state without loading business queues or task history."""
@@ -177,8 +221,9 @@ class InMemoryBackgroundTaskController:
                 and str(task.payload.get("logistics_no") or "").strip()
             }
             revision = self._state.shipments_summary.revision
+        locks = self._shipment_review_context()
         return paginate_shipment_rows(
-            rows,
+            self._shipment_rows_with_review_locks(rows, locks),
             page=page,
             page_size=page_size,
             status=status,
@@ -186,7 +231,7 @@ class InMemoryBackgroundTaskController:
             search_query=search_query,
             product_types=product_types,
             active_statuses=active_statuses,
-            dataset_revision=revision,
+            dataset_revision=self._shipment_review_revision(revision, locks),
         )
 
     def submit_task(self, command: TaskCommand) -> ControlResult:
