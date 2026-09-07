@@ -841,8 +841,9 @@ class InMemoryBackgroundTaskController:
         action: str,
         *,
         reason: str,
+        expected_re_mark_cycle_ids: Mapping[str, int] | None = None,
     ) -> ControlResult:
-        del logistics_nos, action, reason
+        del logistics_nos, action, reason, expected_re_mark_cycle_ids
         return ControlResult(False, "当前内存控制器没有连接自动标发队列。")
 
     def confirm_shipment_tracking_pair(

@@ -92,6 +92,17 @@ def _ready_row(**changes) -> ShipmentRow:
     return ShipmentRow(**values)
 
 
+def test_manually_completed_re_mark_is_terminal_and_displays_operator_confirmation():
+    row = _ready_row(
+        erp_state="DONE", re_mark_state="COMPLETED",
+        re_mark_checkpoint="MANUALLY_COMPLETED", re_mark_cycle_id=41,
+    )
+    assert _shipment_business_status(row) == "重新标发完成"
+    assert _shipment_progress_label(row) == "人工已完成"
+    assert "已人工确认" in _shipment_status_explanation(row, "重新标发完成")
+    assert "未写入 ERP" in _shipment_status_explanation(row, "重新标发完成")
+
+
 @pytest.mark.parametrize(
     ("changes", "expected"),
     [

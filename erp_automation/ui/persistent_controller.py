@@ -4730,6 +4730,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         action: str,
         *,
         reason: str,
+        expected_re_mark_cycle_ids: Mapping[str, int] | None = None,
     ) -> ControlResult:
         """Apply one guarded local transition to queue rows or scan issues."""
 
@@ -4851,14 +4852,24 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                             changed = store.restore_cancelled(
                                 logistics_no, reason=audit_reason
                             )
-                        elif action == "mark_manual_done":
-                            changed = store.mark_manually_completed(
-                                logistics_no, reason=audit_reason
-                            )
                         else:
-                            changed = store.undo_manual_completion(
-                                logistics_no, reason=audit_reason
+                            operation = (
+                                store.mark_manually_completed
+                                if action == "mark_manual_done"
+                                else store.undo_manual_completion
                             )
+                            try:
+                                changed = operation(
+                                    logistics_no, reason=audit_reason,
+                                    expected_re_mark_cycle_id=(
+                                        expected_re_mark_cycle_ids.get(logistics_no)
+                                        if expected_re_mark_cycle_ids is not None
+                                        else None
+                                    ),
+                                )
+                            except ValueError as exc:
+                                skipped_reasons[logistics_no] = str(exc)
+                                continue
                         if changed:
                             changed_logistics_nos.append(logistics_no)
                         else:
@@ -4876,7 +4887,10 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                 return ControlResult(False, f"修改自动标发队列状态失败：{type(exc).__name__}。")
             if not changed_logistics_nos:
                 detail = next(iter(skipped_reasons.values()), "当前状态不允许执行该操作")
-                return ControlResult(False, f"{detail}，状态未改变。")
+                return ControlResult(
+                    False, f"{detail}，状态未改变。",
+                    details={"changed_logistics_nos": (), "skipped_reasons": skipped_reasons},
+                )
             message = f"已修改 {len(changed_logistics_nos)} 条自动标发记录状态"
             if skipped_reasons:
                 message += f"；跳过 {len(skipped_reasons)} 条"

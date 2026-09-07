@@ -872,7 +872,9 @@ class RecordingController(InMemoryBackgroundTaskController):
         action: str,
         *,
         reason: str,
+        expected_re_mark_cycle_ids=None,
     ) -> ControlResult:
+        self.last_expected_re_mark_cycle_ids = expected_re_mark_cycle_ids
         values = list(logistics_nos)
         self.change_shipment_calls.append((values, action, reason))
         return ControlResult(
@@ -4745,6 +4747,47 @@ def test_shipment_status_dialog_uses_modern_combo_and_lists_every_reopen_stage(a
         assert dialog.action_combo.itemText(cancel_index) == "停止当前勾选任务"
     finally:
         dialog.deleteLater()
+
+
+@pytest.mark.parametrize("confirm", [True, False])
+def test_manual_re_mark_completion_previews_new_waybill_and_guards_selected_cycle(
+    app, monkeypatch, confirm,
+):
+    controller = RecordingController()
+    page = ShipmentPage(controller, lambda _result: None)
+    page.update_snapshot(DesktopSnapshot(shipments=[ShipmentRow(
+        platform_order_no="111-REMARK", system_order_no="SYS-REMARK",
+        logistics_no="ALS-REMARK", erp_state="DONE", identity_state="ACTIVE",
+        re_mark_cycle_id=41, re_mark_state="MANUAL_REVIEW",
+        re_mark_checkpoint="OUTBOUNDED", re_mark_new_carrier="UPS",
+        re_mark_new_waybill_no="1Z16GA850314607876",
+    )]))
+    page.table.item(0, 0).setCheckState(Qt.CheckState.Checked)
+    monkeypatch.setattr(_ShipmentStatusDialog, "exec", lambda _dialog: 1)
+    monkeypatch.setattr(_ShipmentStatusDialog, "selected_action", lambda _dialog: "mark_manual_done")
+    monkeypatch.setattr(_ShipmentStatusDialog, "selected_label", lambda _dialog: "标记为人工已完成")
+    monkeypatch.setattr(page, "_reason", lambda _title: "已人工核对领星")
+    prompts = []
+
+    def answer(_parent, _title, content, *_args):
+        prompts.append(content)
+        return QMessageBox.StandardButton.Yes if confirm else QMessageBox.StandardButton.No
+
+    monkeypatch.setattr(QMessageBox, "question", answer)
+    page._change_selected_status()
+    assert "SYS-REMARK" in prompts[0]
+    assert "UPS / 1Z16GA850314607876" in prompts[0]
+    assert "出库及标发结果" in prompts[0]
+    if confirm:
+        assert controller.change_shipment_calls == [
+            (["ALS-REMARK"], "mark_manual_done", "已人工核对领星"),
+        ]
+        assert controller.last_expected_re_mark_cycle_ids == {"ALS-REMARK": 41}
+        assert page._checked_logistics_nos == set()
+    else:
+        assert controller.change_shipment_calls == []
+        assert page._checked_logistics_nos == {"ALS-REMARK"}
+    page.deleteLater()
 
 
 def test_shipment_status_and_retry_ignore_blue_row_and_use_checks(app, monkeypatch):
