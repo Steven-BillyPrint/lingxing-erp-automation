@@ -2629,6 +2629,82 @@ def test_desktop_snapshot_includes_customer_shipping_service_scan_error(
     controller.close()
 
 
+def test_shipment_batch_manual_completion_handles_re_mark_and_reports_per_row_skips(tmp_path):
+    from shipment_automation.models import LogisticsDetail, ShipmentCandidate
+    from shipment_automation.queue_store import ShipmentWorkflowStore
+
+    controller = _controller(tmp_path)
+    store = ShipmentWorkflowStore(controller._shipment_state_path())
+    cycles = {}
+    for index, (carrier, waybill) in enumerate([
+        ("USPS", "9235990374018503441025"),
+        ("UPS", "1Z16GA850314607876"),
+        ("ONTRAC", "1LSD01R0017NAPB"),
+    ], start=1):
+        als = f"ALS-REMARK-{index}"
+        store.upsert_candidate(ShipmentCandidate(
+            platform_order_no=f"111-0000000-000000{index}",
+            system_order_no=f"10370000000000000{index}", logistics_no=als,
+            shipment_tag_name="自动标发", tag_text="自动标发",
+            sku_text="test", product_type="other", customer_remark="",
+            status_text="待审核", sales_platform_code="Amazon",
+            platform_order_item_ids=(f"item-{index}",),
+            logistics_provider_name="手动", logistics_type_name="万邦速达",
+        ))
+        store.complete_logistics_attempt(als, LogisticsDetail(
+            logistics_no=als, status_text="运输中", carrier="万邦速达",
+            international_tracking_no="WNBAA0494424973YQ",
+            actual_total="CNY 100", chargeable_weight_kg="2",
+        ), state="READY", last_error=None)
+        store.mark_erp_outbounded(als, email_preview_enabled=False)
+        cycle = store.record_completed_refresh_observation(als, LogisticsDetail(
+            logistics_no=als, status_text="运输中", carrier=carrier,
+            international_tracking_no=waybill, actual_total="CNY 100",
+            chargeable_weight_kg="2",
+        ))
+        assert cycle is not None
+        store.update_re_mark_checkpoint(cycle.id, checkpoint="OUTBOUNDED")
+        store.require_re_mark_manual_review(cycle.id, "外部写入结果不明确")
+        cycles[als] = cycle.id
+    try:
+        result = controller.change_shipment_statuses(
+            list(cycles), "mark_manual_done", reason="已在领星核对新物流及标发",
+            expected_re_mark_cycle_ids=cycles,
+        )
+        assert result.accepted
+        assert result.details["changed_logistics_nos"] == tuple(cycles)
+        page = controller.list_shipment_page(status="重新标发完成")
+        assert page.total == 3
+        assert all(row.re_mark_checkpoint == "MANUALLY_COMPLETED" for row in page.items)
+        assert controller.list_shipment_page(status="重新标发需人工复核").total == 0
+        undone = controller.change_shipment_statuses(
+            list(cycles), "undo_manual_done", reason="撤销人工确认",
+            expected_re_mark_cycle_ids=cycles,
+        )
+        assert undone.accepted
+        assert controller.list_shipment_page(status="重新标发需人工复核").total == 3
+
+        with store.connect() as conn:
+            conn.execute("UPDATE shipment_re_mark_cycles SET lease_owner = 'worker', "
+                         "lease_until = '2999-01-01T00:00:00Z' WHERE id = ?",
+                         (cycles["ALS-REMARK-1"],))
+        stale = {**cycles, "ALS-REMARK-2": 9999}
+        partial = controller.change_shipment_statuses(
+            list(cycles), "mark_manual_done", reason="核对完成", expected_re_mark_cycle_ids=stale,
+        )
+        assert partial.accepted
+        assert partial.details["changed_logistics_nos"] == ("ALS-REMARK-3",)
+        assert "正在执行" in partial.details["skipped_reasons"]["ALS-REMARK-1"]
+        assert "记录已更新" in partial.details["skipped_reasons"]["ALS-REMARK-2"]
+        rejected = controller.change_shipment_statuses(
+            ["ALS-REMARK-1"], "mark_manual_done", reason="核对完成",
+        )
+        assert not rejected.accepted
+        assert "正在执行" in rejected.details["skipped_reasons"]["ALS-REMARK-1"]
+    finally:
+        controller.close()
+
+
 def test_desktop_can_manually_add_shipment_and_show_identity_state(tmp_path):
     controller = _controller(tmp_path)
 

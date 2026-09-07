@@ -75,6 +75,7 @@ from .models import (
     ReadyToMarkItem,
     REMARK_ACTIVE_STATES,
     REMARK_CANCELLED,
+    REMARK_CHECKPOINT_MANUALLY_COMPLETED,
     REMARK_COMPLETED,
     REMARK_DETECTED,
     REMARK_MARK_CONFIRMED,
@@ -8199,13 +8200,151 @@ class ShipmentWorkflowStore:
             conn.commit()
         return True
 
-    def mark_manually_completed(self, logistics_no: str, *, reason: str) -> bool:
+    def _change_re_mark_manual_completion(
+        self,
+        logistics_no: str,
+        *,
+        reason: str,
+        undo: bool,
+        expected_cycle_id: int | None,
+    ) -> bool | None:
+        """Close/restore the latest cycle atomically; None means no re-mark exists.
+
+        The manual checkpoint records the operator's assertion without inventing
+        an ERP receipt or changing the original ERP completion. The audit event
+        owns the undo snapshot, so a newer cycle can never undo an older one.
+        """
+        now = utc_now()
+        logistics_fields = (
+            "service_line", "carrier_raw", "carrier_normalized",
+            "international_tracking_no", "currency", "fee_amount",
+            "chargeable_weight_kg",
+        )
+        with closing(self.connect()) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            jobs = conn.execute(
+                "SELECT j.*, e.state AS erp_state FROM shipment_jobs j "
+                "JOIN shipment_erp e ON e.job_id = j.id WHERE j.logistics_no = ?",
+                (logistics_no,),
+            ).fetchall()
+            if len(jobs) != 1:
+                return False
+            job = jobs[0]
+            cycle = conn.execute(
+                "SELECT * FROM shipment_re_mark_cycles WHERE job_id = ? "
+                "ORDER BY id DESC LIMIT 1",
+                (job["id"],),
+            ).fetchone()
+            cycle_id = int(cycle["id"]) if cycle is not None else 0
+            if expected_cycle_id is not None and cycle_id != expected_cycle_id:
+                raise ValueError("重新标发记录已更新，请刷新列表并重新核对后操作")
+            if cycle is None:
+                return None
+            if (
+                job["identity_state"] != IDENTITY_ACTIVE
+                or job["erp_state"] != ERP_DONE
+                or any(cycle[key] != job[key] for key in (
+                    "system_order_no", "platform_order_no", "logistics_no",
+                ))
+            ):
+                raise ValueError("订单身份或首次标发状态已变化，不能修改重新标发状态")
+            if _has_live_lease(job, now=now) or _has_live_lease(cycle, now=now):
+                raise ValueError("任务正在执行，不能修改重新标发状态")
+            logistics = conn.execute(
+                "SELECT * FROM shipment_logistics WHERE job_id = ?", (job["id"],),
+            ).fetchone()
+            current_logistics = {key: logistics[key] for key in logistics_fields}
+            if undo:
+                if (
+                    cycle["state"] != REMARK_COMPLETED
+                    or cycle["checkpoint"] != REMARK_CHECKPOINT_MANUALLY_COMPLETED
+                ):
+                    return False
+                event = conn.execute(
+                    "SELECT event_type, details_json FROM shipment_events "
+                    "WHERE job_id = ? AND stage = 're_mark' "
+                    "AND json_extract(details_json, '$.cycle_id') = ? "
+                    "ORDER BY id DESC LIMIT 1", (job["id"], cycle_id),
+                ).fetchone()
+                if event is None or event["event_type"] != "RE_MARK_MANUALLY_COMPLETED":
+                    return False
+                details = json.loads(event["details_json"])
+                previous = details["previous"]
+                if previous["state"] not in REMARK_ACTIVE_STATES:
+                    return False
+                if current_logistics != details["confirmed_logistics"]:
+                    raise ValueError("人工完成后物流资料已更新，不能覆盖新资料，请先人工复核")
+                new_state = previous["state"]
+                checkpoint = previous["checkpoint"]
+                last_error = previous["last_error"]
+                restored_logistics = previous["logistics"]
+                event_type = "RE_MARK_MANUAL_COMPLETION_UNDONE"
+                audit_details = {"cycle_id": cycle_id, "source": "desktop_user"}
+            else:
+                if cycle["state"] not in REMARK_ACTIVE_STATES:
+                    return False
+                new_state = REMARK_COMPLETED
+                checkpoint = REMARK_CHECKPOINT_MANUALLY_COMPLETED
+                last_error = None
+                restored_logistics = {
+                    "service_line": cycle["new_service_line"] or logistics["service_line"],
+                    "carrier_raw": cycle["new_carrier"],
+                    "carrier_normalized": cycle["new_carrier"],
+                    "international_tracking_no": cycle["new_waybill_no"],
+                    "currency": cycle["new_currency"],
+                    "fee_amount": cycle["new_freight"],
+                    "chargeable_weight_kg": format(
+                        Decimal(str(cycle["new_fee_weight_g"])) / Decimal("1000"), "f",
+                    ),
+                }
+                event_type = "RE_MARK_MANUALLY_COMPLETED"
+                audit_details = {
+                    "cycle_id": cycle_id, "source": "desktop_user",
+                    "previous": {
+                        "state": cycle["state"], "checkpoint": cycle["checkpoint"],
+                        "last_error": cycle["last_error"], "logistics": current_logistics,
+                    },
+                    "confirmed_logistics": restored_logistics,
+                }
+            conn.execute(
+                "UPDATE shipment_logistics SET "
+                + ", ".join(f"{key} = ?" for key in logistics_fields)
+                + ", updated_at = ? WHERE job_id = ?",
+                (*[restored_logistics[key] for key in logistics_fields], now, job["id"]),
+            )
+            conn.execute(
+                "UPDATE shipment_re_mark_cycles SET state = ?, checkpoint = ?, "
+                "last_error = ?, lease_owner = NULL, lease_until = NULL, updated_at = ? "
+                "WHERE id = ?",
+                (new_state, checkpoint, last_error, now, cycle_id),
+            )
+            conn.execute(
+                "UPDATE shipment_jobs SET updated_at = ?, version = version + 1 "
+                "WHERE id = ?", (now, job["id"]),
+            )
+            self._insert_event_conn(
+                conn, job_id=job["id"], stage="re_mark", event_type=event_type,
+                old_state=cycle["state"], new_state=new_state,
+                message=reason, details=audit_details,
+            )
+            conn.commit()
+        return True
+
+    def mark_manually_completed(
+        self, logistics_no: str, *, reason: str, expected_re_mark_cycle_id: int | None = None,
+    ) -> bool:
         """Record an operator-confirmed external completion without writing ERP."""
 
         audit_reason = str(reason or "").strip()
         if not audit_reason:
             raise ValueError("标记人工完成必须填写原因。")
         self.initialize()
+        re_mark_changed = self._change_re_mark_manual_completion(
+            logistics_no, reason=audit_reason, undo=False,
+            expected_cycle_id=expected_re_mark_cycle_id,
+        )
+        if re_mark_changed is not None:
+            return re_mark_changed
         job = self.get_by_logistics_no(logistics_no)
         if (
             not job
@@ -8269,13 +8408,21 @@ class ShipmentWorkflowStore:
             conn.commit()
         return True
 
-    def undo_manual_completion(self, logistics_no: str, *, reason: str) -> bool:
+    def undo_manual_completion(
+        self, logistics_no: str, *, reason: str, expected_re_mark_cycle_id: int | None = None,
+    ) -> bool:
         """Undo only a completion created by :meth:`mark_manually_completed`."""
 
         audit_reason = str(reason or "").strip()
         if not audit_reason:
             raise ValueError("撤销人工完成必须填写原因。")
         self.initialize()
+        re_mark_changed = self._change_re_mark_manual_completion(
+            logistics_no, reason=audit_reason, undo=True,
+            expected_cycle_id=expected_re_mark_cycle_id,
+        )
+        if re_mark_changed is not None:
+            return re_mark_changed
         job = self.get_by_logistics_no(logistics_no)
         if (
             not job

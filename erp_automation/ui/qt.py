@@ -895,6 +895,8 @@ def _shipment_checkpoint_label(value: object) -> str:
 
 def _shipment_progress_label(row: ShipmentRow) -> str:
     re_mark_state = str(row.re_mark_state or "").strip().upper()
+    if re_mark_state == "COMPLETED" and row.re_mark_checkpoint == "MANUALLY_COMPLETED":
+        return "人工已完成"
     if re_mark_state and re_mark_state != "CANCELLED":
         return _RE_MARK_PROGRESS_LABELS.get(re_mark_state, re_mark_state)
     return _shipment_checkpoint_label(row.checkpoint)
@@ -1042,6 +1044,11 @@ def _shipment_status_explanation(row: ShipmentRow, status: str) -> str:
             f"{row.re_mark_new_waybill_no or '-'}；可执行“更新物流单号”。"
         )
     if status == "重新标发完成":
+        if row.re_mark_checkpoint == "MANUALLY_COMPLETED":
+            return (
+                "已人工确认领星新运单和标发结果，重新标发已结案；"
+                "本次仅更新管理记录，未写入 ERP 或重发客户通知。"
+            )
         return "新物流已重新出库并完成订单标发；原客户发货通知不会重复发送。"
     if status == "重新标发处理中":
         return "正在按系统单号执行撤销、OpenAPI 重设物流、重新出库和可更新标发。"
@@ -4249,6 +4256,8 @@ if PYSIDE6_AVAILABLE:
             if pending is not None and pending.awaiting_ack:
                 return "submission_check_pending" if pending.check_required else "waiting"
             if task is not None:
+                if task.status is TaskStatus.SUCCEEDED and row.workflow_stage == "completed":
+                    return "completed"
                 return "task_succeeded" if task.status is TaskStatus.SUCCEEDED else task.status.value
             if row.platform_order_no in self._active_order_nos:
                 return "waiting"
@@ -6514,6 +6523,17 @@ if PYSIDE6_AVAILABLE:
             if reason is None:
                 return
             preview = "\n".join(f"• {row.platform_order_no}" for row in rows[:10])
+            re_mark_rows = [row for row in rows if int(row.re_mark_cycle_id or 0) > 0]
+            manual_action = action in {"mark_manual_done", "undo_manual_done"}
+            if manual_action and re_mark_rows:
+                preview = "\n".join(
+                    f"• {row.platform_order_no}（系统单号：{row.system_order_no}）"
+                    + (
+                        f"\n  新运单：{row.re_mark_new_carrier} / {row.re_mark_new_waybill_no}"
+                        if row.re_mark_cycle_id else ""
+                    )
+                    for row in rows[:10]
+                )
             if len(rows) > 10:
                 preview += f"\n• ……另有 {len(rows) - 10} 张"
             if action.startswith("reopen:"):
@@ -6525,6 +6545,17 @@ if PYSIDE6_AVAILABLE:
                 )
             else:
                 warning = "该操作只修改本地管理状态，不会立即向 ERP 发送请求。"
+                if re_mark_rows and action == "mark_manual_done":
+                    warning += (
+                        "\n请先逐单在领星核对承运商、新运单号、出库及标发结果，"
+                        "仅在已经人工完成且核对无误后确认。确认后结束对应重新标发流程，"
+                        "记录人工完成原因，不会重发客户通知。"
+                    )
+                elif re_mark_rows and action == "undo_manual_done":
+                    warning += (
+                        "\n将恢复人工结案前的重新标发状态和物流记录，"
+                        "原人工复核原因会保留；不会撤销领星中的操作。"
+                    )
                 if has_scan_issues:
                     warning += (
                         " 扫描错误仍会保留原始错误和操作历史，且始终不能直接执行标发。"
@@ -6550,6 +6581,12 @@ if PYSIDE6_AVAILABLE:
                     selection_keys,
                     action,
                     reason=reason,
+                    **({
+                        "expected_re_mark_cycle_ids": {
+                            _shipment_selection_key(row): int(row.re_mark_cycle_id or 0)
+                            for row in rows if not row.scan_issue_code
+                        },
+                    } if manual_action else {}),
                 )
             display_by_key = {
                 _shipment_selection_key(row): row.platform_order_no for row in rows

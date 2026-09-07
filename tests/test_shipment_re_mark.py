@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -104,6 +105,159 @@ def _completed_store(tmp_path, **candidate_changes) -> ShipmentQueueStore:
         email_preview_enabled=True,
     )
     return store
+
+
+def _manual_review_cycle(store):
+    cycle = store.record_completed_refresh_observation(LOGISTICS_NO, _new_detail())
+    assert cycle is not None
+    store.update_re_mark_checkpoint(cycle.id, checkpoint=ERP_CHECKPOINT_OUTBOUNDED)
+    store.require_re_mark_manual_review(cycle.id, "外部写入结果不明确：RuntimeError")
+    return store.get_re_mark_cycle(cycle.id)
+
+
+def test_manual_completion_closes_re_mark_and_undo_restores_review_without_receipts(tmp_path):
+    store = _completed_store(tmp_path)
+    cycle = _manual_review_cycle(store)
+    with store.connect() as conn:
+        erp_before = dict(conn.execute("SELECT * FROM shipment_erp").fetchone())
+        notifications_before = list(conn.execute("SELECT * FROM shipment_email_batches"))
+        receipts_before = dict(conn.execute(
+            "SELECT platform_marked_at, reoutbounded_at FROM shipment_re_mark_cycles"
+        ).fetchone())
+
+    assert store.mark_manually_completed(
+        LOGISTICS_NO, reason="已在领星核对新运单、出库和标发结果", expected_re_mark_cycle_id=cycle.id,
+    )
+    completed = store.get_re_mark_cycle(cycle.id)
+    assert completed.state == REMARK_COMPLETED
+    assert completed.checkpoint == "MANUALLY_COMPLETED"
+    assert completed.last_error == ""
+    assert store.list_re_mark_cycles() == []
+    assert store.claim_re_mark_cycle(cycle.id, "other-worker") is None
+    assert not store.mark_manually_completed(LOGISTICS_NO, reason="重复确认")
+    row = store.get_by_logistics_no(LOGISTICS_NO)
+    assert row["international_tracking_no"] == NEW_WAYBILL_NO
+    assert row["carrier"] == "ONTRAC"
+    event = store.history(LOGISTICS_NO)[-1]
+    assert event.event_type == "RE_MARK_MANUALLY_COMPLETED"
+    assert event.details["cycle_id"] == cycle.id
+    assert event.details["previous"]["last_error"] == cycle.last_error
+    assert event.message == "已在领星核对新运单、出库和标发结果"
+    with store.connect() as conn:
+        assert dict(conn.execute("SELECT * FROM shipment_erp").fetchone()) == erp_before
+        assert list(conn.execute("SELECT * FROM shipment_email_batches")) == notifications_before
+        assert dict(conn.execute(
+            "SELECT platform_marked_at, reoutbounded_at FROM shipment_re_mark_cycles"
+        ).fetchone()) == receipts_before
+
+    assert store.undo_manual_completion(LOGISTICS_NO, reason="人工确认有误")
+    restored = store.get_re_mark_cycle(cycle.id)
+    assert restored.state == REMARK_MANUAL_REVIEW
+    assert restored.checkpoint == ERP_CHECKPOINT_OUTBOUNDED
+    assert restored.last_error == cycle.last_error
+    assert store.get_by_logistics_no(LOGISTICS_NO)["international_tracking_no"] == OLD_WAYBILL_NO
+    assert store.history(LOGISTICS_NO)[-1].event_type == "RE_MARK_MANUAL_COMPLETION_UNDONE"
+    assert not store.undo_manual_completion(LOGISTICS_NO, reason="重复撤销")
+    assert store.mark_manually_completed(LOGISTICS_NO, reason="再次核对完成")
+    assert store.undo_manual_completion(LOGISTICS_NO, reason="再次撤销")
+
+
+@pytest.mark.parametrize("table", ["shipment_jobs", "shipment_re_mark_cycles"])
+@pytest.mark.parametrize("lease_until", ["2999-01-01T00:00:00Z", None, "invalid"])
+def test_re_mark_manual_completion_does_not_interrupt_workers(tmp_path, table, lease_until):
+    store = _completed_store(tmp_path)
+    cycle = _manual_review_cycle(store)
+    with store.connect() as conn:
+        conn.execute(f"UPDATE {table} SET lease_owner = 'worker', lease_until = ?", (lease_until,))
+    with pytest.raises(ValueError, match="任务正在执行"):
+        store.mark_manually_completed(LOGISTICS_NO, reason="核对完成")
+    assert store.get_re_mark_cycle(cycle.id).state == REMARK_MANUAL_REVIEW
+    assert store.get_by_logistics_no(LOGISTICS_NO)["international_tracking_no"] == OLD_WAYBILL_NO
+
+
+def test_manual_re_mark_completion_accepts_expired_lease_but_rejects_stale_selection(tmp_path):
+    store = _completed_store(tmp_path)
+    cycle = _manual_review_cycle(store)
+    for expected_id in (0, cycle.id + 1):
+        with pytest.raises(ValueError, match="记录已更新"):
+            store.mark_manually_completed(
+                LOGISTICS_NO, reason="核对完成", expected_re_mark_cycle_id=expected_id,
+            )
+    with store.connect() as conn:
+        conn.execute("UPDATE shipment_re_mark_cycles SET lease_owner = 'expired', "
+                     "lease_until = '2000-01-01T00:00:00Z'")
+    assert store.mark_manually_completed(
+        LOGISTICS_NO, reason="核对完成", expected_re_mark_cycle_id=cycle.id,
+    )
+
+
+def test_manual_completion_cannot_undo_automatically_completed_or_newer_cycle(tmp_path):
+    store = _completed_store(tmp_path)
+    cycle = _manual_review_cycle(store)
+    assert store.mark_manually_completed(LOGISTICS_NO, reason="核对完成")
+    newer = store.record_completed_refresh_observation(
+        LOGISTICS_NO, replace(_new_detail(), international_tracking_no="1LSD01R0018AGME"),
+    )
+    assert newer is not None and newer.id != cycle.id
+    assert not store.undo_manual_completion(LOGISTICS_NO, reason="不能撤销旧周期")
+    with pytest.raises(ValueError, match="记录已更新"):
+        store.undo_manual_completion(
+            LOGISTICS_NO, reason="旧界面", expected_re_mark_cycle_id=cycle.id,
+        )
+    assert store.reconcile_completed_refresh_lingxing_waybill(
+        system_order_no=SYSTEM_ORDER_NO, platform_order_no=PLATFORM_ORDER_NO,
+        logistics_no=LOGISTICS_NO, current_waybill_no=newer.new_waybill_no,
+    )["resolved_cycle_count"] == 1
+    assert not store.undo_manual_completion(LOGISTICS_NO, reason="不能撤销自动确认")
+
+
+def test_manual_completion_undo_preserves_subsequent_logistics_update(tmp_path):
+    store = _completed_store(tmp_path)
+    cycle = _manual_review_cycle(store)
+    assert store.mark_manually_completed(LOGISTICS_NO, reason="核对完成")
+    with store.connect() as conn:
+        conn.execute("UPDATE shipment_logistics SET fee_amount = '200.00'")
+    with pytest.raises(ValueError, match="物流资料已更新"):
+        store.undo_manual_completion(LOGISTICS_NO, reason="撤销")
+    assert store.get_re_mark_cycle(cycle.id).state == REMARK_COMPLETED
+    assert store.get_by_logistics_no(LOGISTICS_NO)["fee_amount"] == "200.00"
+
+
+def test_manual_re_mark_completion_rolls_back_if_audit_cannot_be_saved(tmp_path, monkeypatch):
+    store = _completed_store(tmp_path)
+    cycle = _manual_review_cycle(store)
+
+    def fail_audit(*args, **kwargs):
+        raise sqlite3.OperationalError("audit unavailable")
+
+    monkeypatch.setattr(store, "_insert_event_conn", fail_audit)
+    with pytest.raises(sqlite3.OperationalError, match="audit unavailable"):
+        store.mark_manually_completed(LOGISTICS_NO, reason="核对完成")
+    assert store.get_re_mark_cycle(cycle.id).state == REMARK_MANUAL_REVIEW
+    assert store.get_by_logistics_no(LOGISTICS_NO)["international_tracking_no"] == OLD_WAYBILL_NO
+
+
+@pytest.mark.parametrize("operation", ["mark_manually_completed", "undo_manual_completion"])
+def test_manual_re_mark_changes_require_a_reason(tmp_path, operation):
+    store = _completed_store(tmp_path)
+    _manual_review_cycle(store)
+    with pytest.raises(ValueError, match="必须填写原因"):
+        getattr(store, operation)(LOGISTICS_NO, reason=" ")
+
+
+@pytest.mark.parametrize("change", [
+    "UPDATE shipment_jobs SET identity_state = 'CONFLICT'",
+    "UPDATE shipment_erp SET state = 'WAITING'",
+    "UPDATE shipment_jobs SET system_order_no = 'OTHER-ORDER'",
+])
+def test_manual_re_mark_completion_rejects_changed_order_identity(tmp_path, change):
+    store = _completed_store(tmp_path)
+    cycle = _manual_review_cycle(store)
+    with store.connect() as conn:
+        conn.execute(change)
+    with pytest.raises(ValueError, match="订单身份或首次标发状态已变化"):
+        store.mark_manually_completed(LOGISTICS_NO, reason="核对完成")
+    assert store.get_re_mark_cycle(cycle.id).state == REMARK_MANUAL_REVIEW
 
 
 @pytest.mark.parametrize(

@@ -328,6 +328,7 @@ class BackgroundTaskController(QueueQueryController, Protocol):
         action: str,
         *,
         reason: str,
+        expected_re_mark_cycle_ids: Mapping[str, int] | None = None,
     ) -> ControlResult: ...
 
     def confirm_shipment_tracking_pair(
