@@ -27,6 +27,16 @@ class ControlResult:
     details: Mapping[str, Any] = field(default_factory=dict, repr=False)
 
 
+@dataclass(frozen=True)
+class TaskSubmissionReceipt:
+    """Local transport receipt; request completion is not task completion."""
+
+    submission_id: str
+    order_no: str
+    request_id: str
+    result: ControlResult
+
+
 @runtime_checkable
 class QueueQueryController(Protocol):
     """Read-only paged queue boundary shared by local and remote clients."""
