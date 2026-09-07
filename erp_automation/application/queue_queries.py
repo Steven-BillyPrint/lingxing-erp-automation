@@ -177,6 +177,8 @@ def _timestamp_value(value: object) -> float:
 
 
 def shipment_status_timestamp(row: ShipmentRow) -> str:
+    if row.manual_review_reason:
+        return row.manual_review_created_at
     if row.scan_issue_code:
         return row.scan_issue_state_changed_at or row.updated_at or row.last_scanned_at
     if row.re_mark_state:
@@ -209,6 +211,11 @@ def _has_live_lease(row: ShipmentRow, *, now: datetime | None = None) -> bool:
 
 
 def shipment_business_status(row: ShipmentRow, *, now: datetime | None = None) -> str:
+    if row.manual_review_reason and (
+        row.erp_state.strip().upper() != "DONE"
+        or row.re_mark_state.strip().upper() not in {"", "COMPLETED", "CANCELLED"}
+    ):
+        return "标发需人工复核"
     if row.scan_issue_code:
         return {
             "MANUAL_REVIEW": "标发需人工复核",
@@ -350,6 +357,8 @@ def paginate_shipment_rows(
     normalized_status = str(status or "").strip()
 
     def display_status(row: ShipmentRow) -> str:
+        if row.manual_review_reason:
+            return shipment_business_status(row)
         return str(overlays.get(row.logistics_no) or shipment_business_status(row))
 
     filtered = [

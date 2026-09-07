@@ -3172,6 +3172,8 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         index_rows = tuple(
             shipment_row_from_mapping(row) for row in raw_index_rows
         )
+        locks = self._shipment_review_context()
+        index_rows = self._shipment_rows_with_review_locks(index_rows, locks)
         page_projection = paginate_shipment_rows(
             index_rows,
             page=page,
@@ -3181,7 +3183,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             search_query=search_query,
             product_types=product_types,
             active_statuses=self._active_shipment_statuses(),
-            dataset_revision=sqlite_dataset_revision(shipment_path),
+            dataset_revision=self._shipment_review_revision(sqlite_dataset_revision(shipment_path), locks),
         )
         selected_logistics_nos = tuple(
             row.logistics_no
@@ -3209,7 +3211,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             for row in page_projection.items
         )
         return ShipmentPage(
-            items=complete_items,
+            items=self._shipment_rows_with_review_locks(complete_items, locks),
             page=page_projection.page,
             page_size=page_projection.page_size,
             total=page_projection.total,
@@ -3282,7 +3284,9 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         )
         snapshot.shipments_summary = DatasetSummary(
             total=shipment_total,
-            revision=sqlite_dataset_revision(shipment_path),
+            revision=self._shipment_review_revision(
+                sqlite_dataset_revision(shipment_path), self._shipment_review_context(),
+            ),
             latest_updated_at=shipment_latest,
         )
         # Customer notifications share the shipment SQLite database but keep

@@ -257,6 +257,10 @@ class CoordinationStore:
                     "updated_at",
                     "REAL NOT NULL DEFAULT 0",
                 )
+                self._ensure_column(
+                    connection, "coordination_manual_review_locks", "source_area",
+                    "TEXT NOT NULL DEFAULT ''",
+                )
                 # A RUNNING row can survive only when the previous server
                 # process stopped before persisting a response.  Preserve the
                 # request identity and expose the uncertainty instead of
@@ -703,6 +707,7 @@ class CoordinationStore:
         *,
         task_id: str,
         reason: str = "",
+        source_area: str = "",
     ) -> None:
         normalized = self._normalize_resources(resources)
         task = self._validate_identifier(task_id, label="task_id")
@@ -713,15 +718,20 @@ class CoordinationStore:
             connection.executemany(
                 """
                 INSERT INTO coordination_manual_review_locks(
-                    resource, task_id, reason, created_at
-                ) VALUES (?, ?, ?, ?)
+                    resource, task_id, reason, created_at, source_area
+                ) VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT(resource) DO UPDATE SET
                     task_id = excluded.task_id,
                     reason = excluded.reason,
-                    created_at = excluded.created_at
+                    created_at = CASE
+                        WHEN coordination_manual_review_locks.task_id = excluded.task_id
+                        THEN coordination_manual_review_locks.created_at ELSE excluded.created_at END,
+                    source_area = CASE WHEN excluded.source_area <> ''
+                        OR coordination_manual_review_locks.task_id <> excluded.task_id THEN excluded.source_area
+                        ELSE coordination_manual_review_locks.source_area END
                 """,
                 (
-                    (resource, task, str(reason or "").strip()[:500], now)
+                    (resource, task, str(reason or "").strip()[:500], now, str(source_area or "")[:40])
                     for resource in normalized
                 ),
             )
@@ -734,7 +744,7 @@ class CoordinationStore:
         with self._connect() as connection:
             row = connection.execute(
                 f"""
-                SELECT resource, task_id, reason, created_at
+                SELECT resource, task_id, reason, created_at, source_area
                 FROM coordination_manual_review_locks
                 WHERE resource IN ({placeholders})
                 ORDER BY created_at, resource
@@ -743,6 +753,15 @@ class CoordinationStore:
                 normalized,
             ).fetchone()
         return dict(row) if row is not None else None
+
+    def order_review_locks(self) -> dict[str, dict[str, Any]]:
+        """Shared order guards; omit private task IDs and operator identities."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT resource, reason, created_at, source_area "
+                "FROM coordination_manual_review_locks WHERE resource LIKE 'order:%'"
+            ).fetchall()
+        return {str(row["resource"])[6:]: dict(row) for row in rows}
 
     def clear_manual_review_locks(self, resources: Iterable[str]) -> int:
         normalized = self._normalize_resources(resources)

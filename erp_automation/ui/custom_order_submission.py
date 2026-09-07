@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from erp_automation.contracts.controller import ControlResult, TaskSubmissionReceipt
 from erp_automation.contracts.models import (
     CUSTOM_ORDER_SUBMISSION_ID_PAYLOAD_KEY,
+    SHIPMENT_SUBMISSION_ID_PAYLOAD_KEY,
     TaskArea,
     TaskRecord,
 )
@@ -40,7 +41,8 @@ class CustomOrderSubmission:
     @property
     def task_id(self) -> str:
         return self.task.task_id if self.task else str(
-            self.result.task_id if self.result and self.result.task_id else ""
+            self.result.task_id
+            if self.result and self.result.accepted and self.result.task_id else ""
         )
 
     def apply_receipt(self, receipt: TaskSubmissionReceipt, *, now: float | None = None) -> bool:
@@ -66,12 +68,15 @@ class CustomOrderSubmission:
             self.check_required |= bool(receipt.result.details.get("reconciliation_exhausted"))
         return changed
 
-    def observe_task(self, task: TaskRecord) -> bool:
+    def _matches_task(self, task: TaskRecord) -> bool:
         if task.area is not TaskArea.CUSTOMIZATION or task.order_no != self.order_no:
             return False
-        if task.task_id != self.task_id and str(
+        return task.task_id == self.task_id or str(
             task.payload.get(CUSTOM_ORDER_SUBMISSION_ID_PAYLOAD_KEY) or ""
-        ) != self.submission_id:
+        ) == self.submission_id
+
+    def observe_task(self, task: TaskRecord) -> bool:
+        if not self._matches_task(task):
             return False
         if self.task is not None and (
             task.updated_at < self.task.updated_at
@@ -94,3 +99,27 @@ class CustomOrderSubmission:
             self.check_required = True
             return True
         return False
+
+
+@dataclass
+class ShipmentSubmission(CustomOrderSubmission):
+    """One shipment attempt, also disambiguating parcels of the same order."""
+
+    logistics_no: str = ""
+
+    def apply_receipt(self, receipt: TaskSubmissionReceipt, *, now: float | None = None) -> bool:
+        if receipt.logistics_no != self.logistics_no:
+            return False
+        return super().apply_receipt(receipt, now=now)
+
+    def _matches_task(self, task: TaskRecord) -> bool:
+        return (
+            task.area is TaskArea.SHIPMENT
+            and task.order_no == self.order_no
+            and str(task.payload.get("logistics_no") or "") == self.logistics_no
+            and (
+                task.task_id == self.task_id
+                or str(task.payload.get(SHIPMENT_SUBMISSION_ID_PAYLOAD_KEY) or "")
+                == self.submission_id
+            )
+        )
