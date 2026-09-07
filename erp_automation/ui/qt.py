@@ -11,12 +11,13 @@ from time import monotonic
 from uuid import uuid4
 
 from erp_automation.contracts.controller import TaskSubmissionReceipt
+from erp_automation.contracts.operation_feedback import operation_rejection
 from erp_automation.contracts.models import CUSTOM_ORDER_SUBMISSION_ID_PAYLOAD_KEY, SHIPMENT_SUBMISSION_ID_PAYLOAD_KEY
 from erp_automation.coordination.remote_controller import (
     CoordinationClientUpdateRequired,
 )
 from erp_automation.client_version import CLIENT_VERSION
-from erp_automation.operations.scan_audit import scan_audit_directory_name
+from erp_automation.operations.scan_audit import redact_audit_text, scan_audit_directory_name
 from erp_automation.runtime_mode import (
     is_local_test_mode,
     is_local_test_shared_server_mode,
@@ -24,6 +25,7 @@ from erp_automation.runtime_mode import (
 )
 from lingxing_automation.products.catalog import preferred_product_type
 from shipment_automation.models import shipment_tracking_attention_notice
+from shipment_automation.alibaba_logistics import REAL_OVERSEAS_CARRIER_DISPLAY_NAMES
 from shipment_automation.notification_queue import (
     STATUS_INCONSISTENT_PROVIDER_EVIDENCE,
     notification_has_inconsistent_provider_evidence,
@@ -189,6 +191,16 @@ def _notification_status_explanation(notification: Mapping[str, object]) -> str:
         if error.startswith("outbound_ineligible:"):
             _prefix, _state, reason = (error.split(":", 2) + [""])[:3]
             return {
+                "wms_snapshot_unavailable": (
+                    "上次读取 WMS 数据失败，未能完成出库核验；"
+                    "这不代表订单未出库，可同步物流或人工重新提交审核。"
+                ),
+                "platform_order_facts_unavailable": (
+                    "上次读取订单子单信息失败，请重新同步或人工重新提交审核。"
+                ),
+                "notification_sync_processing_failed": (
+                    "上次通知同步处理失败，请重新同步或人工重新提交审核。"
+                ),
                 "waiting_for_all_customer_visible_packages_outbound": (
                     "尚无客户可见包裹被领星 WMS 明确确认为已出库，"
                     "已保留扫描任务并等待下次同步。"
@@ -1223,8 +1235,21 @@ if PYSIDE6_AVAILABLE:
         dialog.exec()
 
 
+    def _control_operation_result(operation: Callable[[], ControlResult]) -> ControlResult:
+        try:
+            return operation()
+        except Exception as exc:
+            reason = redact_audit_text(str(exc), redact_phone=False).strip()
+            return ControlResult(
+                False,
+                f"操作失败：{reason or type(exc).__name__}",
+                details={"operation_failed": True},
+            )
+
+
     class _ControlResultThread(QThread):
         result_ready = Signal(object)
+        delivery_finished = Signal()
 
         def __init__(self, operation: Callable[[], ControlResult], parent=None) -> None:
             super().__init__(parent)
@@ -1242,20 +1267,14 @@ if PYSIDE6_AVAILABLE:
             )
 
         def run(self) -> None:
-            try:
-                result = self._operation()
-            except Exception as exc:  # pragma: no cover - defensive UI boundary
-                result = ControlResult(
-                    False,
-                    f"后台操作失败：{type(exc).__name__}。",
-                )
-            self._result = result
+            self._result = _control_operation_result(self._operation)
 
         def _publish_result(self) -> None:
             result = self._result
             self._result = None
             if result is not None:
                 self.result_ready.emit(result)
+            self.delivery_finished.emit()
 
 
     class _ValueThread(QThread):
@@ -1622,7 +1641,7 @@ if PYSIDE6_AVAILABLE:
             getattr(controller, "snapshot_runs_in_background", False)
             or getattr(controller, "control_calls_run_in_background", False)
         ):
-            result_handler(operation())
+            result_handler(_control_operation_result(operation))
             return
         threads = getattr(owner, "_responsive_control_threads", None)
         if threads is None:
@@ -1639,7 +1658,9 @@ if PYSIDE6_AVAILABLE:
                 QTimer.singleShot(0, window.close)
 
         thread.result_ready.connect(result_handler)
-        thread.finished.connect(cleanup)
+        # The finished signal only schedules publication on the GUI thread.
+        # Keep ownership until the result callback (including its dialog) ran.
+        thread.delivery_finished.connect(cleanup)
         thread.start()
 
 
@@ -3766,7 +3787,7 @@ if PYSIDE6_AVAILABLE:
                     # when finished schedules deletion of its signal sender.
                     Qt.ConnectionType.DirectConnection,
                 )
-                thread.finished.connect(thread.deleteLater)
+                thread.delivery_finished.connect(thread.deleteLater)
                 self._submission_thread = thread
                 thread.start()
                 return
@@ -3998,6 +4019,9 @@ if PYSIDE6_AVAILABLE:
                     f"已排队 {len(accepted_order_nos)} 张，未排队 {len(rejected)} 张。\n\n"
                     f"{rejected_preview}",
                 )
+                result = replace(result, details={
+                    **dict(result.details), "rejection_notice_shown": True,
+                })
             self._update_active_order_cells(set(self._order_submissions))
             self._refresh_visible_row_caches()
             self._apply_status_filter()
@@ -5539,21 +5563,7 @@ if PYSIDE6_AVAILABLE:
 
 
     class _ConfirmedShipmentTrackingDialog(QDialog):
-        CARRIERS = (
-            "UPS",
-            "FedEx",
-            "DHL",
-            "USPS",
-            "GOFO",
-            "Yanwen",
-            "SpeedX",
-            "泛远",
-            "UniUni",
-            "1ST",
-            "SwiftX",
-            "Canada Post",
-            "Aramex",
-        )
+        CARRIERS = tuple(REAL_OVERSEAS_CARRIER_DISPLAY_NAMES.values())
 
         def __init__(
             self,
@@ -6605,17 +6615,13 @@ if PYSIDE6_AVAILABLE:
                     self._clear_checked_shipments(changed)
                 skipped = dict(result.details.get("skipped_reasons") or {})
                 if skipped:
-                    detail = "\n".join(
-                        f"• {display_by_key.get(identifier, identifier)}：{message}"
-                        for identifier, message in list(skipped.items())[:10]
-                    )
-                    if len(skipped) > 10:
-                        detail += f"\n• ……另有 {len(skipped) - 10} 条"
-                    QMessageBox.warning(
-                        self,
-                        "部分任务未修改",
-                        f"以下任务保留勾选：\n\n{detail}",
-                    )
+                    result = replace(result, details={
+                        **dict(result.details),
+                        "skipped_reasons": {
+                            display_by_key.get(key, key): value
+                            for key, value in skipped.items()
+                        },
+                    })
                 self._result_handler(result)
 
             _run_control_result_responsive(
@@ -6809,7 +6815,7 @@ if PYSIDE6_AVAILABLE:
                 self._update_selection_summary()
                 thread = _ControlResultThread(submit, self)
                 thread.result_ready.connect(self._finish_shipment_submission)
-                thread.finished.connect(thread.deleteLater)
+                thread.delivery_finished.connect(thread.deleteLater)
                 self._submission_thread = thread
                 thread.start()
                 return
@@ -6961,7 +6967,7 @@ if PYSIDE6_AVAILABLE:
                     self,
                 )
                 thread.result_ready.connect(self._finish_shipment_submission)
-                thread.finished.connect(thread.deleteLater)
+                thread.delivery_finished.connect(thread.deleteLater)
                 self._submission_thread = thread
                 thread.start()
                 return
@@ -9629,7 +9635,7 @@ if PYSIDE6_AVAILABLE:
                         False,
                         result.message,
                         result.task_id,
-                        details={**dict(result.details), "non_modal": True},
+                        details={**dict(result.details), "non_modal": True, "rejection_notice_shown": True},
                     )
                 )
 
@@ -10461,7 +10467,8 @@ if PYSIDE6_AVAILABLE:
             self._notification_total = 0
             self._notification_total_pages = 1
             self._notification_data_task_states: dict[str, TaskStatus] = {}
-            self._notification_send_task_id: str | None = None
+            self._notification_send_task_ids: set[str] = set()
+            self._notification_send_submission_count = 0
             self._optimistic_send_notification_ids: set[int] = set()
             self._active_notification_send_task_ids: tuple[str, ...] = ()
             self._active_task_ids_by_notification_id: dict[
@@ -10945,7 +10952,7 @@ if PYSIDE6_AVAILABLE:
                     False,
                     result.message,
                     result.task_id,
-                    details={**dict(result.details), "non_modal": True},
+                    details={**dict(result.details), "non_modal": True, "rejection_notice_shown": True},
                 )
             )
             return True
@@ -11923,16 +11930,6 @@ if PYSIDE6_AVAILABLE:
             if not notifications:
                 self._result_handler(ControlResult(False, "请先勾选至少一条标发邮件通知。"))
                 return
-            invalid = [
-                item
-                for item in notifications
-                if str(item.get("state") or "") == "MANUALLY_COMPLETED"
-            ]
-            if invalid:
-                self._result_handler(
-                    ControlResult(False, "勾选记录中包含已经是人工完成的通知，无需重复修改。")
-                )
-                return
             reason, accepted = QInputDialog.getText(
                 self,
                 "标记人工完成",
@@ -11963,6 +11960,7 @@ if PYSIDE6_AVAILABLE:
             def finish(result: ControlResult) -> None:
                 if result.accepted:
                     self._checked_notification_ids.difference_update(notification_ids)
+                    self._notification_page_loader.invalidate()
                 self._result_handler(result)
                 self._reload(navigation=False)
 
@@ -11984,19 +11982,6 @@ if PYSIDE6_AVAILABLE:
             if not notifications:
                 self._result_handler(ControlResult(False, "请先勾选或选择至少一条客户通知。"))
                 return
-            allowed_states = {
-                "WAITING_CONTACT", "MANUAL_EMAIL_REQUIRED", "AWAITING_REVIEW", "BLOCKED", "REJECTED",
-                "RETRYABLE", "FAILED",
-            }
-            invalid = [
-                item for item in notifications
-                if str(item.get("state") or "") not in allowed_states
-            ]
-            if invalid:
-                self._result_handler(
-                    ControlResult(False, "只有尚未发送的最新通知可以设为已取消。")
-                )
-                return
             reason, accepted = QInputDialog.getText(
                 self,
                 "取消客户通知",
@@ -12013,6 +11998,7 @@ if PYSIDE6_AVAILABLE:
                 "确认取消客户通知",
                 f"即将把 {len(notifications)} 条客户通知设为“已取消”。\n\n"
                 "不会调用邮件或短信接口；后续扫描也不会自动重新生成草稿。"
+                "已经提交的消息不会被撤回，原发送记录和回执会保留。"
                 "如需恢复，可使用“重新提交审核”。是否继续？",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
@@ -12024,6 +12010,7 @@ if PYSIDE6_AVAILABLE:
             def finish(result: ControlResult) -> None:
                 if result.accepted:
                     self._checked_notification_ids.difference_update(ids)
+                    self._notification_page_loader.invalidate()
                 self._result_handler(result)
                 self._reload(navigation=False)
 
@@ -12253,8 +12240,7 @@ if PYSIDE6_AVAILABLE:
             if self._notification_action_detail_loading:
                 return False
             self._notification_action_detail_loading = True
-            self.approve_button.setEnabled(False)
-            self.approve_button.setText("正在读取审核预览…")
+            self._update_notification_approve_button()
 
             def ready(value: object) -> None:
                 merged = self._merge_notification_review_previews(value)
@@ -12262,8 +12248,7 @@ if PYSIDE6_AVAILABLE:
                     notification_id in merged for notification_id in missing_ids
                 )
                 self._notification_action_detail_loading = False
-                self.approve_button.setEnabled(True)
-                self.approve_button.setText("审核通过并发送")
+                self._update_notification_approve_button()
                 if not load_succeeded:
                     self._result_handler(
                         ControlResult(
@@ -12278,8 +12263,7 @@ if PYSIDE6_AVAILABLE:
 
             def failed(error: object) -> None:
                 self._notification_action_detail_loading = False
-                self.approve_button.setEnabled(True)
-                self.approve_button.setText("审核通过并发送")
+                self._update_notification_approve_button()
                 self._result_handler(
                     ControlResult(
                         False,
@@ -12524,20 +12508,45 @@ if PYSIDE6_AVAILABLE:
             show(0)
             return dialog.exec() == QDialog.DialogCode.Accepted
 
+        def _update_notification_approve_button(self) -> None:
+            if self._notification_action_detail_loading:
+                self.approve_button.setEnabled(False)
+                self.approve_button.setText("正在读取审核预览…")
+                return
+            if self._notification_send_submission_count:
+                self.approve_button.setEnabled(False)
+                self.approve_button.setText(
+                    f"正在提交 {self._notification_send_submission_count} 条发送任务…"
+                )
+                return
+            pending_task_ids = (
+                set(self._active_notification_send_task_ids)
+                | self._notification_send_task_ids
+            )
+            # The worker queues batches and the server locks individual
+            # notifications. An unrelated batch must not lock this page.
+            self.approve_button.setEnabled(True)
+            self.approve_button.setText(
+                "审核通过并排队" if pending_task_ids else "审核通过并发送"
+            )
+            self.approve_button.setToolTip(
+                f"后台有 {len(pending_task_ids)} 批客户通知尚未结束；"
+                "新审核的通知可继续排队，正在处理的同一条通知不能重复提交。"
+                if pending_task_ids
+                else "审核所选通知后提交发送任务。"
+            )
+
         def _approve(self) -> None:
+            if (
+                self._notification_action_detail_loading
+                or self._notification_send_submission_count
+            ):
+                return
             notifications = self._target_notifications()
             if not notifications:
                 self._result_handler(ControlResult(False, "请先勾选或选择至少一条待审核通知。"))
                 return
             if not self._ensure_notification_details(notifications, self._approve):
-                return
-            if self._active_notification_send_task_ids:
-                self._result_handler(
-                    ControlResult(
-                        False,
-                        "已有另一批客户通知正在发送；请等待当前批次完成。",
-                    )
-                )
                 return
             sendable = [
                 item
@@ -12603,16 +12612,17 @@ if PYSIDE6_AVAILABLE:
                     DESKTOP_CONFIRMATION_PAYLOAD_KEY: confirmation.to_payload(),
                 },
             )
-            self.approve_button.setEnabled(False)
-            self.approve_button.setText(f"正在提交 {len(notification_ids)} 条发送任务…")
+            self._notification_send_submission_count = len(notification_ids)
+            self._update_notification_approve_button()
 
             def finish(result: ControlResult) -> None:
+                self._notification_send_submission_count = 0
                 if self._show_submission_queue_conflict(result, notifications):
-                    self.approve_button.setEnabled(True)
-                    self.approve_button.setText("审核通过并发送")
+                    self._update_notification_approve_button()
                     return
                 if result.accepted:
-                    self._notification_send_task_id = result.task_id
+                    if result.task_id:
+                        self._notification_send_task_ids.add(result.task_id)
                     self._checked_notification_ids.difference_update(
                         notification_ids
                     )
@@ -12625,12 +12635,7 @@ if PYSIDE6_AVAILABLE:
                         selected_column=self.table.currentColumn(),
                     )
                     self._reload(navigation=False)
-                    self.approve_button.setText(
-                        f"已提交 {len(notification_ids)} 条发送任务…"
-                    )
-                else:
-                    self.approve_button.setEnabled(True)
-                    self.approve_button.setText("审核通过并发送")
+                self._update_notification_approve_button()
                 self._result_handler(result)
 
             _run_control_result_responsive(
@@ -12702,10 +12707,12 @@ if PYSIDE6_AVAILABLE:
                 if self._show_submission_queue_conflict(result, notifications):
                     return
                 if result.accepted:
-                    self._notification_send_task_id = result.task_id
+                    if result.task_id:
+                        self._notification_send_task_ids.add(result.task_id)
                     self._checked_notification_ids.difference_update(
                         notification_ids
                     )
+                self._update_notification_approve_button()
                 self._result_handler(result)
 
             _run_control_result_responsive(
@@ -12742,12 +12749,6 @@ if PYSIDE6_AVAILABLE:
                     ControlResult(False, "请先勾选或选择至少一条客户通知。")
                 )
                 return
-            for notification in notifications:
-                if self._active_task_for_notification(
-                    int(notification.get("id") or 0)
-                ) is not None:
-                    self._show_notification_queue_conflict(notification)
-                    return
             reason, accepted = QInputDialog.getText(
                 self,
                 "重新提交审核",
@@ -12772,6 +12773,14 @@ if PYSIDE6_AVAILABLE:
                 return
 
             def finish(result: ControlResult) -> None:
+                reopened_ids = tuple(result.details.get("reopened_notification_ids") or ())
+                if result.accepted or reopened_ids:
+                    self._checked_notification_ids.difference_update(
+                        int(item["id"]) for item in notifications
+                    )
+                    if reopened_ids:
+                        self._selected_id = int(reopened_ids[0])
+                    self._notification_page_loader.invalidate()
                 self._result_handler(result)
                 self._reload(navigation=False)
 
@@ -13153,34 +13162,25 @@ if PYSIDE6_AVAILABLE:
                     selected_column=self.table.currentColumn(),
                 )
                 self._reload(navigation=False)
-            send_active = bool(self._active_notification_send_task_ids)
-            self.approve_button.setEnabled(not send_active)
-            self.approve_button.setText(
-                "正在并发发送客户通知…"
-                if send_active
-                else "审核通过并发送"
-            )
-            if self._notification_send_task_id:
-                completed_send = next(
-                    (
-                        task
-                        for task in notification_send_tasks
-                        if task.task_id == self._notification_send_task_id
-                        and task.status.terminal
-                    ),
-                    None,
-                )
-                if completed_send is not None:
-                    self._notification_send_task_id = None
-                    self._reload(navigation=False)
-                    self._result_handler(
-                        ControlResult(
-                            completed_send.status is TaskStatus.SUCCEEDED,
-                            completed_send.message,
-                            completed_send.task_id,
-                            details={"non_modal": True},
-                        )
+            completed_sends = [
+                task
+                for task in notification_send_tasks
+                if task.task_id in self._notification_send_task_ids
+                and task.status.terminal
+            ]
+            for completed_send in completed_sends:
+                self._notification_send_task_ids.discard(completed_send.task_id)
+                self._result_handler(
+                    ControlResult(
+                        completed_send.status is TaskStatus.SUCCEEDED,
+                        completed_send.message,
+                        completed_send.task_id,
+                        details={"non_modal": True},
                     )
+                )
+            if completed_sends:
+                self._reload(navigation=False)
+            self._update_notification_approve_button()
             rescan_active = any(
                 str(task.payload.get("trigger") or "")
                 == NOTIFICATION_REVIEW_RESCAN_TRIGGER
@@ -13529,7 +13529,7 @@ if PYSIDE6_AVAILABLE:
             )
             self._cleanup_thread = thread
             thread.result_ready.connect(self._finish_log_cleanup)
-            thread.finished.connect(thread.deleteLater)
+            thread.delivery_finished.connect(thread.deleteLater)
             thread.start()
 
         def _finish_log_cleanup(self, result: ControlResult) -> None:
@@ -13850,7 +13850,7 @@ if PYSIDE6_AVAILABLE:
                     requested,
                 )
             )
-            thread.finished.connect(thread.deleteLater)
+            thread.delivery_finished.connect(thread.deleteLater)
             self._execution_pause_thread = thread
             thread.start()
 
@@ -14163,6 +14163,10 @@ if PYSIDE6_AVAILABLE:
                 QTimer.singleShot(0, self.refresh)
 
         def _apply_snapshot(self, snapshot: DesktopSnapshot) -> None:
+            take_rejections = getattr(self._controller, "take_operation_rejections", None)
+            if callable(take_rejections):
+                for result in take_rejections():
+                    self._show_operation_rejection(result)
             self.custom_orders_page.update_sync_status()
             self._sync_scheduled_scan_timers(snapshot)
             unchanged = snapshot is self._latest_snapshot
@@ -14482,7 +14486,7 @@ if PYSIDE6_AVAILABLE:
                 thread.result_ready.connect(
                     self._handle_local_logistics_followup_result
                 )
-                thread.finished.connect(
+                thread.delivery_finished.connect(
                     self._finish_local_logistics_followup_thread
                 )
                 self._active_local_logistics_followup_scan_id = scan_task_id
@@ -14854,9 +14858,13 @@ if PYSIDE6_AVAILABLE:
             if bool(result.details.get("authentication_required")):
                 self._request_cloudflare_reauthentication(result.message)
                 return
-            if not result.accepted and not bool(result.details.get("non_modal")):
-                QMessageBox.warning(self, "操作未执行", result.message)
+            self._show_operation_rejection(result)
             self.refresh()
+
+        def _show_operation_rejection(self, result: ControlResult) -> None:
+            notice = operation_rejection(result)
+            if notice is not None:
+                QMessageBox.warning(self, notice.title, notice.message)
 
         def _request_cloudflare_reauthentication(self, reason: str) -> None:
             if (
@@ -14890,7 +14898,7 @@ if PYSIDE6_AVAILABLE:
             )
             thread = _ControlResultThread(reauthenticate, self)
             thread.result_ready.connect(self._finish_cloudflare_reauthentication)
-            thread.finished.connect(
+            thread.delivery_finished.connect(
                 self._clear_cloudflare_reauthentication_thread
             )
             self._authentication_thread = thread

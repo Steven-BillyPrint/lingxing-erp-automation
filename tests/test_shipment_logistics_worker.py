@@ -879,6 +879,29 @@ def test_logistics_worker_update_queue_records_non_real_carrier_reason(tmp_path)
     assert "不是真实海外尾程承运商" in row["last_error"]
 
 
+def test_logistics_worker_saves_yanwen_for_null_carrier_with_ywe_tracking(tmp_path):
+    store = ShipmentQueueStore(tmp_path / "shipment_queue.sqlite3")
+    candidate = _candidate()
+    store.insert_candidate(candidate)
+
+    async def fake_fetch(logistics_no):
+        detail = _ready_detail(logistics_no)
+        detail.carrier = "null"
+        detail.international_tracking_no = "YWE00001506996989"
+        return detail
+
+    report = asyncio.run(process_logistics_queue_once(
+        store, fetch_detail=fake_fetch, update_queue=True, dry_run=False,
+    ))
+
+    row = store.get_by_logistics_no(candidate.logistics_no)
+    assert row["carrier"] == "Yanwen"
+    assert row["logistics_state"] == LOGISTICS_READY
+    assert row["logistics_last_error"] is None
+    assert report.ready_count == 1
+    assert report.ready_to_mark_items[0].carrier == "Yanwen"
+
+
 def test_logistics_worker_retries_error_records(tmp_path):
     store = ShipmentQueueStore(tmp_path / "shipment_queue.sqlite3")
     error_candidate = _candidate("ALS01781406025")

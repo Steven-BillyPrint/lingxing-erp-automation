@@ -2591,6 +2591,18 @@ class CoordinatedControllerService:
                 )
             )
         )
+        if method in {
+            "mark_shipment_notifications_manually_completed",
+            "cancel_shipment_notifications",
+            "resubmit_shipment_notification",
+            "resubmit_shipment_notifications",
+        }:
+            # Manual decisions serialize with each other, not with background
+            # sends. The store resolves the latest revision atomically and
+            # preserves any in-flight row for its original provider receipt.
+            resources = tuple(
+                f"notification-manual-{resource}" for resource in resources
+            )
         if method == "set_execution_paused":
             resources = (f"instance:{instance_id}:execution_pause",)
         review_lock = (

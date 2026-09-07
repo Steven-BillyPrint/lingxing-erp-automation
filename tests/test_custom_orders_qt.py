@@ -7533,6 +7533,51 @@ def test_notification_resubmit_supports_checked_batch(app, monkeypatch):
     page.deleteLater()
 
 
+@pytest.mark.parametrize("target_state", ["MANUALLY_COMPLETED", "CANCELLED", "AWAITING_REVIEW"])
+def test_notification_status_change_accepts_active_send_and_refreshes_new_record(
+    app, monkeypatch, target_state,
+):
+    controller = RecordingController()
+    controller.notification_rows = [{
+        "id": 61, "platform_order_no": "MANUAL-ORDER", "state": "SENDING", "items": [],
+    }]
+    results = []
+    page = ShipmentNotificationPage(controller, results.append)
+    page.update_snapshot(DesktopSnapshot(tasks=[TaskRecord(
+        "old-send", "发送客户通知", TaskArea.SHIPMENT, Capability.SEND_NOTIFICATION,
+        status=TaskStatus.RUNNING,
+        payload={"trigger": SHIPMENT_NOTIFICATION_SEND_TRIGGER, "notification_ids": [61]},
+    )]))
+    page._checked_notification_ids = {61}
+    monkeypatch.setattr(_NotificationStatusDialog, "exec", lambda _dialog: QDialog.DialogCode.Accepted)
+    monkeypatch.setattr(_NotificationStatusDialog, "selected_value", lambda _dialog: target_state)
+    monkeypatch.setattr(QInputDialog, "getText", lambda *_args, **_kwargs: ("人工确认", True))
+    monkeypatch.setattr(QMessageBox, "question", lambda *_args, **_kwargs: QMessageBox.StandardButton.Yes)
+    calls = []
+
+    def change(ids, *, reason):
+        calls.append((list(ids), reason))
+        controller.notification_rows = [{
+            "id": 62, "platform_order_no": "MANUAL-ORDER", "state": target_state, "items": [],
+        }]
+        return ControlResult(True, "人工状态已保存", details={"reopened_notification_ids": [62]})
+
+    method = {
+        "MANUALLY_COMPLETED": "mark_shipment_notifications_manually_completed",
+        "CANCELLED": "cancel_shipment_notifications",
+        "AWAITING_REVIEW": "resubmit_shipment_notifications",
+    }[target_state]
+    monkeypatch.setattr(controller, method, change)
+    page._change_status()
+    assert calls == [([61], "人工确认")]
+    assert results[-1].accepted
+    assert not page._checked_notification_ids
+    assert page._notifications[0]["id"] == 62
+    assert page._notifications[0]["state"] == target_state
+    assert controller.submitted_commands == []
+    page.deleteLater()
+
+
 def test_notification_retry_supports_checked_approved_content_batch(app):
     controller = RecordingController()
     controller.notification_rows = [
@@ -7683,7 +7728,8 @@ def test_notification_approval_submits_visible_cancellable_background_task(
     assert confirmation.action is DesktopWriteAction.SEND_SHIPMENT_NOTIFICATION
     assert confirmation.order_no == expected_order_no
     assert confirmation.source == "qt_message_box"
-    assert page._notification_send_task_id == f"task-{expected_order_no}"
+    assert page._notification_send_task_ids == {f"task-{expected_order_no}"}
+    assert page.approve_button.isEnabled()
     assert page._checked_notification_ids == set()
     assert page._optimistic_send_notification_ids == {61}
     row = next(
@@ -7693,6 +7739,145 @@ def test_notification_approval_submits_visible_cancellable_background_task(
     )
     assert page.table.item(row, 8).text() == "等待发送"
 
+    page.deleteLater()
+
+
+@pytest.mark.parametrize(
+    "status",
+    [TaskStatus.QUEUED, TaskStatus.RUNNING, TaskStatus.WAITING_USER, TaskStatus.STOPPING],
+)
+def test_notification_approval_queues_new_batches_while_another_is_active(
+    app, monkeypatch, status,
+):
+    controller = RecordingController()
+    controller.notification_rows = [
+        {
+            "id": notification_id,
+            "platform_order_no": f"NEW-ORDER-{notification_id}",
+            "state": "AWAITING_REVIEW",
+            "subject": "Shipment update",
+            "body": "Reviewed shipment details",
+            "items": [],
+        }
+        for notification_id in (61, 62, 63)
+    ]
+    results: list[ControlResult] = []
+    page = ShipmentNotificationPage(controller, results.append)
+    active = TaskRecord(
+        "existing-batch", "发送客户通知", TaskArea.SHIPMENT,
+        Capability.SEND_NOTIFICATION, status=status,
+        payload={
+            "trigger": SHIPMENT_NOTIFICATION_SEND_TRIGGER,
+            "notification_ids": [61],
+        },
+    )
+    page.update_snapshot(DesktopSnapshot(tasks=[active]))
+    assert page.approve_button.isEnabled()
+    assert page.approve_button.text() == "审核通过并排队"
+    reviewed: list[list[int]] = []
+    monkeypatch.setattr(
+        page, "_confirm_batch_review",
+        lambda items: reviewed.append([int(item["id"]) for item in items]) or True,
+    )
+    page._checked_notification_ids = {61, 62}
+    page._approve()
+    # A second new batch can be submitted before the next server snapshot.
+    # The previous submission remains protected from duplicate sending.
+    page._checked_notification_ids = {62, 63}
+    page._approve()
+    page._checked_notification_ids = {61, 62, 63}
+    page._approve()
+    assert reviewed == [[62], [63]]
+    assert [command.payload["notification_ids"] for command in controller.submitted_commands] == [[62], [63]]
+    assert page._optimistic_send_notification_ids == {62, 63}
+    assert page.approve_button.isEnabled()
+
+    completed = [
+        TaskRecord(
+            f"task-{command.order_no}", command.name, command.area,
+            command.capability, status=TaskStatus.SUCCEEDED,
+            payload=command.payload, message="本批完成",
+        )
+        for command in controller.submitted_commands
+    ]
+    results.clear()
+    page.update_snapshot(DesktopSnapshot(tasks=[active, *completed]))
+    assert {result.task_id for result in results} == {task.task_id for task in completed}
+    assert not page._notification_send_task_ids
+    assert not page._optimistic_send_notification_ids
+    results.clear()
+    page.update_snapshot(DesktopSnapshot(tasks=[active, *completed]))
+    assert results == []
+    page.update_snapshot(DesktopSnapshot(tasks=completed))
+    assert page.approve_button.text() == "审核通过并发送"
+    page.deleteLater()
+
+
+@pytest.mark.parametrize("accepted", [True, False])
+def test_notification_snapshot_keeps_submission_locked_until_response(
+    app, monkeypatch, accepted,
+):
+    controller = RecordingController()
+    controller.notification_rows = [{
+        "id": 62, "platform_order_no": "NEW-ORDER-62",
+        "state": "AWAITING_REVIEW", "subject": "Shipment update",
+        "body": "Reviewed shipment details", "items": [],
+    }]
+    page = ShipmentNotificationPage(controller, lambda _result: None)
+    page._reload()
+    monkeypatch.setattr(page, "_confirm_batch_review", lambda _items: True)
+    callbacks = []
+    monkeypatch.setattr(
+        qt_module, "_run_control_result_responsive",
+        lambda _owner, _controller, operation, finish: callbacks.append((operation, finish)),
+    )
+    page._approve()
+    page.update_snapshot(DesktopSnapshot())
+    assert not page.approve_button.isEnabled()
+    assert page.approve_button.text() == "正在提交 1 条发送任务…"
+    page._approve()
+    assert len(callbacks) == 1
+    callbacks[0][1](ControlResult(accepted, "提交结果", "new-task" if accepted else None))
+    assert page.approve_button.isEnabled()
+    assert page.approve_button.text() == (
+        "审核通过并排队" if accepted else "审核通过并发送"
+    )
+    page.deleteLater()
+
+
+@pytest.mark.parametrize("succeeded", [True, False])
+def test_notification_snapshot_keeps_review_preview_locked_until_loaded(
+    app, monkeypatch, succeeded,
+):
+    controller = RecordingController()
+    row = {
+        "id": 62, "platform_order_no": "NEW-ORDER-62",
+        "state": "AWAITING_REVIEW", "detail_loaded": False,
+        "preview_items": [], "content_hash": "review-62",
+    }
+    controller.notification_rows = [row]
+    page = ShipmentNotificationPage(controller, lambda _result: None)
+    page._reload()
+    monkeypatch.setattr(page, "_review_preview_reader", lambda: lambda _ids: [])
+    callbacks = []
+    monkeypatch.setattr(
+        qt_module, "_run_value_responsive",
+        lambda _owner, _controller, _operation, ready, failed: callbacks.append((ready, failed)),
+    )
+    assert not page._ensure_notification_details([row], lambda: None)
+    page.update_snapshot(DesktopSnapshot())
+    assert not page.approve_button.isEnabled()
+    assert page.approve_button.text() == "正在读取审核预览…"
+    if succeeded:
+        callbacks[0][0]([{
+            "id": 62, "content_hash": "review-62", "subject": "Shipment",
+            "body": "Reviewed details", "items": [],
+        }])
+    else:
+        callbacks[0][1](RuntimeError("preview unavailable"))
+    assert page.approve_button.isEnabled()
+    assert not controller.submitted_commands
+    QTest.qWait(1)
     page.deleteLater()
 
 

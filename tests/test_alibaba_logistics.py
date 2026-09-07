@@ -209,6 +209,67 @@ def test_unknown_carrier_with_ambiguous_tracking_remains_retryable_and_visible()
     assert "人工复核" in decision.reason
 
 
+@pytest.mark.parametrize("carrier", ["null", "Unknown", "Yanwen", "YWE"])
+def test_yanwen_ywe_tracking_is_ready_with_reported_or_unknown_carrier(carrier):
+    detail = LogisticsDetail(
+        logistics_no="ALS01941700001",
+        status_text="运输中",
+        carrier=carrier,
+        international_tracking_no="YWE00001506996989",
+        actual_total="CNY 340.51",
+        chargeable_weight_kg="2.645",
+    )
+
+    decision = logistics_readiness_decision(detail)
+
+    assert decision.logistics_state == LOGISTICS_READY
+    assert infer_carrier_from_tracking_number(detail.international_tracking_no) == "Yanwen"
+    if carrier in {"null", "Unknown"}:
+        assert detail.carrier == "Yanwen"
+        assert detail.raw["original_carrier"] == carrier
+        assert detail.raw["carrier_inferred_from_tracking"] is True
+
+
+@pytest.mark.parametrize(
+    "tracking_no",
+    ["YWE0000150699698", "YWE000015069969899", "YWE0000150699698A", "YWQ00001506996989"],
+)
+def test_yanwen_ywe_tracking_rejects_unconfirmed_lengths_and_suffixes(tracking_no):
+    assert tracking_number_matches_carrier("Yanwen", tracking_no) is False
+    assert infer_carrier_from_tracking_number(tracking_no) is None
+
+
+@pytest.mark.parametrize("carrier,tracking_no", [
+    ("DHL", "55500001700462"),
+    ("DHL", "00340434161094000000"),
+    ("泛远", "FAREX2606037475YQ"),
+])
+def test_additional_official_carrier_formats_are_ready(carrier, tracking_no):
+    detail = LogisticsDetail(
+        logistics_no="ALS01941700001", status_text="运输中", carrier=carrier,
+        international_tracking_no=tracking_no, actual_total="CNY 20.00",
+        chargeable_weight_kg="1.000",
+    )
+    assert logistics_readiness_decision(detail).logistics_state == LOGISTICS_READY
+
+
+@pytest.mark.parametrize("tracking_no", ["55500001700462", "00340434161094000000"])
+def test_shared_numeric_dhl_formats_do_not_guess_an_unknown_carrier(tracking_no):
+    assert infer_carrier_from_tracking_number(tracking_no) is None
+
+
+def test_fanyuan_forwarder_number_does_not_infer_final_mile_carrier():
+    assert tracking_number_matches_carrier("泛远", "FAREX2606037475YQ") is True
+    assert infer_carrier_from_tracking_number("FAREX2606037475YQ") is None
+    assert tracking_number_matches_carrier("泛远", "873589116692") is False
+    assert tracking_number_matches_carrier("泛远", "FAREX260603747YQ") is False
+
+
+def test_ups_t_format_keeps_official_ten_digit_suffix():
+    assert tracking_number_matches_carrier("UPS", "T9999999999") is True
+    assert tracking_number_matches_carrier("UPS", "T999999999") is False
+
+
 @pytest.mark.parametrize(
     ("carrier", "tracking_no", "normalized_carrier"),
     [
