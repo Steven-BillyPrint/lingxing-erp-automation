@@ -2508,6 +2508,20 @@ class ShipmentNotificationStore:
             NOTIFICATION_MANUAL_EMAIL_REQUIRED,
         }:
             return 0
+        if str(latest["provider_message_id"] or "").strip() or str(
+            latest["sent_at"] or ""
+        ).strip():
+            # A temporary WMS read failure must not overwrite a real delivery
+            # outcome. Eligibility still gates any subsequent send separately.
+            return 0
+        if conn.execute(
+            "SELECT 1 FROM shipment_notification_reviews "
+            "WHERE notification_id = ? AND action = 'MANUAL_REOPEN' LIMIT 1",
+            (latest["id"],),
+        ).fetchone() is not None:
+            # Keep the operator's review decision visible. The separate
+            # eligibility record continues to block an unverified real send.
+            return 0
         error = f"outbound_ineligible:{state}:{reason.strip() or 'unconfirmed'}"
         if (
             latest["state"] == NOTIFICATION_BLOCKED
@@ -3234,6 +3248,8 @@ class ShipmentNotificationStore:
         conn: sqlite3.Connection,
         platform_order_no: str,
         configuration: NotificationConfiguration,
+        *,
+        manual_review: bool = False,
     ) -> tuple[
         RenderedNotification | None,
         list[PackageSnapshot],
@@ -3262,8 +3278,9 @@ class ShipmentNotificationStore:
                 (platform_order_no,),
             ).fetchone()
             erp_completed_at = str(source_row[0] or "") if source_row else ""
-        if not source_kind or (
-            source_kind == "AUTO_ERP" and (not queue_total or queue_complete <= 0)
+        if not manual_review and (
+            not source_kind
+            or (source_kind == "AUTO_ERP" and (not queue_total or queue_complete <= 0))
         ):
             return (
                 None,
@@ -3275,7 +3292,7 @@ class ShipmentNotificationStore:
                 contact,
             )
         current_package_hash = self.package_set_hash(packages)
-        if (
+        if not manual_review and (
             outbound_eligibility is None
             or str(outbound_eligibility["outbound_state"] or "").upper()
             != "OUTBOUNDED"
@@ -3320,7 +3337,8 @@ class ShipmentNotificationStore:
                 else PLATFORM_POLICY_AMAZON
             ),
             known_customer_package_total=int(
-                outbound_eligibility["known_customer_package_total"] or 0
+                (outbound_eligibility["known_customer_package_total"] or 0)
+                if outbound_eligibility is not None else 0
             ),
         )
         # Customization JSON remains the first choice.  When no usable JSON is
@@ -3790,6 +3808,16 @@ class ShipmentNotificationStore:
         now = utc_now()
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            force_reopen = force_reopen_notification_id is not None
+            if force_reopen:
+                if not reopen_note.strip():
+                    raise NotificationStateError("重新提交审核的原因不能为空。")
+                selected = conn.execute(
+                    "SELECT platform_order_no FROM shipment_notifications WHERE id = ?",
+                    (int(force_reopen_notification_id),),
+                ).fetchone()
+                if selected is None or str(selected[0]) != platform:
+                    raise NotificationStateError("通知已不存在，请刷新列表。")
             (
                 rendered,
                 packages,
@@ -3798,14 +3826,20 @@ class ShipmentNotificationStore:
                 erp_completed_at,
                 contact_ready,
                 contact_snapshot,
-            ) = self._render_current_conn(conn, platform, configuration)
+            ) = self._render_current_conn(
+                conn, platform, configuration, manual_review=force_reopen
+            )
             if rendered is None:
                 conn.rollback()
                 return None
             # An expected system order without a WMS row is a normal partial
             # shipment.  Do not create a blocked draft until at least one real,
             # customer-visible tracking number exists.
-            if rendered.package_complete <= 0 and not allow_incomplete_issue:
+            if (
+                rendered.package_complete <= 0
+                and not allow_incomplete_issue
+                and not force_reopen
+            ):
                 conn.rollback()
                 return None
             latest = conn.execute(
@@ -3816,14 +3850,13 @@ class ShipmentNotificationStore:
                 """,
                 (platform,),
             ).fetchone()
-            force_reopen = force_reopen_notification_id is not None
             if (
-                latest is not None
+                not force_reopen
+                and latest is not None
                 and notification_has_inconsistent_provider_evidence(dict(latest))
             ):
-                # Never replace or reopen contradictory delivery evidence with
-                # a fresh sendable draft.  A targeted receipt reconciliation
-                # must resolve the existing row first.
+                # Automatic scans cannot turn conflicting receipt evidence
+                # into a fresh send. Explicit manual review is handled below.
                 conn.rollback()
                 return self.get_notification(int(latest["id"]))
             if not force_reopen and latest is None and not blocked_reason:
@@ -3850,45 +3883,16 @@ class ShipmentNotificationStore:
                     conn.rollback()
                     return self.get_notification(int(historical_sent["id"]))
             if force_reopen:
-                allowed_states = {
-                    NOTIFICATION_AWAITING_REVIEW,
-                    NOTIFICATION_REJECTED,
-                    NOTIFICATION_BLOCKED,
-                    NOTIFICATION_WAITING_CONTACT,
-                    NOTIFICATION_MANUAL_EMAIL_REQUIRED,
-                    NOTIFICATION_FAILED,
-                    NOTIFICATION_RETRYABLE,
-                    NOTIFICATION_ACCEPTED,
-                    NOTIFICATION_DELIVERED,
-                    NOTIFICATION_DELIVERY_UNCONFIRMED,
-                    NOTIFICATION_MANUALLY_COMPLETED,
-                    NOTIFICATION_CANCELLED,
-                    NOTIFICATION_SUPPRESSED,
-                }
-                note = reopen_note.strip()
-                if not note:
-                    conn.rollback()
-                    raise NotificationStateError("A manual reopen reason is required.")
+                # Manual review is a local business decision, not a send. Old
+                # list IDs, inconsistent receipts and incomplete automatic
+                # eligibility must not prevent creating a fresh review draft.
                 if (
-                    latest is None
-                    or int(latest["id"]) != int(force_reopen_notification_id)
-                    or latest["state"] not in allowed_states
-                    or latest["legacy_email_batch_id"] is not None
+                    latest is not None
+                    and int(latest["id"]) != int(force_reopen_notification_id)
                 ):
-                    conn.rollback()
-                    raise NotificationStateError(
-                        "Only the latest notification in a safe state can be reopened."
-                    )
-                if not contact_ready:
-                    conn.rollback()
-                    raise NotificationStateError(
-                        "Current recipient contact is incomplete and cannot enter review."
-                    )
-                if rendered.blocked_reasons:
-                    conn.rollback()
-                    raise NotificationStateError(
-                        "Current notification content is blocked and cannot enter review: "
-                        + ",".join(rendered.blocked_reasons)
+                    reopen_note = (
+                        f"{reopen_note.strip()}（所选历史通知 {force_reopen_notification_id}，"
+                        f"按当前通知 {latest['id']} 重新审核）"
                     )
             if not force_reopen and latest is not None:
                 permanently_closed = latest["state"] in {
@@ -4004,7 +4008,10 @@ class ShipmentNotificationStore:
             ):
                 conn.rollback()
                 return self.get_notification(int(latest["id"]))
-            revision = int(latest["revision"] if latest is not None else 0) + 1
+            revision = int(conn.execute(
+                "SELECT COALESCE(MAX(revision), 0) FROM shipment_notifications WHERE platform_order_no = ?",
+                (platform,),
+            ).fetchone()[0]) + 1
             state = (
                 NOTIFICATION_AWAITING_REVIEW
                 if force_reopen
@@ -4581,7 +4588,10 @@ class ShipmentNotificationStore:
                 "AND TRIM(COALESCE(e.package_set_hash, '')) <> '') "
                 "OR TRIM(COALESCE(n.provider_message_id, '')) <> '' "
                 "OR TRIM(COALESCE(n.sent_at, '')) <> '' "
-                "OR TRIM(COALESCE(n.delivered_at, '')) <> '')"
+                "OR TRIM(COALESCE(n.delivered_at, '')) <> '' "
+                "OR EXISTS (SELECT 1 FROM shipment_notification_reviews review "
+                "WHERE review.notification_id = n.id "
+                "AND review.action IN ('MANUAL_REOPEN', 'MANUAL_COMPLETION', 'CANCEL')))"
             )
         if query:
             pattern = f"%{query.casefold()}%"
@@ -5332,6 +5342,20 @@ class ShipmentNotificationStore:
             if row is None:
                 conn.rollback()
                 raise NotificationStateError("Notification does not exist.")
+            latest = conn.execute(
+                "SELECT id FROM shipment_notifications WHERE platform_order_no = ? "
+                "AND legacy_email_batch_id IS NULL ORDER BY revision DESC, id DESC LIMIT 1",
+                (row["platform_order_no"],),
+            ).fetchone()
+            if latest is None or int(latest[0]) != int(notification_id):
+                raise NotificationStateError("该通知已有新的人工处理版本，旧发送任务已停止。")
+            in_flight = conn.execute(
+                "SELECT id FROM shipment_notifications WHERE platform_order_no = ? "
+                "AND state = ? AND id <> ? LIMIT 1",
+                (row["platform_order_no"], NOTIFICATION_SENDING, notification_id),
+            ).fetchone()
+            if in_flight is not None:
+                raise NotificationStateError("原版本的发送请求尚未结束，新版本已保留，待原请求结束后可发送。")
             if INDEPENDENT_SITE_ORDER_RE.fullmatch(
                 str(row["platform_order_no"] or "").strip()
             ):
@@ -5524,88 +5548,12 @@ class ShipmentNotificationStore:
         actor: str = "desktop_user",
         note: str = "",
     ) -> dict[str, int]:
-        """Close latest notifications after an operator verifies manual completion.
-
-        A provider may already have accepted the message without confirming
-        delivery.  That is precisely when an operator needs to reconcile the
-        order manually, so sent/accepted/error states must not be excluded.
-        Immutable attempts and review history retain the original provider
-        evidence; only the current business state is closed here.
-        """
-
-        self.initialize()
-        ids = tuple(dict.fromkeys(int(value) for value in notification_ids if int(value) > 0))
-        reason = note.strip()
-        if not ids:
-            raise NotificationStateError("At least one notification is required.")
-        if not reason:
-            raise NotificationStateError("A manual completion reason is required.")
-        now = utc_now()
-        placeholders = ",".join("?" for _ in ids)
-        with self.connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            rows = conn.execute(
-                f"""
-                SELECT n.*
-                FROM shipment_notifications n
-                WHERE n.id IN ({placeholders})
-                  AND n.legacy_email_batch_id IS NULL
-                  AND n.id = (
-                      SELECT MAX(latest.id)
-                      FROM shipment_notifications latest
-                      WHERE latest.platform_order_no = n.platform_order_no
-                        AND latest.legacy_email_batch_id IS NULL
-                  )
-                """,
-                ids,
-            ).fetchall()
-            if len(rows) != len(ids):
-                conn.rollback()
-                raise NotificationStateError(
-                    "Every notification must exist and be the latest revision for its order."
-                )
-            invalid = [
-                row
-                for row in rows
-                if row["state"] == NOTIFICATION_MANUALLY_COMPLETED
-            ]
-            if invalid:
-                conn.rollback()
-                raise NotificationStateError(
-                    "Notifications already manually completed cannot be completed again."
-                )
-            for row in rows:
-                conn.execute(
-                    """
-                    UPDATE shipment_notifications
-                    SET state = ?, provider_status = CASE
-                            WHEN TRIM(COALESCE(provider_status, '')) = ''
-                                THEN 'MANUAL_COMPLETION'
-                            ELSE provider_status
-                        END,
-                        last_error = NULL, state_changed_at = ?, updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (NOTIFICATION_MANUALLY_COMPLETED, now, now, row["id"]),
-                )
-                conn.execute(
-                    """
-                    INSERT INTO shipment_notification_reviews (
-                        notification_id, revision, action, content_hash, actor, note, created_at
-                    ) VALUES (?, ?, 'MANUAL_COMPLETION', ?, ?, ?, ?)
-                    """,
-                    (
-                        row["id"],
-                        row["revision"],
-                        row["content_hash"],
-                        actor,
-                        reason,
-                        now,
-                    ),
-                )
-                self._mark_package_events_handled_conn(conn, int(row["id"]))
-            conn.commit()
-        return {"completed": len(rows)}
+        """Apply the operator's decision independently of automatic states."""
+        count = self._set_manual_notification_state(
+            notification_ids, state=NOTIFICATION_MANUALLY_COMPLETED,
+            action="MANUAL_COMPLETION", actor=actor, note=note,
+        )
+        return {"completed": count}
 
     def cancel_notifications(
         self,
@@ -5614,87 +5562,129 @@ class ShipmentNotificationStore:
         actor: str = "desktop_user",
         note: str,
     ) -> dict[str, int]:
-        """Persistently cancel latest unsent notifications without external calls."""
+        """Cancel future processing without retracting any submitted message."""
+        count = self._set_manual_notification_state(
+            notification_ids, state=NOTIFICATION_CANCELLED,
+            action="CANCEL", actor=actor, note=note,
+        )
+        return {"cancelled": count}
 
+    @staticmethod
+    def _clone_manual_status_conn(
+        conn: sqlite3.Connection, source: sqlite3.Row, *, state: str, now: str,
+    ) -> sqlite3.Row:
+        """Keep an in-flight/legacy row available for its original receipt."""
+        values = dict(source)
+        values.pop("id")
+        revision = int(conn.execute(
+            "SELECT MAX(revision) FROM shipment_notifications WHERE platform_order_no = ?",
+            (source["platform_order_no"],),
+        ).fetchone()[0]) + 1
+        values.update(
+            revision=revision, state=state, legacy_email_batch_id=None,
+            idempotency_key=f"{source['idempotency_key']}:manual:{revision}",
+            approved_content_hash=None, approved_at=None, provider_message_id=None,
+            provider_status=None, provider_operator_email="", sent_at=None,
+            delivered_at=None, attempt_count=0, last_error=None,
+            receipt_next_check_at="", receipt_last_checked_at="", receipt_deadline_at="",
+            receipt_check_attempt_count=0, receipt_check_lease_owner="",
+            receipt_check_lease_until="", created_at=now, updated_at=now,
+            state_changed_at=now,
+        )
+        columns = ",".join(values)
+        placeholders = ",".join("?" for _ in values)
+        cursor = conn.execute(
+            f"INSERT INTO shipment_notifications ({columns}) VALUES ({placeholders})",
+            tuple(values.values()),
+        )
+        new_id = int(cursor.lastrowid)
+        for source_item in conn.execute(
+            "SELECT * FROM shipment_notification_items WHERE notification_id = ?",
+            (source["id"],),
+        ).fetchall():
+            item = dict(source_item)
+            item.pop("id")
+            item["notification_id"] = new_id
+            conn.execute(
+                f"INSERT INTO shipment_notification_items ({','.join(item)}) "
+                f"VALUES ({','.join('?' for _ in item)})", tuple(item.values()),
+            )
+        return conn.execute(
+            "SELECT * FROM shipment_notifications WHERE id = ?", (new_id,),
+        ).fetchone()
+
+    def _set_manual_notification_state(
+        self, notification_ids: Sequence[int], *, state: str,
+        action: str, actor: str, note: str,
+    ) -> int:
         self.initialize()
         ids = tuple(dict.fromkeys(int(value) for value in notification_ids if int(value) > 0))
         reason = note.strip()
         if not ids:
-            raise NotificationStateError("At least one notification is required.")
+            raise NotificationStateError("请先选择至少一条客户通知。")
         if not reason:
-            raise NotificationStateError("A cancellation reason is required.")
-        allowed_states = {
-            NOTIFICATION_AWAITING_REVIEW,
-            NOTIFICATION_BLOCKED,
-            NOTIFICATION_REJECTED,
-            NOTIFICATION_WAITING_CONTACT,
-            NOTIFICATION_MANUAL_EMAIL_REQUIRED,
-            NOTIFICATION_RETRYABLE,
-            NOTIFICATION_FAILED,
-        }
+            raise NotificationStateError("人工修改状态的原因不能为空。")
         now = utc_now()
         placeholders = ",".join("?" for _ in ids)
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            rows = conn.execute(
-                f"""
-                SELECT n.*
-                FROM shipment_notifications n
-                WHERE n.id IN ({placeholders})
-                  AND n.legacy_email_batch_id IS NULL
-                  AND n.id = (
-                      SELECT MAX(latest.id)
-                      FROM shipment_notifications latest
-                      WHERE latest.platform_order_no = n.platform_order_no
-                        AND latest.legacy_email_batch_id IS NULL
-                  )
-                """,
-                ids,
+            selected_rows = conn.execute(
+                f"SELECT * FROM shipment_notifications WHERE id IN ({placeholders})", ids,
             ).fetchall()
-            if len(rows) != len(ids):
-                conn.rollback()
-                raise NotificationStateError(
-                    "Every notification must exist and be the latest revision for its order."
-                )
-            invalid = [
-                row
-                for row in rows
-                if row["state"] not in allowed_states
-                or row["provider_message_id"] is not None
-                or row["sent_at"] is not None
-            ]
-            if invalid:
-                conn.rollback()
-                raise NotificationStateError(
-                    "Only latest unsent notifications can be cancelled."
-                )
-            for row in rows:
+            if len(selected_rows) != len(ids):
+                raise NotificationStateError("部分通知已不存在，请刷新列表后重试。")
+            changed_platforms: set[str] = set()
+            for selected in selected_rows:
+                platform = str(selected["platform_order_no"])
+                if platform in changed_platforms:
+                    continue
+                row = conn.execute(
+                    "SELECT * FROM shipment_notifications WHERE platform_order_no = ? "
+                    "AND legacy_email_batch_id IS NULL ORDER BY revision DESC, id DESC LIMIT 1",
+                    (platform,),
+                ).fetchone() or selected
+                source_id, source_state = int(row["id"]), str(row["state"])
+                if (
+                    source_state == NOTIFICATION_SENDING
+                    or row["legacy_email_batch_id"] is not None
+                ):
+                    row = self._clone_manual_status_conn(conn, row, state=state, now=now)
                 conn.execute(
                     """
                     UPDATE shipment_notifications
-                    SET state = ?, provider_status = 'MANUAL_CANCELLATION',
+                    SET state = ?, provider_status = CASE
+                            WHEN TRIM(COALESCE(provider_status, '')) = '' THEN ?
+                            ELSE provider_status END,
+                        approved_content_hash = NULL, approved_at = NULL,
+                        receipt_next_check_at = '', receipt_check_lease_owner = '',
+                        receipt_check_lease_until = '',
                         last_error = NULL, state_changed_at = ?, updated_at = ?
                     WHERE id = ?
                     """,
-                    (NOTIFICATION_CANCELLED, now, now, row["id"]),
+                    (state, "MANUAL_COMPLETION" if action == "MANUAL_COMPLETION" else "MANUAL_CANCELLATION",
+                     now, now, row["id"]),
                 )
                 conn.execute(
                     """
                     INSERT INTO shipment_notification_reviews (
                         notification_id, revision, action, content_hash, actor, note, created_at
-                    ) VALUES (?, ?, 'CANCEL', ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         row["id"],
                         row["revision"],
+                        action,
                         row["content_hash"],
                         actor,
-                        reason,
+                        f"{reason}（所选通知 {selected['id']}；当前来源 {source_id}，原状态 {source_state}）",
                         now,
                     ),
                 )
+                if state == NOTIFICATION_MANUALLY_COMPLETED:
+                    self._mark_package_events_handled_conn(conn, int(row["id"]))
+                changed_platforms.add(platform)
             conn.commit()
-        return {"cancelled": len(rows)}
+        return len(changed_platforms)
 
     def exclude_and_delete_platforms(
         self,
@@ -5786,14 +5776,6 @@ class ShipmentNotificationStore:
         )
         if reopened is None:
             raise NotificationStateError("Notification is not currently eligible for review.")
-        if (
-            int(reopened.get("id") or 0) == int(notification_id)
-            and notification_has_inconsistent_provider_evidence(reopened)
-        ):
-            raise NotificationStateError(
-                "待审核通知同时带有供应商发送凭证，不能重新提交；"
-                "请先核对供应商回执并修复状态。"
-            )
         return reopened
 
     def resubmit(

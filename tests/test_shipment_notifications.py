@@ -3493,6 +3493,101 @@ def test_manual_reopen_creates_new_review_revision_and_preserves_history(tmp_pat
     )
 
 
+@pytest.mark.parametrize("state", [
+    "AWAITING_REVIEW", "BLOCKED", "RETRYABLE", "FAILED", "SENDING",
+    "ACCEPTED", "DELIVERED", "DELIVERY_UNCONFIRMED", "MANUALLY_COMPLETED",
+    "CANCELLED", "SUPPRESSED", "WAITING_CONTACT", "MANUAL_EMAIL_REQUIRED",
+    "REJECTED", "UNKNOWN_LEGACY_STATE",
+])
+@pytest.mark.parametrize("action", ["reopen", "complete", "cancel"])
+def test_manual_notification_actions_accept_old_ids_and_all_business_states(
+    tmp_path, state, action,
+) -> None:
+    store = _ready_database(tmp_path / "manual-state.sqlite3", system_count=1)
+    platform = "112-1234567-1234567"
+    store.upsert_contact(_contact(system_order_nos=("10001",)))
+    store.replace_package_scan(platform, [_package(1)])
+    original = store.prepare_notification(platform, _config())
+    current = store.reopen_for_review(original["id"], _config(), note="first manual review")
+    with store.connect() as conn:
+        conn.execute(
+            "UPDATE shipment_notifications SET state=?, provider_message_id='old-evidence', "
+            "provider_status='Failed / 301', sent_at='2026-09-01T00:00:00Z', attempt_count=1 WHERE id=?",
+            (state, current["id"]),
+        )
+        conn.commit()
+
+    if action == "reopen":
+        changed = store.reopen_for_review(original["id"], _config(), note="operator verified")
+        assert changed["state"] == NOTIFICATION_AWAITING_REVIEW
+        assert changed["revision"] == current["revision"] + 1
+        assert changed["provider_message_id"] is None
+        assert changed["attempt_count"] == 0
+    else:
+        method = store.mark_manually_completed if action == "complete" else store.cancel_notifications
+        result = method([original["id"], current["id"]], note="operator verified")
+        assert list(result.values()) == [1]
+        changed = store.get_latest_notification(platform)
+        assert changed["state"] == (NOTIFICATION_MANUALLY_COMPLETED if action == "complete" else NOTIFICATION_CANCELLED)
+        # Repeating an already-completed/cancelled decision is idempotent.
+        assert method([changed["id"]], note="confirmed again") == result
+    assert "operator verified" in " ".join(r["note"] for r in changed["reviews"])
+    assert store.get_notification(current["id"])["provider_message_id"] == "old-evidence"
+    if state == "SENDING":
+        assert changed["id"] != current["id"]
+        if action == "reopen":
+            with pytest.raises(NotificationStateError, match="原版本的发送请求尚未结束"):
+                store.approve_and_claim(changed["id"], _config())
+        store.finalize_send(current["id"], accepted=True, provider_message_id="late-result")
+        assert store.get_latest_notification(platform)["state"] == changed["state"]
+        assert store.get_notification(current["id"])["provider_message_id"] == "late-result"
+        if action == "reopen":
+            assert store.approve_and_claim(changed["id"], _config())["state"] == "SENDING"
+    with pytest.raises(NotificationStateError, match="旧发送任务已停止"):
+        store.approve_and_claim(original["id"], _config())
+
+
+def test_manual_review_can_be_created_before_automatic_eligibility_recovers(tmp_path) -> None:
+    store = _ready_database(tmp_path / "manual-incomplete.sqlite3", system_count=1)
+    platform = "112-1234567-1234567"
+    store.upsert_contact(_contact(system_order_nos=("10001",)))
+    store.replace_package_scan(platform, [_package(1)])
+    original = store.prepare_notification(platform, _config())
+    store.record_outbound_eligibility(platform, outbound_state="UNKNOWN", reason="wms_snapshot_unavailable")
+    store.upsert_contact(_contact(email="", phone_raw="", verified_phone_e164="", system_order_nos=("10001",)))
+    reopened = store.reopen_for_review(original["id"], _config(), note="operator requests manual review")
+    assert reopened["state"] == NOTIFICATION_AWAITING_REVIEW
+    assert reopened["attempt_count"] == 0
+    store.record_outbound_eligibility(
+        platform, outbound_state="UNKNOWN", reason="wms_snapshot_unavailable"
+    )
+    assert store.get_notification(reopened["id"])["state"] == NOTIFICATION_AWAITING_REVIEW
+    page = store.list_notification_page(outbound_eligible_only=True)
+    assert [row["id"] for row in page["items"]] == [reopened["id"]]
+    with pytest.raises((NotificationStateError, StaleNotificationError)):
+        store.approve_and_claim(reopened["id"], _config())
+
+
+def test_wms_read_failure_preserves_existing_sms_failure(tmp_path) -> None:
+    store = _ready_database(tmp_path / "wms-receipt.sqlite3", system_count=1)
+    platform = "112-1234567-1234567"
+    store.upsert_contact(_contact(system_order_nos=("10001",)))
+    store.replace_package_scan(platform, [_package(1)])
+    original = store.prepare_notification(platform, _config())
+    store.approve_and_claim(original["id"], _config())
+    store.finalize_send(original["id"], accepted=True, provider_message_id="sms-1")
+    store.mark_delivery_failed(original["id"], provider_status="Failed / 301 / Absent Subscriber")
+    failed = store.get_notification(original["id"])
+    store.record_outbound_eligibility(platform, outbound_state="UNKNOWN", reason="wms_snapshot_unavailable")
+    after = store.get_notification(original["id"])
+    assert after["state"] == failed["state"] == "RETRYABLE"
+    assert after["last_error"] == failed["last_error"]
+    assert after["provider_status"] == failed["provider_status"]
+    assert store.get_outbound_eligibility(platform)["outbound_state"] == "UNKNOWN"
+    with pytest.raises(StaleNotificationError):
+        store.retry_approved_and_claim(original["id"], _config())
+
+
 def test_cancelled_notification_is_audited_and_not_recreated_by_scan(tmp_path) -> None:
     store = _ready_database(tmp_path / "queue.sqlite3")
     platform = "112-1234567-1234567"
@@ -5048,12 +5143,6 @@ def test_contradictory_review_provider_success_is_blocked_then_reconciled(
     assert unchanged is not None
     assert unchanged["id"] == notification["id"]
     assert unchanged["state"] == "AWAITING_REVIEW"
-    with pytest.raises(NotificationStateError, match="不能重新提交"):
-        store.reopen_for_review(
-            notification["id"],
-            _config(),
-            note="attempted unsafe reopen",
-        )
     with pytest.raises(NotificationStateError, match="消息 ID 与已核验结果不一致"):
         store.reconcile_verified_provider_success(
             notification["id"],

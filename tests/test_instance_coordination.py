@@ -6,6 +6,7 @@ import sqlite3
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 
 import httpx
@@ -2127,6 +2128,59 @@ def test_notification_batch_lease_blocks_overlapping_ids_across_clients(
             "notification:71",
             "notification:72",
             "order:shipment-notifications:71,72",
+        }
+        independent = replace(
+            overlapping,
+            order_no="shipment-notifications:73",
+            payload={
+                "trigger": SHIPMENT_NOTIFICATION_SEND_TRIGGER,
+                "notification_ids": [73],
+            },
+        )
+        queued = service.invoke(
+            instance_id="two",
+            request_id="notification-batch-independent",
+            method="submit_task",
+            raw_args=[to_jsonable(independent)],
+            raw_kwargs={},
+        )
+        assert queued["result"]["accepted"] is True
+        assert len(controller.snapshot().tasks) == 2
+    finally:
+        service.close()
+
+
+@pytest.mark.parametrize("method", [
+    "mark_shipment_notifications_manually_completed", "cancel_shipment_notifications",
+    "resubmit_shipment_notifications",
+])
+def test_manual_notification_decision_is_not_refused_by_background_send_lease(
+    tmp_path, monkeypatch, method,
+) -> None:
+    controller, store, service = _service(tmp_path)
+    service.register("sender", "Sender")
+    service.register("reviewer", "Reviewer")
+    calls = []
+    monkeypatch.setattr(controller, "get_shipment_notification_details", lambda _ids: [
+        {"id": 71, "platform_order_no": "ORDER-71"},
+    ])
+    monkeypatch.setattr(controller, method, lambda ids, *, reason: (
+        calls.append((ids, reason)) or ControlResult(True, "人工决定已保存")
+    ))
+    try:
+        assert store.acquire(
+            resources=("notification:71", "order:ORDER-71"),
+            instance_id="sender", request_id="active-send", operation="submit_task",
+            ttl_seconds=30,
+        ) is None
+        result = service.invoke(
+            instance_id="reviewer", request_id="manual-decision", method=method,
+            raw_args=[[71]], raw_kwargs={"reason": "人工核验"},
+        )
+        assert result["result"]["accepted"] is True
+        assert calls == [([71], "人工核验")]
+        assert {lease["resource"] for lease in store.active_leases()} == {
+            "notification:71", "order:order-71",
         }
     finally:
         service.close()

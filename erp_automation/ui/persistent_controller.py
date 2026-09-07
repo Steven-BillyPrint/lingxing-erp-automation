@@ -3946,6 +3946,8 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
     def mark_shipment_notifications_manually_completed(
         self, notification_ids: Sequence[int], *, reason: str
     ) -> ControlResult:
+        from shipment_automation.notification_store import NotificationStateError
+
         store, _configuration = self._shipment_notification_context()
         try:
             result = store.mark_manually_completed(
@@ -3954,7 +3956,12 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                 note=reason,
             )
         except Exception as exc:
-            message = f"标记人工完成失败：{type(exc).__name__}。未修改任何通知。"
+            detail = (
+                str(exc).strip()
+                if isinstance(exc, NotificationStateError)
+                else type(exc).__name__
+            )
+            message = f"标记人工完成失败：{detail}。未修改任何通知。"
             self._append_log(LogLevel.ERROR, "shipment_notification", message)
             return ControlResult(False, message)
         count = int(result.get("completed") or 0)
@@ -3965,6 +3972,8 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
     def cancel_shipment_notifications(
         self, notification_ids: Sequence[int], *, reason: str
     ) -> ControlResult:
+        from shipment_automation.notification_store import NotificationStateError
+
         store, _configuration = self._shipment_notification_context()
         try:
             result = store.cancel_notifications(
@@ -3973,7 +3982,12 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                 note=reason,
             )
         except Exception as exc:
-            message = f"取消客户通知失败：{type(exc).__name__}。未修改任何通知。"
+            detail = (
+                str(exc).strip()
+                if isinstance(exc, NotificationStateError)
+                else type(exc).__name__
+            )
+            message = f"取消客户通知失败：{detail}。未修改任何通知。"
             self._append_log(LogLevel.ERROR, "shipment_notification", message)
             return ControlResult(False, message)
         count = int(result.get("cancelled") or 0)
