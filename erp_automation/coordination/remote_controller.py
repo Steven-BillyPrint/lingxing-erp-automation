@@ -25,6 +25,7 @@ import httpx
 
 from erp_automation.configuration import atomic_write_bytes, backup_path_for
 from erp_automation.contracts.controller import ControlResult, TaskSubmissionReceipt
+from erp_automation.contracts.operation_feedback import operation_rejection
 from erp_automation.contracts.models import (
     Capability,
     CUSTOM_ORDER_SUBMISSION_ID_PAYLOAD_KEY,
@@ -1150,6 +1151,24 @@ class RemoteBackgroundTaskController:
             messages.clear()
             return message
 
+    def _record_operation_rejection(self, request_id: str, result: ControlResult) -> None:
+        if operation_rejection(result) is None:
+            return
+        with self._metadata_guard():
+            shown = self.__dict__.setdefault("_operation_rejection_request_ids", set())
+            if request_id in shown:
+                return
+            shown.add(request_id)
+            self.__dict__.setdefault("_operation_rejections", {})[request_id] = result
+
+    def take_operation_rejections(self) -> tuple[ControlResult, ...]:
+        """Deliver late server refusals once on the GUI thread, without I/O."""
+        with self._metadata_guard():
+            pending = self.__dict__.setdefault("_operation_rejections", {})
+            results = tuple(pending.values())
+            pending.clear()
+            return results
+
     def take_task_submission_receipts(
         self, submission_ids: Sequence[str],
     ) -> tuple[TaskSubmissionReceipt, ...]:
@@ -1297,6 +1316,18 @@ class RemoteBackgroundTaskController:
                                 self._record_task_submission_receipts(
                                     request_id, submitted_commands, results,
                                 )
+                                rejected_orders = tuple(
+                                    (str(command.order_no or command.name), result.message)
+                                    for command, result in zip(submitted_commands, results)
+                                    if not result.accepted
+                                    and not result.details.get("submission_outcome_unknown")
+                                )
+                                if rejected_orders:
+                                    self._record_operation_rejection(request_id, ControlResult(
+                                        any(result.accepted for result in results),
+                                        "服务器已确认批量操作结果。",
+                                        details={"rejected_orders": rejected_orders},
+                                    ))
                                 with self._lock:
                                     for command, result in zip(
                                         submitted_commands,
@@ -1317,6 +1348,12 @@ class RemoteBackgroundTaskController:
                                                 else self._browser_cleanup_task_ids
                                             )
                                             cleanup_ids.add(str(result.task_id))
+                            raw_result = response.get("result")
+                            result_type = str(response.get("result_type") or "")
+                            if result_type == "control_result" and not submitted_commands:
+                                self._record_operation_rejection(
+                                    request_id, decode_control_result(raw_result),
+                                )
                             if success_handler is not None:
                                 try:
                                     message = success_handler(response)
@@ -1349,6 +1386,12 @@ class RemoteBackgroundTaskController:
                         "后台确认请求失败："
                         + str(status.get("error") or "未返回失败原因。")
                     )
+                    self._record_operation_rejection(request_id, ControlResult(
+                        False,
+                        "服务器处理失败：" + str(status.get("error") or "未返回具体原因。")
+                        + " 请核对当前状态，勿重复提交。",
+                        details={"server_execution_failed": True},
+                    ))
                     if not submitted_commands:
                         return
                     # A failed RPC journal is not proof that no task entered

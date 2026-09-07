@@ -1457,6 +1457,46 @@ def test_manual_tracking_pair_can_correct_carrier_and_make_exact_pair_ready(tmp_
     assert event.details["old_pair"]["carrier"] == "FedEx"
 
 
+def test_manual_yanwen_ywe_pair_replaces_null_and_persists_after_reopening(tmp_path):
+    path = tmp_path / "shipment_queue.sqlite3"
+    store = ShipmentWorkflowStore(path)
+    candidate = _candidate()
+    store.upsert_candidate(candidate)
+    tracking_no = "YWE00001506996989"
+    store.complete_logistics_attempt(
+        candidate.logistics_no,
+        LogisticsDetail(
+            logistics_no=candidate.logistics_no,
+            status_text="运输中",
+            carrier="null",
+            international_tracking_no=tracking_no,
+            actual_total="CNY 340.51",
+            chargeable_weight_kg="2.645",
+        ),
+        state=LOGISTICS_RETRYABLE,
+        last_error="承运商为 null，请人工复核。",
+    )
+
+    assert store.confirm_tracking_pair(
+        candidate.logistics_no,
+        carrier="Yanwen",
+        tracking_no=tracking_no,
+        reason="人工向物流客服核实承运商为燕文",
+    )
+
+    reopened = ShipmentWorkflowStore(path)
+    row = reopened.get_by_logistics_no(candidate.logistics_no)
+    assert row["carrier"] == "Yanwen"
+    assert row["international_tracking_no"] == tracking_no
+    assert row["logistics_state"] == LOGISTICS_READY
+    assert row["erp_state"] == ERP_PENDING
+    assert row["logistics_last_error"] is None
+    assert row["tracking_override_carrier"] == "YANWEN"
+    assert row["tracking_override_no"] == tracking_no
+    assert reopened.list_erp_mark_candidates()[0].tracking_manually_verified is True
+    assert reopened.history(candidate.logistics_no)[-1].details["old_pair"]["carrier"] == "null"
+
+
 def test_amazon_main_image_forbidden_channel_blocks_until_valid_manual_pair(tmp_path):
     store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
     candidate = _candidate()
