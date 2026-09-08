@@ -31,6 +31,7 @@ from .alibaba_logistics import (
     parse_logistics_detail_from_text,
 )
 from .config import (
+    ALIBABA_SESSION_HOSTS,
     DEFAULT_SHIPMENT_QUEUE_PATH,
     AlibabaLoginConfig,
     configuration_source_from_args,
@@ -73,14 +74,6 @@ MAX_CONSECUTIVE_PAGE_FAILURES = 3
 ALIBABA_SCM_WARMUP_LOAD_TIMEOUT_MS = 10_000
 ALIBABA_SCM_WARMUP_POLL_INTERVAL_MS = 250
 ALIBABA_SCM_WARMUP_STABLE_OBSERVATIONS = 3
-ALIBABA_SESSION_HOSTS = frozenset(
-    {
-        "scm.alibaba.com",
-        "login.alibaba.com",
-        "passport.alibaba.com",
-        "login.aliexpress.com",
-    }
-)
 LOGISTICS_QUERY_CONFIGURATION_MISSING_MESSAGE = "阿里物流查询账号未配置"
 
 
@@ -473,7 +466,11 @@ async def run_logistics_worker(args: argparse.Namespace) -> dict[str, Any]:
     finally:
         if update_queue:
             store.release_claimed_jobs(worker_id, "logistics")
-        if getattr(args, "keep_browser_open", False):
+        if str(getattr(args, "browser_cdp_url", "") or "").strip():
+            # The desktop owns this browser. Detach the task's driver while
+            # preserving the page, cookies and sessionStorage for the next task.
+            await _close_browser_state(browser_state, preserve_session=True)
+        elif getattr(args, "keep_browser_open", False):
             print("Browser will stay open for inspection.")
         else:
             await _close_browser_state(browser_state)
@@ -856,16 +853,18 @@ async def fetch_logistics_detail_from_page(
             await _close_page(page)
 
 
-async def _close_browser_state(browser_state: dict[str, Any]) -> None:
+async def _close_browser_state(
+    browser_state: dict[str, Any], *, preserve_session: bool = False,
+) -> None:
     page = browser_state.get("page")
     context = browser_state.get("context")
     playwright = browser_state.get("playwright")
     browser_state["page"] = None
     browser_state["context"] = None
     browser_state["playwright"] = None
-    if page is not None:
+    if page is not None and not preserve_session:
         await _close_page(page)
-    if context is not None:
+    if context is not None and not preserve_session:
         try:
             await context.close()
         except Exception:

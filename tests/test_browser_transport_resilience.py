@@ -201,7 +201,6 @@ def test_remote_submission_is_rejected_while_its_browser_tunnel_recovers() -> No
     client._revision = 0
     client.instance_id = "desktop-one"
     client._browser_cleanup_task_ids = set()
-    client._logistics_browser_cleanup_task_ids = set()
     client._request = lambda *_args, **_kwargs: (_ for _ in ()).throw(
         AssertionError("down-lane task must not reach the server")
     )

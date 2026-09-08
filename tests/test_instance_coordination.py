@@ -2793,7 +2793,8 @@ def test_remote_browser_close_ignores_api_only_and_other_desktop_tasks() -> None
     assert client._browser_close_pending is False
 
 
-def test_completed_logistics_query_closes_only_its_profile_while_order_waits() -> None:
+@pytest.mark.parametrize("status", [TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.PAUSED, TaskStatus.CANCELLED])
+def test_terminal_logistics_query_preserves_session_while_order_waits(status) -> None:
     class BrowserHost:
         def __init__(self) -> None:
             self.close_count = 0
@@ -2809,8 +2810,6 @@ def test_completed_logistics_query_closes_only_its_profile_while_order_waits() -
     client._logistics_browser_host = logistics_host
     client._browser_cleanup_task_ids = set()
     client._browser_close_pending = False
-    client._logistics_browser_cleanup_task_ids = {"completed-logistics"}
-    client._logistics_browser_close_pending = False
 
     client._cleanup_browser_after_terminal_tasks(
         DesktopSnapshot(
@@ -2820,7 +2819,7 @@ def test_completed_logistics_query_closes_only_its_profile_while_order_waits() -
                     "query logistics",
                     TaskArea.SHIPMENT,
                     Capability.ALIBABA_LOGISTICS,
-                    status=TaskStatus.SUCCEEDED,
+                    status=status,
                     payload={"_desktop_instance_id": "desktop-a"},
                 ),
                 TaskRecord(
@@ -2835,7 +2834,7 @@ def test_completed_logistics_query_closes_only_its_profile_while_order_waits() -
         )
     )
 
-    assert logistics_host.close_count == 1
+    assert logistics_host.close_count == 0
     assert order_host.close_count == 0
 
 
@@ -2892,7 +2891,6 @@ def test_remote_task_batch_starts_browser_once_and_decodes_each_result() -> None
     client._revision = 0
     client.instance_id = "desktop-one"
     client._browser_cleanup_task_ids = set()
-    client._logistics_browser_cleanup_task_ids = set()
     client._request = lambda *_args, **_kwargs: {
         "revision": 3,
         "result_type": "control_results",
@@ -2982,7 +2980,6 @@ def test_remote_task_batch_read_timeout_is_reported_as_unconfirmed_per_item() ->
     client._timeout_seconds = 5.0
     client.instance_id = "desktop-one"
     client._browser_cleanup_task_ids = set()
-    client._logistics_browser_cleanup_task_ids = set()
 
     def read_timeout(*_args, **_kwargs):
         try:
@@ -3212,17 +3209,18 @@ def test_lingxing_login_opens_the_requesting_desktops_dedicated_profile() -> Non
     assert "lingxing.password" not in serialized_request
 
 
-def test_alibaba_logistics_query_opens_home_only_in_query_browser_profile() -> None:
+@pytest.mark.parametrize("scope", ["normal", "completed"])
+def test_alibaba_logistics_query_reuses_only_query_browser_profile(scope) -> None:
     class BrowserHost:
         def __init__(self) -> None:
             self.opened_urls: list[str] = []
 
-        def open_url(self, url: str) -> None:
-            self.opened_urls.append(url)
+        def prepare_logistics_session(self) -> None:
+            self.opened_urls.append("reuse-logistics-session")
 
         def ensure_started(self, *, initial_url: str = "about:blank") -> None:
             pytest.fail(
-                "物流查询必须显式打开 SCM 首页，不能只确保 Chrome 已启动。"
+                "物流查询必须保留已有物流页，无页面时才打开 SCM 首页。"
             )
 
     order_host = BrowserHost()
@@ -3236,7 +3234,6 @@ def test_alibaba_logistics_query_opens_home_only_in_query_browser_profile() -> N
     client._logistics_browser_host = logistics_host
     client.logistics_browser_endpoint = "http://127.0.0.1:24001"
     client._browser_cleanup_task_ids = set()
-    client._logistics_browser_cleanup_task_ids = set()
     client._last_interactions = ()
     client._last_snapshot = DesktopSnapshot()
     client._revision = 0
@@ -3255,14 +3252,14 @@ def test_alibaba_logistics_query_opens_home_only_in_query_browser_profile() -> N
         "查询阿里物流号",
         TaskArea.SHIPMENT,
         Capability.ALIBABA_LOGISTICS,
+        payload={"logistics_scope": scope},
     )
 
     result = client._rpc("submit_task", command)
 
     assert result.accepted is True
-    assert logistics_host.opened_urls == [local_browser.ALIBABA_SCM_HOME_URL]
+    assert logistics_host.opened_urls == ["reuse-logistics-session"]
     assert order_host.opened_urls == []
-    assert client._logistics_browser_cleanup_task_ids == {"logistics-one"}
     assert client._browser_cleanup_task_ids == set()
 
 
