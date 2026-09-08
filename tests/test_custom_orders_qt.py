@@ -2369,7 +2369,7 @@ def test_non_table_status_surfaces_keep_full_text_wrapped(app):
             pages[2].status_label,
             pages[3].scan_schedule_label,
             pages[4].emergency_state,
-            pages[5].summary,
+            pages[5].package_status_label,
         )
         assert all(label.wordWrap() for label in wrapped_labels)
     finally:
@@ -6949,7 +6949,7 @@ def test_notification_package_preview_renders_without_detail_round_trip(app):
 
     assert page.package_table.rowCount() == 1
     assert page.package_table.item(0, 5).text() == "4PX001"
-    assert page.summary.text() != "正在加载通知包裹与正文详情…"
+    assert page.package_status_label.isHidden()
     assert controller.detail_calls == []
     page.deleteLater()
 
@@ -7296,7 +7296,7 @@ def test_notification_table_selects_one_cell_and_copies_current_value(app):
     page.deleteLater()
 
 
-def test_notification_status_keeps_full_text_in_table_and_selected_detail(app):
+def test_notification_status_keeps_full_text_in_table_without_duplicate_summary(app):
     controller = RecordingController()
     full_explanation = (
         "发送未开始：订单 112-2585733-5194611 的出库状态、物流信息或联系方式"
@@ -7323,7 +7323,7 @@ def test_notification_status_keeps_full_text_in_table_and_selected_detail(app):
     assert status_item.text() == full_explanation
     assert status_item.toolTip() == full_explanation
     assert "拖宽" in page.table.horizontalHeaderItem(9).toolTip()
-    assert f"状态说明：{full_explanation}" in page.summary.text()
+    assert page.package_status_label.isHidden()
     page.deleteLater()
 
 

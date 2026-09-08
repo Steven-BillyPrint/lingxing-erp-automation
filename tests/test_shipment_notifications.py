@@ -2031,6 +2031,7 @@ def test_notification_page_orders_work_states_globally_before_pagination(
         ("REJECTED", 0, "2026-08-14T02:00:00Z", ""),
         ("CANCELLED", 0, "2026-08-14T03:00:00Z", ""),
         ("DRAFT", 0, "2026-08-14T04:00:00Z", ""),
+        ("FAILED", 0, "2026-08-13T09:00:00Z", "状态核验超时：provider timeout"),
     )
     notification_ids: list[int] = []
     with sqlite3.connect(path) as conn:
@@ -2094,7 +2095,7 @@ def test_notification_page_orders_work_states_globally_before_pagination(
             active_notification_ids=(active_waiting_id,),
             outbound_eligible_only=False,
         )
-        assert page["total"] == 19
+        assert page["total"] == 20
         assert page["total_pages"] == 5
         page_ids.extend(int(item["id"]) for item in page["items"])
 
@@ -2104,14 +2105,15 @@ def test_notification_page_orders_work_states_globally_before_pagination(
         notification_ids[3],
         notification_ids[2],
         notification_ids[4],
+        notification_ids[11],
+        notification_ids[12],
+        notification_ids[19],
         notification_ids[5],
         notification_ids[6],
         notification_ids[7],
         notification_ids[8],
         notification_ids[9],
         notification_ids[10],
-        notification_ids[11],
-        notification_ids[12],
         notification_ids[13],
         notification_ids[14],
         notification_ids[15],

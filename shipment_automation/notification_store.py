@@ -318,6 +318,13 @@ def initialize_notification_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_shipment_notifications_queue_order
             ON shipment_notifications(updated_at DESC, id DESC)
             WHERE legacy_email_batch_id IS NULL;
+        -- Receipt history is queried for each visible order while classifying
+        -- and sorting the queue. Cover both equality filters and the revision
+        -- range so SQLite avoids repeatedly scanning the notification rows.
+        CREATE INDEX IF NOT EXISTS idx_shipment_notifications_prior_delivery
+            ON shipment_notifications(
+                legacy_email_batch_id, platform_order_no, revision, state
+            );
         CREATE TABLE IF NOT EXISTS shipment_notification_items (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             notification_id INTEGER NOT NULL
