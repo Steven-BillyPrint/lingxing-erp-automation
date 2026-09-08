@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 from lingxing_automation.browser.session import launch_context
 
 from .alibaba_session import (
+    ALIBABA_DETAIL_TIMEOUT_SECONDS,
     AlibabaAccountVerificationError,
     AlibabaAccountUnverifiedError,
     is_alibaba_login_page,
@@ -794,7 +795,8 @@ async def fetch_logistics_detail_from_page(
 
         response_handler = handle_response
         page.on("response", response_handler)
-        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        detail_deadline = time.monotonic() + ALIBABA_DETAIL_TIMEOUT_SECONDS
+        await page.goto(url, wait_until="domcontentloaded", timeout=ALIBABA_DETAIL_TIMEOUT_SECONDS * 1000)
         await wait_for_alibaba_logistics_detail(
             page,
             url,
@@ -802,6 +804,7 @@ async def fetch_logistics_detail_from_page(
             auto_login=auto_login,
             timeout_sec=login_timeout_sec,
             manual_login_callback=manual_login_callback,
+            detail_deadline=detail_deadline,
         )
         _remove_response_listener(page, response_handler)
         response_handler = None

@@ -240,3 +240,60 @@ def test_detail_identity_allows_tracking_parameters_but_rejects_other_order():
     assert not _is_logistics_detail_url(expected.replace("id=123", "id=456"), expected)
     assert not _is_logistics_detail_url(expected + "&id=456", expected)
     assert not _is_logistics_detail_url(expected.replace("scm.alibaba.com", "example.com"), expected)
+
+
+@pytest.mark.parametrize("navigation_seconds, mode, total_seconds", [
+    (24, "page", 30),
+    (29.8, "page", 30),
+    (30, "page", 30),
+    (30, "login", 330),
+    (30, "transition", 120),
+    (24, "batch", 90),
+])
+def test_navigation_does_not_add_another_page_wait_budget(tmp_path, monkeypatch, navigation_seconds, mode, total_seconds):
+    from shipment_automation import alibaba_session as session
+    from shipment_automation import logistics_worker as worker
+    ticks = [0.0]
+
+    class Page:
+        url = ""
+        def on(self, *_args):
+            pass
+        def remove_listener(self, *_args):
+            pass
+        async def goto(self, url, *, wait_until, timeout):
+            assert wait_until == "domcontentloaded" and timeout == 30_000
+            self.url = url
+            ticks[0] += navigation_seconds
+        async def wait_for_timeout(self, milliseconds):
+            ticks[0] += milliseconds / 1000
+
+    async def no_warmup(_page):
+        pass
+    async def body(_page):
+        return "loading"
+    async def login(_page, _body):
+        return mode == "login" or mode == "transition" and ticks[0] < 90
+
+    monkeypatch.setattr(session.time, "monotonic", lambda: ticks[0])
+    monkeypatch.setattr(session, "_safe_body_text", body)
+    monkeypatch.setattr(session, "is_alibaba_login_page", login)
+    monkeypatch.setattr(worker, "_warm_up_alibaba_page_if_needed", no_warmup)
+    if mode == "batch":
+        store = ShipmentWorkflowStore(tmp_path / "queue.sqlite3")
+        for index in range(6):
+            store.upsert_candidate(candidate(index))
+        async def fetch(logistics_no):
+            return await worker.fetch_logistics_detail_from_page(SimpleNamespace(), logistics_no, page=Page(), auto_login=False)
+        report = asyncio.run(process_logistics_queue_once(store, fetch_detail=fetch, update_queue=True, dry_run=False))
+        assert report.status == "failed"
+        assert report.scanned_page_count == report.aborted_count == 3
+        assert [store.get_by_logistics_no(candidate(i).logistics_no)["logistics_attempt_count"] for i in range(6)] == [1, 1, 1, 0, 0, 0]
+    else:
+        query = worker.fetch_logistics_detail_from_page(SimpleNamespace(), "ALS123", page=Page(), auto_login=False)
+        if mode == "login":
+            with pytest.raises(session.AlibabaAccountUnverifiedError):
+                asyncio.run(query)
+        else:
+            assert "加载超时" in asyncio.run(query).page_error
+    assert ticks[0] == pytest.approx(total_seconds, abs=0.002)

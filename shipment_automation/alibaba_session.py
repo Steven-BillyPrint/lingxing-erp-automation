@@ -114,11 +114,16 @@ async def wait_for_alibaba_logistics_detail(
     timeout_sec: int = 300,
     manual_login_callback: ManualLoginCallback | None = None,
     detail_timeout_sec: float = ALIBABA_DETAIL_TIMEOUT_SECONDS,
+    detail_deadline: float | None = None,
 ) -> None:
     """Wait until an Alibaba logistics detail page is readable, logging in when possible."""
 
     page_budget = min(max(detail_timeout_sec, 1), max(timeout_sec, 1))
+    # Navigation and readiness share a deadline.  Login/verification has its
+    # own budget; returning from login starts a fresh page budget.
     deadline = time.monotonic() + page_budget
+    if detail_deadline is not None:
+        deadline = min(deadline, detail_deadline)
     login_deadline: float | None = None
     waiting_for_login = False
     auto_login_attempted = False
@@ -130,7 +135,9 @@ async def wait_for_alibaba_logistics_detail(
     config = login_config or AlibabaLoginConfig()
     should_auto_login = auto_login and config.auto_login
 
-    while time.monotonic() < deadline:
+    while True:
+        # Observe once even at the boundary: navigation may have just reached
+        # a login page, whose separate budget must still be available.
         body_text = await _safe_body_text(page)
         if _is_logistics_detail_url(page.url, detail_url) and _is_logistics_detail_ready(page.url, body_text):
             if config.account:
@@ -151,6 +158,8 @@ async def wait_for_alibaba_logistics_detail(
         elif waiting_for_login:
             deadline = time.monotonic() + page_budget
             waiting_for_login = False
+        if time.monotonic() >= deadline:
+            break
         if (
             needs_manual_verification
             and not verification_login_retried
@@ -191,6 +200,7 @@ async def wait_for_alibaba_logistics_detail(
                 # Time spent by the operator is not a page/network timeout.
                 login_deadline = time.monotonic() + max(timeout_sec, 1)
                 deadline = time.monotonic() + page_budget
+                waiting_for_login = False
                 if not _is_logistics_detail_url(page.url, detail_url):
                     await page.goto(detail_url, wait_until="domcontentloaded")
                 continue
@@ -208,6 +218,8 @@ async def wait_for_alibaba_logistics_detail(
                     auto_login_submitted = True
                     await page.wait_for_timeout(POST_LOGIN_SUBMIT_DELAY_MS)
                     if "detail.htm" not in page.url:
+                        deadline = time.monotonic() + page_budget
+                        waiting_for_login = False
                         await page.goto(detail_url, wait_until="domcontentloaded")
                     continue
                 print("阿里自动登录未能完成，请在浏览器里手动登录或处理验证；脚本会自动继续。")
@@ -224,6 +236,10 @@ async def wait_for_alibaba_logistics_detail(
             print("阿里页面重试后仍需要验证码或安全验证，请在浏览器里手动处理；脚本会自动继续。")
             printed_manual_message = True
 
+        remaining_ms = int((deadline - time.monotonic()) * 1000)
+        if remaining_ms <= 0:
+            break
+        wait_ms = min(ALIBABA_DETAIL_POLL_INTERVAL_MS, remaining_ms)
         if hasattr(page, "wait_for_function"):
             try:
                 await page.wait_for_function(
@@ -235,13 +251,13 @@ async def wait_for_alibaba_logistics_detail(
                             && markers.some(marker => (document.body?.innerText || '').includes(marker));
                     }""",
                     arg=[detail_url, list(DETAIL_READY_MARKERS + DETAIL_ERROR_MARKERS)],
-                    timeout=min(ALIBABA_DETAIL_POLL_INTERVAL_MS, max(1, int((deadline - time.monotonic()) * 1000))),
+                    timeout=wait_ms,
                     polling="raf",
                 )
             except PlaywrightTimeoutError:
                 pass
         else:
-            await page.wait_for_timeout(ALIBABA_DETAIL_POLL_INTERVAL_MS)
+            await page.wait_for_timeout(wait_ms)
 
     if waiting_for_login:
         raise AlibabaAccountUnverifiedError(
