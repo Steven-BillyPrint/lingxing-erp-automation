@@ -534,16 +534,6 @@ def _available_loopback_port(preferred: int = PREFERRED_LOCAL_PORT) -> int:
     raise PackagedClientBootstrapError("本机没有可用的 SSH 转发端口。")
 
 
-def _assert_loopback_port_available(port: int) -> None:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
-        try:
-            listener.bind(("127.0.0.1", port))
-        except OSError as exc:
-            raise PackagedClientBootstrapError(
-                f"本机浏览器转发端口 {port} 已被占用。"
-            ) from exc
-
-
 def _operator_browser_local_port(operator_email: str) -> int:
     """Return one stable local CDP port for the operator on this Windows PC."""
 

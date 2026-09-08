@@ -55,16 +55,6 @@ def find_missing_rule_line(
     return title_text or value_text, False
 
 
-def _line_exists_in_customization_pairs(line: str, customization_pairs: Mapping[str, Any] | None) -> bool:
-    """判断指定缺失规则行是否存在于原始定制化选项中。"""
-    if not customization_pairs:
-        return False
-    for pair_title, pair_value in customization_pairs.items():
-        if line == f"{str(pair_title or '').strip()} = {str(pair_value or '').strip()}":
-            return True
-    return False
-
-
 def format_rule_missing_lines(
     *,
     status: str | None,

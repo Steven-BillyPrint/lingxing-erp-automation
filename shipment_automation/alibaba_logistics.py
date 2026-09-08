@@ -1340,14 +1340,6 @@ def _section_package_count(lines: list[str], section_name: str) -> int | None:
     return total or None
 
 
-def _tracking_no_from_timeline(lines: list[str]) -> str | None:
-    for line in lines:
-        match = re.search(r"国际快递单号\s*([A-Za-z0-9-]+)", line)
-        if match:
-            return match.group(1)
-    return None
-
-
 def _find_line(lines: list[str], value: str) -> int:
     try:
         return lines.index(value)

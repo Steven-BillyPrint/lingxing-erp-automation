@@ -1508,3 +1508,11 @@ def signature_required(*, expedited: bool, requested: bool) -> bool:
 
     del expedited
     return bool(requested)
+
+
+def extract_lingxing_shipping_address(detail: Mapping[str, Any]) -> tuple[ShippingAddress, str]:
+    """Build an Alibaba address from the documented Lingxing API payload."""
+    try:
+        return extract_shipping_address(detail), "lingxing_openapi"
+    except AlibabaOrderRuleError as exc:
+        raise AlibabaOrderRuleError(f"领星公开 API 订单列表地址不完整：{exc}") from exc

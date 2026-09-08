@@ -10,7 +10,8 @@ from __future__ import annotations
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
-import os
+import asyncio
+import time
 import re
 import stat
 from pathlib import Path
@@ -2115,6 +2116,7 @@ class DesktopApiServices:
         targets = queue.list_completed_refresh_targets(
             eligible_only=False,
             include_detected_reconciliation=True,
+            evidence_only=True,
             limit=500,
         )
         metrics = {
@@ -2126,23 +2128,45 @@ class DesktopApiServices:
             "waybill_synced_count": 0,
             "externally_resolved_count": 0,
         }
-        seen: set[tuple[str, str, str]] = set()
-        for target in targets:
+        started = time.monotonic()
+        semaphore = asyncio.Semaphore(2)
+        detail_tasks: dict[str, asyncio.Task] = {}
+        wms_tasks: dict[str, asyncio.Task] = {}
+
+        async def read_wms(system_order_no: str, **kwargs):
+            if system_order_no not in wms_tasks:
+                wms_tasks[system_order_no] = asyncio.create_task(gateway.list_wms_orders(**kwargs))
+            return await wms_tasks[system_order_no]
+
+        async def refresh(target):
+            async with semaphore:
+                await refresh_one(target)
+
+        async def refresh_one(target):
             system_order_no = str(target.get("system_order_no") or "").strip()
             platform_order_no = str(target.get("platform_order_no") or "").strip()
             logistics_no = str(target.get("logistics_no") or "").strip()
-            identity = (system_order_no, platform_order_no, logistics_no)
-            if not all(identity) or identity in seen:
-                continue
-            seen.add(identity)
             try:
-                detail = await gateway.get_order_detail(system_order_no)
+                if system_order_no not in detail_tasks:
+                    detail_tasks[system_order_no] = asyncio.create_task(gateway.get_order_detail(system_order_no))
+                detail = await detail_tasks[system_order_no]
                 evidence = completed_re_mark_evidence_from_payload(
                     detail.payload,
                     system_order_no=system_order_no,
                     platform_order_no=platform_order_no,
                 )
-                wms_page = await gateway.list_wms_orders(
+                eligibility = completed_re_mark_eligibility(**evidence)
+                if not eligibility.eligible:
+                    queue.update_completed_refresh_evidence(
+                        system_order_no=system_order_no,
+                        platform_order_no=platform_order_no,
+                        run_id=run_id,
+                        **evidence,
+                    )
+                    metrics["checked_count"] += 1
+                    metrics["ineligible_count"] += 1
+                    return
+                wms_page = await read_wms(system_order_no,
                     filters={
                         "page": 1,
                         "page_size": 200,
@@ -2208,6 +2232,16 @@ class DesktopApiServices:
                     run_id=run_id,
                 )
                 metrics["failed_count"] += 1
+        unique = {}
+        for target in targets:
+            identity = tuple(str(target.get(key) or "").strip() for key in
+                             ("system_order_no", "platform_order_no", "logistics_no"))
+            if all(identity):
+                unique.setdefault(identity, target)
+        await asyncio.gather(*(refresh(target) for target in unique.values()))
+        metrics["elapsed_ms"] = round((time.monotonic() - started) * 1000)
+        metrics["detail_request_count"] = len(detail_tasks)
+        metrics["wms_request_count"] = len(wms_tasks)
         return metrics
 
     async def refresh_completed_shipment_eligibility_evidence(

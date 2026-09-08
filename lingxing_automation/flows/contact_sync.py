@@ -29,7 +29,6 @@ from ..models import (
 from ..pages.order_detail import (
     assert_current_detail_order,
     close_order_detail_dialog,
-    collect_detail_contact_candidates,
     click_system_order,
     find_contact_from_system_orders,
     read_shipping_contact_values,

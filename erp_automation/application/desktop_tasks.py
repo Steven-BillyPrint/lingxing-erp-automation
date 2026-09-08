@@ -586,6 +586,7 @@ class DesktopTaskRunner:
                     self._query_logistics(
                         settings,
                         configuration,
+                        logistics_scope=str(command.payload.get("logistics_scope") or "normal"),
                         task_id=command.execution_id or "",
                         browser_endpoint=str(
                             command.payload.get(DESKTOP_BROWSER_ENDPOINT_PAYLOAD_KEY) or ""
@@ -749,19 +750,9 @@ class DesktopTaskRunner:
     async def _alibaba_shipping_address(
         detail: Mapping[str, Any],
     ) -> tuple[Any, str]:
-        """Build the Alibaba address only from documented OpenAPI payloads."""
+        from shipment_automation.alibaba_ordering import extract_lingxing_shipping_address
 
-        from shipment_automation.alibaba_ordering import (
-            AlibabaOrderRuleError,
-            extract_shipping_address,
-        )
-
-        try:
-            return extract_shipping_address(detail), "lingxing_openapi"
-        except AlibabaOrderRuleError as exc:
-            raise AlibabaOrderRuleError(
-                f"领星公开 API 订单列表地址不完整：{exc}"
-            ) from exc
+        return extract_lingxing_shipping_address(detail)
 
     async def _prepare_alibaba_order(
         self,
@@ -2262,6 +2253,7 @@ class DesktopTaskRunner:
         *,
         task_id: str = "",
         browser_endpoint: str = "",
+        logistics_scope: str = "normal",
     ) -> TaskExecutionResult:
         normalized_endpoint = str(browser_endpoint or "").strip()
         if (
@@ -2288,7 +2280,7 @@ class DesktopTaskRunner:
             "ineligible_count": 0,
             "failed_count": 0,
         }
-        if self.shipment_completed_refresh is not None:
+        if logistics_scope == "completed" and self.shipment_completed_refresh is not None:
             self._report_progress(
                 task_id,
                 "正在通过领星 OpenAPI 核对近 15 天已标发订单。",
@@ -2335,6 +2327,8 @@ class DesktopTaskRunner:
         )
         args.configuration_values = dict(configuration)
         args.process_all_batches = True
+        args.logistics_scope = logistics_scope
+        args.logistics_run_id = task_id
         args.progress_callback = lambda message, percent: self._report_progress(
             task_id,
             message,

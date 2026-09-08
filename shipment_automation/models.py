@@ -433,6 +433,8 @@ class LogisticsWorkerReport:
     retryable_count: int = 0
     failed_count: int = 0
     browser_error_count: int = 0
+    consecutive_page_failures: int = 0
+    phase_durations_ms: dict[str, int] = field(default_factory=dict)
     aborted_count: int = 0
     parser_artifact_requeued_count: int = 0
     tracking_rule_requeued_count: int = 0
