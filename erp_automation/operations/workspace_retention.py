@@ -453,10 +453,6 @@ def _verify_business_archive(path: str | Path) -> dict[str, object]:
     return index
 
 
-def _actions_by_category(plan: CleanupPlan, category: str) -> tuple[Path, ...]:
-    return tuple(Path(action.path) for action in plan.actions if action.category == category)
-
-
 def _validate_actions(plan: CleanupPlan) -> None:
     workspace = Path(plan.workspace).resolve(strict=True)
     allowed = {

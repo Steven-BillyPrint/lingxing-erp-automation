@@ -472,6 +472,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         self._shipment_rule_reconciliation_completed = False
         self._custom_rows_signature: tuple[Any, ...] | None = None
         self._shipment_rows_signature: tuple[Any, ...] | None = None
+        self._shipment_page_facets_cache: tuple[object, QueueFacets] | None = None
         self._task_runner = task_runner
         self._executor = _DaemonTaskExecutor(thread_name="erp-desktop-worker")
         # Scans and business workflows use independent lanes so unrelated work
@@ -510,7 +511,6 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         self._recover_interrupted_task_journal_on_startup = bool(
             recover_interrupted_task_journal
         )
-        self._pause_generation = 0
         self._task_pause_reasons: dict[str, str] = {}
         self._pending_interactions: dict[str, DesktopInteractionRequest] = {}
         self._interaction_responses: dict[str, DesktopInteractionResponse] = {}
@@ -1349,104 +1349,6 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                 requested += 1
         return requested
 
-    def _cancel_queued_tasks_for_pause_locked(self, reason: str) -> int:
-        """Pause every task that has not started running."""
-
-        paused = 0
-        for task_id, future in list(self._futures.items()):
-            if future.done() or future.running() or not future.cancel():
-                continue
-            match = self._find_task(task_id)
-            if match is not None and not match[1].status.terminal:
-                self.set_task_status(
-                    task_id,
-                    TaskStatus.PAUSED,
-                    message=reason,
-                )
-                self._append_log(
-                    LogLevel.WARNING,
-                    match[1].area.value,
-                    reason,
-                    task_id=task_id,
-                )
-            self._futures.pop(task_id, None)
-            paused += 1
-        return paused
-
-    def _request_running_task_stops_locked(self) -> tuple[str, ...]:
-        """Request remaining write tasks to leave at their next safe boundary."""
-
-        requested: list[str] = []
-        for task_id, future in self._futures.items():
-            if future.done() or not future.running():
-                continue
-            self._shutdown_cancel_requested.add(task_id)
-            requested.append(task_id)
-        return tuple(requested)
-
-    def _pause_non_atomic_running_tasks_locked(
-        self,
-        reason: str,
-    ) -> tuple[str, ...]:
-        """Immediately fence work known not to be inside an external write."""
-
-        paused: list[str] = []
-        executor_attrs: list[str] = []
-        for task_id, future in list(self._futures.items()):
-            if future.done() or not future.running():
-                continue
-            match = self._find_task(task_id)
-            if match is None:
-                continue
-            task = match[1]
-            if task.status is not TaskStatus.WAITING_USER and task.capability.is_write:
-                continue
-            self._shutdown_cancel_requested.add(task_id)
-            self._futures.pop(task_id, None)
-            self._abandoned_futures[task_id] = future
-            self._terminally_fenced_tasks.add(task_id)
-            if not task.status.terminal:
-                self.set_task_status(
-                    task_id,
-                    TaskStatus.PAUSED,
-                    message=(
-                        f"{reason}；任务当前未执行外部写入，已立即暂停并释放占用。"
-                    ),
-                )
-            self._append_log(
-                LogLevel.WARNING,
-                task.area.value,
-                "任务处于等待用户或只读阶段，已立即暂停并隔离旧执行线程。",
-                task_id=task_id,
-            )
-            executor_attrs.append(
-                self._executor_attr_for_command(
-                    TaskCommand(
-                        name=task.name,
-                        area=task.area,
-                        capability=task.capability,
-                        payload=dict(task.payload),
-                        order_no=task.order_no,
-                        execution_id=task.task_id,
-                    )
-                )
-            )
-            paused.append(task_id)
-        if executor_attrs:
-            self._retire_executor_lanes_locked(executor_attrs)
-        return tuple(paused)
-
-    def _reject_pending_interactions_locked(self) -> int:
-        rejected = 0
-        for request_id in tuple(self._pending_interactions):
-            if request_id in self._interaction_responses:
-                continue
-            self._interaction_responses[request_id] = DesktopInteractionResponse(
-                request_id,
-                False,
-            )
-            rejected += 1
-        return rejected
 
     def _reject_pending_write_interactions_locked(self) -> int:
         """Resolve visible write prompts as rejected when emergency stop is raised."""
@@ -1517,6 +1419,8 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         # Keep all shipment writes in the same serial lane, but put an explicit
         # operator-triggered re-mark ahead of ordinary marks that have not yet
         # started.  The currently running write is never interrupted.
+        if command.capability is Capability.ALIBABA_LOGISTICS and command.payload.get("logistics_scope") == "completed":
+            return 10
         return -10 if command.capability is Capability.REMARK_SHIPMENT else 0
 
     @staticmethod
@@ -2631,98 +2535,6 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                 },
             )
 
-    def _enforce_pause_after_grace(
-        self,
-        generation: int,
-        task_ids: tuple[str, ...],
-        reason: str,
-    ) -> None:
-        if self._pause_grace_seconds:
-            threading.Event().wait(self._pause_grace_seconds)
-        with self._lock:
-            if (
-                generation != self._pause_generation
-                or not self._state.policy.execution_paused
-            ):
-                return
-            stuck = [
-                task_id
-                for task_id in task_ids
-                if (future := self._futures.get(task_id)) is not None
-                and not future.done()
-            ]
-            if not stuck:
-                return
-            old_executors = self._active_executors()
-            self._executor = _DaemonTaskExecutor(
-                thread_name="erp-desktop-worker",
-            )
-            self._custom_scan_executor = _DaemonTaskExecutor(
-                thread_name="erp-customization-scan",
-            )
-            self._shipment_scan_executor = _DaemonTaskExecutor(
-                thread_name="erp-shipment-scan",
-            )
-            self._notification_scan_executor = _DaemonTaskExecutor(
-                thread_name="erp-notification-scan",
-            )
-            self._custom_order_executor = _DaemonTaskExecutor(
-                thread_name="erp-customization-worker",
-            )
-            self._shipment_order_executor = _DaemonTaskExecutor(
-                thread_name="erp-shipment-worker",
-            )
-            self._shipment_logistics_executor = _DaemonTaskExecutor(
-                thread_name="erp-shipment-logistics",
-            )
-            self._notification_executor = _DaemonTaskExecutor(
-                thread_name="erp-notification-worker",
-            )
-            self._maintenance_executor = _DaemonTaskExecutor(
-                thread_name="erp-background-maintenance",
-            )
-            self._retired_executors.extend(old_executors)
-            for executor in old_executors:
-                executor.shutdown(wait=False, cancel_futures=True)
-            for task_id in stuck:
-                future = self._futures.pop(task_id, None)
-                if future is not None:
-                    self._abandoned_futures[task_id] = future
-                self._terminally_fenced_tasks.add(task_id)
-                match = self._find_task(task_id)
-                if match is None or match[1].status.terminal:
-                    continue
-                self.set_task_status(
-                    task_id,
-                    TaskStatus.PAUSED,
-                    message=(
-                        f"{reason}；任务未在 {self._pause_grace_seconds:g} 秒内退出，"
-                        "已强制中断并隔离旧执行线程。涉及写入时请人工读回核对。"
-                    ),
-                )
-            self._append_log(
-                LogLevel.ERROR,
-                "safety",
-                f"{len(stuck)} 个任务未在暂停宽限期内退出，已强制中断并隔离。",
-            )
-
-    def _start_pause_enforcer_locked(
-        self,
-        *,
-        already_paused: bool,
-        running: tuple[str, ...],
-        reason: str,
-    ) -> None:
-        if already_paused:
-            return
-        self._pause_generation += 1
-        generation = self._pause_generation
-        threading.Thread(
-            target=self._enforce_pause_after_grace,
-            args=(generation, running, reason),
-            name="erp-pause-enforcer",
-            daemon=True,
-        ).start()
 
     def set_execution_paused(
         self,
@@ -2898,6 +2710,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                 from shipment_automation.queue_store import ShipmentWorkflowStore
 
                 shipment_store = ShipmentWorkflowStore(shipment_path)
+                shipment_store.reconcile_persistent_rules()
                 requeued_tracking = (
                     shipment_store.requeue_tracking_mismatches_resolved_by_current_rules(
                         run_id=f"rules-{self._session_id}",
@@ -3170,12 +2983,20 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             return ShipmentPage(page_size=max(1, min(int(page_size), 200)))
         from shipment_automation.queue_store import ShipmentWorkflowStore
 
-        store = ShipmentWorkflowStore(shipment_path)
-        raw_index_rows = store.list_queue_index_rows()
+        store = ShipmentWorkflowStore(shipment_path, read_only=True)
+        dataset_revision = store.queue_dataset_revision()
+        locks = self._shipment_review_context()
+        active_statuses = self._active_shipment_statuses()
+        revision = self._shipment_review_revision(dataset_revision, locks)
+        facets_key = (str(shipment_path), revision, tuple(sorted(active_statuses.items())))
+        with self._lock:
+            cached_facets = self._shipment_page_facets_cache
+        raw_index_rows = store.list_queue_index_rows(
+            search_field=search_field, search_query=search_query,
+        )
         index_rows = tuple(
             shipment_row_from_mapping(row) for row in raw_index_rows
         )
-        locks = self._shipment_review_context()
         index_rows = self._shipment_rows_with_review_locks(index_rows, locks)
         page_projection = paginate_shipment_rows(
             index_rows,
@@ -3185,9 +3006,18 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             search_field=search_field,
             search_query=search_query,
             product_types=product_types,
-            active_statuses=self._active_shipment_statuses(),
-            dataset_revision=self._shipment_review_revision(sqlite_dataset_revision(shipment_path), locks),
+            active_statuses=active_statuses,
+            dataset_revision=revision,
         )
+        if cached_facets is not None and cached_facets[0] == facets_key:
+            facets = cached_facets[1]
+        else:
+            all_rows = index_rows if not str(search_query or "").strip() else self._shipment_rows_with_review_locks(
+                tuple(shipment_row_from_mapping(row) for row in store.list_queue_index_rows()), locks,
+            )
+            facets = paginate_shipment_rows(all_rows, page_size=1, active_statuses=active_statuses).facets
+            with self._lock:
+                self._shipment_page_facets_cache = (facets_key, facets)
         selected_logistics_nos = tuple(
             row.logistics_no
             for row in page_projection.items
@@ -3219,7 +3049,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             page_size=page_projection.page_size,
             total=page_projection.total,
             dataset_revision=page_projection.dataset_revision,
-            facets=page_projection.facets,
+            facets=facets,
         )
 
     def _snapshot_projection(self, *, include_queue_rows: bool) -> DesktopSnapshot:
@@ -3276,7 +3106,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
 
             try:
                 shipment_total, shipment_latest = ShipmentWorkflowStore(
-                    shipment_path
+                    shipment_path, read_only=True
                 ).count_all_jobs()
             except (OSError, sqlite3.Error):
                 pass
@@ -3288,7 +3118,11 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         snapshot.shipments_summary = DatasetSummary(
             total=shipment_total,
             revision=self._shipment_review_revision(
-                sqlite_dataset_revision(shipment_path), self._shipment_review_context(),
+                (
+                    ShipmentWorkflowStore(shipment_path, read_only=True).queue_dataset_revision()
+                    if shipment_path.is_file() else ""
+                ),
+                self._shipment_review_context(),
             ),
             latest_updated_at=shipment_latest,
         )

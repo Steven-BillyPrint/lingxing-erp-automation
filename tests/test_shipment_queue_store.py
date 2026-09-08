@@ -560,9 +560,10 @@ def test_new_als_for_same_platform_and_system_updates_queue_in_place(tmp_path):
         last_error="缺少国际物流服务商或国际物流单号，下次继续查询。",
     )
 
-    # Opening an existing queue upgrades the old WAITING representation to a
-    # terminal logistics cancellation without cancelling the ERP identity.
+    # Explicit startup repair upgrades the old representation; reads do not
+    # acquire a writer lock or perform historical migrations.
     store = ShipmentWorkflowStore(path)
+    store.reconcile_persistent_rules()
     closed = store.get_by_logistics_no(original.logistics_no)
     assert closed["identity_state"] == IDENTITY_ACTIVE
     assert closed["logistics_state"] == LOGISTICS_CANCELLED
@@ -623,6 +624,7 @@ def test_initialize_hides_legacy_duplicate_business_identity(tmp_path):
         )
         conn.commit()
     repaired = ShipmentWorkflowStore(path)
+    repaired.reconcile_persistent_rules()
 
     assert [row["logistics_no"] for row in repaired.list_all_jobs()] == ["ALS01825902784"]
     assert repaired.get_by_logistics_no("ALS01823850227")["identity_state"] == IDENTITY_SUPERSEDED

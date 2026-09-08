@@ -1988,6 +1988,7 @@ def test_alibaba_query_refreshes_completed_lingxing_evidence_first(
             configured_settings,
             {"lingxing": "configured"},
             task_id="completed-refresh-task",
+            logistics_scope="completed",
         )
     )
 
@@ -2023,7 +2024,7 @@ def test_alibaba_query_does_not_silently_skip_failed_eligibility_refresh(
         shipment_completed_refresh=failed_refresh,
     )
 
-    result = asyncio.run(runner._query_logistics(settings, {}))
+    result = asyncio.run(runner._query_logistics(settings, {}, logistics_scope="completed"))
 
     assert result.succeeded is False
     assert result.payload["status"] == "completed_refresh_evidence_failed"

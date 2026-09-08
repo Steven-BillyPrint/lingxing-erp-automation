@@ -1202,17 +1202,6 @@ if PYSIDE6_AVAILABLE:
         painter.end()
         return QIcon(pixmap)
 
-    def _add_proportional_toolbar_widgets(
-        layout: QHBoxLayout,
-        widgets: Sequence[QWidget],
-    ) -> None:
-        """Fill a toolbar row while preserving each control's natural proportion."""
-
-        for widget in widgets:
-            size_policy = widget.sizePolicy()
-            size_policy.setHorizontalPolicy(QSizePolicy.Policy.Expanding)
-            widget.setSizePolicy(size_policy)
-            layout.addWidget(widget, max(1, widget.sizeHint().width()))
 
     def _show_log_viewer(
         parent: QWidget,
@@ -1469,6 +1458,8 @@ if PYSIDE6_AVAILABLE:
         ) -> None:
             cache_key = self._cache_key(request_key, revision)
             if cache_key in self._cache or cache_key in self._inflight:
+                return
+            if any(token not in self._cache and thread.isRunning() for token, thread in self._inflight.items()):
                 return
             self._start_if_needed(cache_key, dict(query), request_key, revision)
 
@@ -3323,7 +3314,130 @@ if PYSIDE6_AVAILABLE:
             _restore_table_scroll_state(self.tasks, scroll_state)
 
 
-    class CustomOrdersPage(QWidget):
+    class _QueuePageNavigationMixin:
+        """Shared query identity, retry and navigation for both queue pages."""
+
+        def _server_query(self, *, page: int | None = None) -> dict[str, object]:
+            return {
+                "page": self._page if page is None else max(1, int(page)),
+                "page_size": self._page_size,
+                "status": str(self.status_filter_combo.currentData() or ""),
+                "search_field": str(
+                    self.search_field_combo.currentData() or "platform_order_no"
+                ),
+                "search_query": self.search_edit.text().strip(),
+                "product_types": tuple(
+                    self.product_type_filter_combo.selected_values
+                ),
+            }
+
+        @staticmethod
+        def _server_query_key(query: Mapping[str, object]) -> tuple[object, ...]:
+            return (
+                int(query.get("page") or 1),
+                int(query.get("page_size") or 50),
+                str(query.get("status") or ""),
+                str(query.get("search_field") or "platform_order_no"),
+                str(query.get("search_query") or ""),
+                tuple(query.get("product_types") or ()),
+            )
+
+        @staticmethod
+        def _server_query_from_key(
+            request_key: tuple[object, ...],
+        ) -> dict[str, object]:
+            return {
+                "page": int(request_key[0]),
+                "page_size": int(request_key[1]),
+                "status": str(request_key[2]),
+                "search_field": str(request_key[3]),
+                "search_query": str(request_key[4]),
+                "product_types": tuple(request_key[5]),
+            }
+
+        @staticmethod
+        def _server_query_is_unfiltered(query: Mapping[str, object]) -> bool:
+            return not any(
+                (
+                    str(query.get("status") or ""),
+                    str(query.get("search_query") or ""),
+                    tuple(query.get("product_types") or ()),
+                )
+            )
+
+        def _set_server_page_navigation_loading(
+            self,
+            loading: bool,
+            target_page: int | None = None,
+        ) -> None:
+            self._server_page_navigation_loading = bool(loading)
+            self.table.setEnabled(True)
+            self.pagination_bar.set_loading(
+                loading and self._server_first_page_painted,
+                target_page=target_page,
+            )
+            self._update_quick_select_button()
+            self._update_selection_summary()
+
+        def ensure_loaded(self) -> None:
+            if not self._server_pagination_enabled:
+                return
+            if self._server_page_state == "error" and self._server_last_failed_key:
+                self._retry_server_page()
+                return
+            if self._server_page_state == "loading":
+                return
+            query_key = self._server_query_key(self._server_query())
+            revision = self._last_dataset_revision
+            if (
+                self._server_page_state == "success"
+                and self._server_page_loaded_key == query_key
+                and self._server_page_loaded_revision == revision
+            ):
+                return
+            self._load_server_page()
+
+        def _retry_server_page(self) -> None:
+            if not self._server_pagination_enabled:
+                return
+            request_key = self._server_last_failed_key
+            if not request_key:
+                self._load_server_page()
+                return
+            query = self._server_query_from_key(request_key)
+            navigation = self._server_last_failed_navigation_loading
+            self._load_server_page(
+                page=int(query["page"]),
+                query=query,
+                navigation=navigation,
+            )
+
+        def _prefetch_adjacent_server_pages(
+            self,
+            request_query: Mapping[str, object],
+            result: CustomOrderPageResult | ShipmentPageResult,
+            requested_revision: str,
+        ) -> None:
+            if not getattr(
+                self._controller,
+                "snapshot_runs_in_background",
+                False,
+            ):
+                return
+            for target in (result.page + 1, result.page - 1):
+                if target < 1 or target > result.page_count:
+                    continue
+                query = dict(request_query)
+                query["page"] = target
+                key = self._server_query_key(query)
+                self._server_page_loader.prefetch(
+                    query,
+                    key,
+                    requested_revision,
+                )
+
+
+    class CustomOrdersPage(_QueuePageNavigationMixin, QWidget):
         def __init__(self, controller: BackgroundTaskController, result_handler: ResultHandler) -> None:
             super().__init__()
             self._controller = controller
@@ -4433,53 +4547,6 @@ if PYSIDE6_AVAILABLE:
             else:
                 self._search_filter_timer.start()
 
-        def _server_query(self, *, page: int | None = None) -> dict[str, object]:
-            return {
-                "page": self._page if page is None else max(1, int(page)),
-                "page_size": self._page_size,
-                "status": str(self.status_filter_combo.currentData() or ""),
-                "search_field": str(
-                    self.search_field_combo.currentData() or "platform_order_no"
-                ),
-                "search_query": self.search_edit.text().strip(),
-                "product_types": tuple(
-                    self.product_type_filter_combo.selected_values
-                ),
-            }
-
-        @staticmethod
-        def _server_query_key(query: Mapping[str, object]) -> tuple[object, ...]:
-            return (
-                int(query.get("page") or 1),
-                int(query.get("page_size") or 50),
-                str(query.get("status") or ""),
-                str(query.get("search_field") or "platform_order_no"),
-                str(query.get("search_query") or ""),
-                tuple(query.get("product_types") or ()),
-            )
-
-        @staticmethod
-        def _server_query_from_key(
-            request_key: tuple[object, ...],
-        ) -> dict[str, object]:
-            return {
-                "page": int(request_key[0]),
-                "page_size": int(request_key[1]),
-                "status": str(request_key[2]),
-                "search_field": str(request_key[3]),
-                "search_query": str(request_key[4]),
-                "product_types": tuple(request_key[5]),
-            }
-
-        @staticmethod
-        def _server_query_is_unfiltered(query: Mapping[str, object]) -> bool:
-            return not any(
-                (
-                    str(query.get("status") or ""),
-                    str(query.get("search_query") or ""),
-                    tuple(query.get("product_types") or ()),
-                )
-            )
 
         def _set_server_page_state(self, state: str, message: str = "") -> None:
             self._server_page_state = state
@@ -4527,52 +4594,6 @@ if PYSIDE6_AVAILABLE:
             self.server_page_spinner.set_loading(state == "loading")
             self.server_page_state_container.show()
 
-        def _set_server_page_navigation_loading(
-            self,
-            loading: bool,
-            target_page: int | None = None,
-        ) -> None:
-            self._server_page_navigation_loading = bool(loading)
-            self.table.setEnabled(True)
-            self.pagination_bar.set_loading(
-                loading and self._server_first_page_painted,
-                target_page=target_page,
-            )
-            self._update_quick_select_button()
-            self._update_selection_summary()
-
-        def ensure_loaded(self) -> None:
-            if not self._server_pagination_enabled:
-                return
-            if self._server_page_state == "error" and self._server_last_failed_key:
-                self._retry_server_page()
-                return
-            if self._server_page_state == "loading":
-                return
-            query_key = self._server_query_key(self._server_query())
-            revision = self._last_dataset_revision
-            if (
-                self._server_page_state == "success"
-                and self._server_page_loaded_key == query_key
-                and self._server_page_loaded_revision == revision
-            ):
-                return
-            self._load_server_page()
-
-        def _retry_server_page(self) -> None:
-            if not self._server_pagination_enabled:
-                return
-            request_key = self._server_last_failed_key
-            if not request_key:
-                self._load_server_page()
-                return
-            query = self._server_query_from_key(request_key)
-            navigation = self._server_last_failed_navigation_loading
-            self._load_server_page(
-                page=int(query["page"]),
-                query=query,
-                navigation=navigation,
-            )
 
         def _load_server_page(
             self,
@@ -4763,29 +4784,6 @@ if PYSIDE6_AVAILABLE:
                 requested_revision,
             )
 
-        def _prefetch_adjacent_server_pages(
-            self,
-            request_query: Mapping[str, object],
-            result: CustomOrderPageResult,
-            requested_revision: str,
-        ) -> None:
-            if not getattr(
-                self._controller,
-                "snapshot_runs_in_background",
-                False,
-            ):
-                return
-            for target in (result.page + 1, result.page - 1):
-                if target < 1 or target > result.page_count:
-                    continue
-                query = dict(request_query)
-                query["page"] = target
-                key = self._server_query_key(query)
-                self._server_page_loader.prefetch(
-                    query,
-                    key,
-                    requested_revision,
-                )
 
         def _render_rows(self, *, selected_order_no: str = "") -> None:
             selected_row_index = -1
@@ -4898,70 +4896,6 @@ if PYSIDE6_AVAILABLE:
                 self.table.blockSignals(previous)
                 self.table.setUpdatesEnabled(True)
 
-        def _sort_visible_rows_in_place(self) -> None:
-            """Move changed statuses without reallocating every table cell."""
-
-            if self.table.rowCount() < 2:
-                return
-            rows_by_order_no = {
-                row.platform_order_no: row for row in self._rows
-            }
-            previous = self.table.blockSignals(True)
-            self.table.setUpdatesEnabled(False)
-            try:
-                self.table.sortItems(5, Qt.SortOrder.AscendingOrder)
-                ordered_rows: list[CustomOrderRow] = []
-                row_index_by_order_no: dict[str, int] = {}
-                for row_index in range(self.table.rowCount()):
-                    check_item = self.table.item(row_index, 0)
-                    order_no = str(
-                        check_item.data(Qt.ItemDataRole.UserRole)
-                        if check_item is not None
-                        else ""
-                    ).strip()
-                    row = rows_by_order_no.get(order_no)
-                    if row is None:
-                        continue
-                    row_index_by_order_no[order_no] = len(ordered_rows)
-                    ordered_rows.append(row)
-                if len(ordered_rows) == len(self._rows):
-                    self._rows = ordered_rows
-                    self._row_index_by_order_no = row_index_by_order_no
-            finally:
-                self.table.blockSignals(previous)
-                self.table.setUpdatesEnabled(True)
-
-        def _remove_affected_rows_outside_status_filter(
-            self,
-            order_nos: set[str],
-        ) -> None:
-            """Keep an active status filter accurate without rebuilding the table."""
-
-            selected_status = str(self.status_filter_combo.currentData() or "")
-            if not selected_status:
-                return
-            removal_indexes = sorted(
-                (
-                    row_index
-                    for order_no in order_nos
-                    if (row_index := self._row_index_by_order_no.get(order_no))
-                    is not None
-                    and 0 <= row_index < len(self._rows)
-                    and self._status_value(self._rows[row_index]) != selected_status
-                ),
-                reverse=True,
-            )
-            if not removal_indexes:
-                return
-            previous = self.table.blockSignals(True)
-            self.table.setUpdatesEnabled(False)
-            try:
-                for row_index in removal_indexes:
-                    self.table.removeRow(row_index)
-                    self._rows.pop(row_index)
-            finally:
-                self.table.blockSignals(previous)
-                self.table.setUpdatesEnabled(True)
 
         def _refresh_visible_row_caches(self) -> None:
             self._row_index_by_order_no = {
@@ -6073,7 +6007,7 @@ if PYSIDE6_AVAILABLE:
             )
 
 
-    class ShipmentPage(QWidget):
+    class ShipmentPage(_QueuePageNavigationMixin, QWidget):
         def __init__(
             self,
             controller: BackgroundTaskController,
@@ -6135,6 +6069,7 @@ if PYSIDE6_AVAILABLE:
             self._server_page_navigation_loading = False
             self._server_page_state = "idle"
             self._server_first_page_painted = False
+            self._server_page_refresh_pending = False
             self._server_page_retry_attempts = 0
             self._server_page_retry_timer = QTimer(self)
             self._server_page_retry_timer.setSingleShot(True)
@@ -6487,22 +6422,6 @@ if PYSIDE6_AVAILABLE:
                 ),
             )
 
-        def _add_manual_order(self) -> None:
-            dialog = _ManualShipmentDialog(self)
-            if dialog.exec() != QDialog.DialogCode.Accepted:
-                return
-            system_order_no, platform_order_no, logistics_no, reason = dialog.values()
-            _run_control_result_responsive(
-                self,
-                self._controller,
-                lambda: self._controller.add_shipment_order(
-                    system_order_no=system_order_no,
-                    platform_order_no=platform_order_no,
-                    logistics_no=logistics_no,
-                    reason=reason,
-                ),
-                self._result_handler,
-            )
 
         def _change_selected_status(self) -> None:
             rows = self._checked_shipment_rows()
@@ -7213,6 +7132,7 @@ if PYSIDE6_AVAILABLE:
                 name="查询已标发物流状态",
                 area=TaskArea.SHIPMENT,
                 capability=Capability.ALIBABA_LOGISTICS,
+                payload={"logistics_scope": "completed"},
             )
             _run_control_result_responsive(
                 self,
@@ -7742,53 +7662,6 @@ if PYSIDE6_AVAILABLE:
             else:
                 self._search_filter_timer.start()
 
-        def _server_query(self, *, page: int | None = None) -> dict[str, object]:
-            return {
-                "page": self._page if page is None else max(1, int(page)),
-                "page_size": self._page_size,
-                "status": str(self.status_filter_combo.currentData() or ""),
-                "search_field": str(
-                    self.search_field_combo.currentData() or "platform_order_no"
-                ),
-                "search_query": self.search_edit.text().strip(),
-                "product_types": tuple(
-                    self.product_type_filter_combo.selected_values
-                ),
-            }
-
-        @staticmethod
-        def _server_query_key(query: Mapping[str, object]) -> tuple[object, ...]:
-            return (
-                int(query.get("page") or 1),
-                int(query.get("page_size") or 50),
-                str(query.get("status") or ""),
-                str(query.get("search_field") or "platform_order_no"),
-                str(query.get("search_query") or ""),
-                tuple(query.get("product_types") or ()),
-            )
-
-        @staticmethod
-        def _server_query_from_key(
-            request_key: tuple[object, ...],
-        ) -> dict[str, object]:
-            return {
-                "page": int(request_key[0]),
-                "page_size": int(request_key[1]),
-                "status": str(request_key[2]),
-                "search_field": str(request_key[3]),
-                "search_query": str(request_key[4]),
-                "product_types": tuple(request_key[5]),
-            }
-
-        @staticmethod
-        def _server_query_is_unfiltered(query: Mapping[str, object]) -> bool:
-            return not any(
-                (
-                    str(query.get("status") or ""),
-                    str(query.get("search_query") or ""),
-                    tuple(query.get("product_types") or ()),
-                )
-            )
 
         def _set_server_page_state(self, state: str, message: str = "") -> None:
             self._server_page_state = state
@@ -7810,10 +7683,12 @@ if PYSIDE6_AVAILABLE:
                     self._server_page_navigation_loading,
                     target,
                 )
-                self.server_page_spinner.set_loading(False)
-                self.server_page_state_label.hide()
+                searching = bool(self.search_edit.text().strip())
+                self.server_page_spinner.set_loading(searching)
+                self.server_page_state_label.setText("正在搜索订单…" if searching else "正在刷新队列…")
+                self.server_page_state_label.setVisible(searching)
                 self.server_page_retry_button.hide()
-                self.server_page_state_container.hide()
+                self.server_page_state_container.setVisible(searching)
                 return
             if state == "loading":
                 self._set_server_page_navigation_loading(
@@ -7835,52 +7710,6 @@ if PYSIDE6_AVAILABLE:
             self.server_page_spinner.set_loading(state == "loading")
             self.server_page_state_container.show()
 
-        def _set_server_page_navigation_loading(
-            self,
-            loading: bool,
-            target_page: int | None = None,
-        ) -> None:
-            self._server_page_navigation_loading = bool(loading)
-            self.table.setEnabled(True)
-            self.pagination_bar.set_loading(
-                loading and self._server_first_page_painted,
-                target_page=target_page,
-            )
-            self._update_quick_select_button()
-            self._update_selection_summary()
-
-        def ensure_loaded(self) -> None:
-            if not self._server_pagination_enabled:
-                return
-            if self._server_page_state == "error" and self._server_last_failed_key:
-                self._retry_server_page()
-                return
-            if self._server_page_state == "loading":
-                return
-            query_key = self._server_query_key(self._server_query())
-            revision = self._last_dataset_revision
-            if (
-                self._server_page_state == "success"
-                and self._server_page_loaded_key == query_key
-                and self._server_page_loaded_revision == revision
-            ):
-                return
-            self._load_server_page()
-
-        def _retry_server_page(self) -> None:
-            if not self._server_pagination_enabled:
-                return
-            request_key = self._server_last_failed_key
-            if not request_key:
-                self._load_server_page()
-                return
-            query = self._server_query_from_key(request_key)
-            navigation = self._server_last_failed_navigation_loading
-            self._load_server_page(
-                page=int(query["page"]),
-                query=query,
-                navigation=navigation,
-            )
 
         def _load_server_page(
             self,
@@ -7891,6 +7720,7 @@ if PYSIDE6_AVAILABLE:
         ) -> None:
             if not self._server_pagination_enabled:
                 return
+            self._server_page_refresh_pending = False
             page_query = dict(query or self._server_query(page=page))
             request_key = self._server_query_key(page_query)
             navigation_loading = bool(
@@ -8068,35 +7898,16 @@ if PYSIDE6_AVAILABLE:
             self._server_last_failed_revision = ""
             self._server_last_failed_navigation_loading = False
             self._set_server_page_state("success")
+            if self._server_page_refresh_pending:
+                self._server_page_loader.invalidate()
+                self._load_server_page(page=self._page, navigation=False)
+                return
             self._prefetch_adjacent_server_pages(
                 request_query,
                 result,
                 requested_revision,
             )
 
-        def _prefetch_adjacent_server_pages(
-            self,
-            request_query: Mapping[str, object],
-            result: ShipmentPageResult,
-            requested_revision: str,
-        ) -> None:
-            if not getattr(
-                self._controller,
-                "snapshot_runs_in_background",
-                False,
-            ):
-                return
-            for target in (result.page + 1, result.page - 1):
-                if target < 1 or target > result.page_count:
-                    continue
-                query = dict(request_query)
-                query["page"] = target
-                key = self._server_query_key(query)
-                self._server_page_loader.prefetch(
-                    query,
-                    key,
-                    requested_revision,
-                )
 
         def _render_rows(self, *, selected_row_key: str = "") -> None:
             selected_row_index = -1
@@ -8477,6 +8288,9 @@ if PYSIDE6_AVAILABLE:
                 self._last_dataset_revision = dataset_revision
                 if feature_changed or dataset_changed or active_changed:
                     self._server_page_loader.invalidate()
+                    if self._server_page_state == "loading":
+                        self._server_page_refresh_pending = True
+                        return
                     target_page = (
                         int(self._server_page_request_key[0])
                         if self._server_page_navigation_loading
@@ -11213,10 +11027,6 @@ if PYSIDE6_AVAILABLE:
             )
             self._notification_reload_failed(error)
 
-        def _load_notification_page(self) -> object:
-            return self._load_notification_page_query(
-                self._notification_page_query()
-            )
 
         def _load_notification_page_query(
             self,
@@ -11233,11 +11043,6 @@ if PYSIDE6_AVAILABLE:
                     raise
                 return method()
 
-        def _show_previous_notification_page(self) -> None:
-            self._show_notification_page(self._notification_page - 1)
-
-        def _show_next_notification_page(self) -> None:
-            self._show_notification_page(self._notification_page + 1)
 
         def _show_notification_page(self, page: int) -> None:
             target = max(
@@ -11630,53 +11435,6 @@ if PYSIDE6_AVAILABLE:
                 self.package_table.setRowCount(0)
             _restore_table_scroll_state(self.table, scroll_state)
 
-        def _update_active_notification_cells(
-            self,
-            notification_ids: set[int],
-        ) -> None:
-            """Refresh volatile task cells without rebuilding the whole table."""
-
-            if not notification_ids:
-                return
-            notifications_by_id = {
-                int(item.get("id") or 0): item
-                for item in self._visible_notifications
-            }
-            previous = self.table.blockSignals(True)
-            self.table.setUpdatesEnabled(False)
-            try:
-                for notification_id in notification_ids:
-                    row = self._row_index_by_notification_id.get(notification_id)
-                    notification = notifications_by_id.get(notification_id)
-                    if row is None or notification is None:
-                        continue
-                    (
-                        display_state,
-                        explanation,
-                        timestamp,
-                    ) = self._notification_status_presentation(notification)
-                    self.table.setItem(
-                        row,
-                        7,
-                        _readonly_item(_format_status_timestamp(timestamp)),
-                    )
-                    self.table.setItem(
-                        row,
-                        8,
-                        _notification_status_item(
-                            display_state,
-                            notification.get("package_missing"),
-                            notification.get("is_supplemental_revision"),
-                            notification.get("last_error"),
-                        ),
-                    )
-                    explanation_item = _status_detail_item(
-                        explanation,
-                    )
-                    self.table.setItem(row, 9, explanation_item)
-            finally:
-                self.table.blockSignals(previous)
-                self.table.setUpdatesEnabled(True)
 
         def _eligible_notification_ids(
             self,
@@ -11694,8 +11452,6 @@ if PYSIDE6_AVAILABLE:
                 if int(item.get("id") or 0) > 0
             }
 
-        def _visible_awaiting_review_ids(self) -> set[int]:
-            return set(self._visible_awaiting_review_ids_cache)
 
         def _update_quick_select_review_button(self) -> None:
             count = len(self._visible_awaiting_review_ids_cache)
@@ -12719,23 +12475,6 @@ if PYSIDE6_AVAILABLE:
                 finish,
             )
 
-        def _reject(self) -> None:
-            notification = self._require_selected()
-            if notification is None:
-                return
-
-            def finish(result: ControlResult) -> None:
-                self._result_handler(result)
-                self._reload(navigation=False)
-
-            _run_control_result_responsive(
-                self,
-                self._controller,
-                lambda: self._controller.reject_shipment_notification(
-                    int(notification["id"])
-                ),
-                finish,
-            )
 
         def _reopen_notifications_for_review(
             self,
@@ -13560,6 +13299,7 @@ if PYSIDE6_AVAILABLE:
             self._task_status_baseline_ready = False
             self._known_task_statuses: dict[str, TaskStatus] = {}
             self._pending_local_logistics_scan_ids: set[str] = set()
+            self._pending_completed_logistics_task_ids: set[str] = set()
             self._local_logistics_followup_thread: _ControlResultThread | None = None
             self._active_local_logistics_followup_scan_id: str | None = None
             self._local_logistics_followup_retry_delay_ms = 0
@@ -14435,7 +14175,7 @@ if PYSIDE6_AVAILABLE:
                 and self._local_logistics_followup_thread.isRunning()
             ):
                 return
-            if not self._pending_local_logistics_scan_ids:
+            if not (self._pending_local_logistics_scan_ids or self._pending_completed_logistics_task_ids):
                 return
             active_query = any(
                 _task_belongs_to_controller_instance(task, self._controller)
@@ -14447,20 +14187,33 @@ if PYSIDE6_AVAILABLE:
             if active_query:
                 return
             tasks_by_id = {task.task_id: task for task in snapshot.tasks}
-            for scan_task_id in tuple(self._pending_local_logistics_scan_ids):
+            for scan_task_id in (
+                *tuple(self._pending_local_logistics_scan_ids),
+                *tuple(self._pending_completed_logistics_task_ids),
+            ):
+                completed_refresh = scan_task_id in self._pending_completed_logistics_task_ids
                 scan_task = tasks_by_id.get(scan_task_id)
                 if scan_task is None or not scan_task.status.terminal:
                     continue
+                if completed_refresh and scan_task.capability is not Capability.ALIBABA_LOGISTICS:
+                    continue
                 if scan_task.status in {TaskStatus.CANCELLED, TaskStatus.PAUSED}:
                     self._pending_local_logistics_scan_ids.discard(scan_task_id)
+                    self._pending_completed_logistics_task_ids.discard(scan_task_id)
+                    continue
+                if completed_refresh and scan_task.status is not TaskStatus.SUCCEEDED:
+                    # A failed session must not immediately launch another
+                    # browser batch against the same unavailable session.
+                    self._pending_completed_logistics_task_ids.discard(scan_task_id)
                     continue
                 command = TaskCommand(
-                    name="领星扫描后在本机查询阿里物流",
+                    name=("后台复查近 15 天已完成物流" if completed_refresh else "领星扫描后在本机查询阿里物流"),
                     area=TaskArea.SHIPMENT,
                     capability=Capability.ALIBABA_LOGISTICS,
                     payload={
                         "trigger": "after_shipment_scan",
                         "source_scan_task_id": scan_task_id,
+                        **({"logistics_scope": "completed"} if completed_refresh else {}),
                     },
                 )
                 self.statusBar().showMessage(
@@ -14497,6 +14250,10 @@ if PYSIDE6_AVAILABLE:
         ) -> None:
             if result.accepted:
                 if self._active_local_logistics_followup_scan_id:
+                    if self._active_local_logistics_followup_scan_id in self._pending_completed_logistics_task_ids:
+                        self._pending_completed_logistics_task_ids.discard(self._active_local_logistics_followup_scan_id)
+                    elif result.task_id:
+                        self._pending_completed_logistics_task_ids.add(result.task_id)
                     self._pending_local_logistics_scan_ids.discard(
                         self._active_local_logistics_followup_scan_id
                     )

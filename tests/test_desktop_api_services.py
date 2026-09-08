@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import json
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -407,7 +408,9 @@ def test_completed_refresh_service_backfills_live_amazon_evidence(
     )
     refreshed = store.get_by_logistics_no(candidate.logistics_no)
 
-    assert metrics == {
+    assert metrics["detail_request_count"] == metrics["wms_request_count"] == 1
+    assert metrics["elapsed_ms"] >= 0
+    assert {key: value for key, value in metrics.items() if key not in {"elapsed_ms", "detail_request_count", "wms_request_count"}} == {
         "target_count": 1,
         "checked_count": 1,
         "eligible_count": 1,
@@ -1492,7 +1495,7 @@ def test_custom_scan_reconciles_missing_candidates_from_order_folders(
     tmp_path,
 ) -> None:
     monkeypatch.setattr(
-        desktop_services_module.os,
+        os,
         "walk",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
             AssertionError("network order folders must not be recursively walked")

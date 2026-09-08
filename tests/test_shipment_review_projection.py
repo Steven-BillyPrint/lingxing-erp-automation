@@ -73,9 +73,10 @@ def test_persistent_hydration_retains_lock_and_summary_revision(tmp_path, monkey
            "carrier": "FedEx", "international_tracking_no": "123", "actual_total": "10",
            "chargeable_weight_kg": "1", "identity_state": "ACTIVE", "logistics_state": "READY", "erp_state": "PENDING"}
     monkeypatch.setattr(ShipmentWorkflowStore, "__init__", lambda *_a, **_kw: None)
-    monkeypatch.setattr(ShipmentWorkflowStore, "list_queue_index_rows", lambda _self: [raw])
+    monkeypatch.setattr(ShipmentWorkflowStore, "list_queue_index_rows", lambda _self, **_kwargs: [raw])
     monkeypatch.setattr(ShipmentWorkflowStore, "list_jobs_by_logistics_nos", lambda _self, _ids: [{**raw, "sku_text": "detail"}])
     monkeypatch.setattr(ShipmentWorkflowStore, "count_all_jobs", lambda _self: (1, ""))
+    monkeypatch.setattr(ShipmentWorkflowStore, "queue_dataset_revision", lambda _self: "queue-1")
     try:
         initial = controller.summary_snapshot().shipments_summary.revision
         store.set_manual_review_locks(("order:ORDER",), task_id="old", reason="需核对")

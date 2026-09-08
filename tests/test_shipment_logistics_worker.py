@@ -855,7 +855,7 @@ def test_logistics_worker_reports_retryable_page_read_as_failure(tmp_path):
         process_logistics_queue_once(store, fetch_detail=permission_error)
     )
 
-    assert report.status == "completed_with_skips"
+    assert report.status == "failed"
     assert report.scanned_page_count == 1
     assert report.failed_count == 1
     assert report.blocked_count == 0
