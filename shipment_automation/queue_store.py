@@ -1995,6 +1995,18 @@ class ShipmentWorkflowStore:
         return """
             SELECT j.*, j.last_seen_at AS last_scanned_at,
                    j.state_changed_at AS identity_state_changed_at,
+                   CASE WHEN j.identity_state = 'CONFLICT' THEN (
+                       SELECT json_group_array(DISTINCT conflict_event.details_json)
+                       FROM shipment_events conflict_event
+                       WHERE conflict_event.job_id = j.id
+                         AND conflict_event.event_type = 'LOGISTICS_NUMBER_CONFLICT'
+                         AND conflict_event.id > COALESCE((
+                             SELECT MAX(resolved_event.id)
+                             FROM shipment_events resolved_event
+                             WHERE resolved_event.job_id = j.id
+                               AND resolved_event.event_type = 'CONFLICT_RESOLVED'
+                         ), 0)
+                   ) END AS identity_conflict_events_json,
                    l.state AS logistics_state, l.alibaba_status, l.service_type,
                    l.service_line,
                    l.carrier_raw, l.carrier_normalized, l.international_tracking_no,
@@ -2155,6 +2167,8 @@ class ShipmentWorkflowStore:
 
     def _flatten(self, row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
         item = dict(row)
+        conflict_description = self._identity_conflict_description(item)
+        item["identity_conflict_description"] = conflict_description
         try:
             raw_item_ids = json.loads(
                 str(item.get("platform_order_item_ids_json") or "[]")
@@ -2196,7 +2210,8 @@ class ShipmentWorkflowStore:
                     tracking_validated=tracking_validated,
                 ),
                 "last_error": (
-                    item.get("re_mark_last_error")
+                    conflict_description
+                    or item.get("re_mark_last_error")
                     or item.get("erp_last_error")
                     or item.get("logistics_last_error")
                     or item.get("email_last_error")
@@ -2204,6 +2219,33 @@ class ShipmentWorkflowStore:
             }
         )
         return item
+
+    @staticmethod
+    def _identity_conflict_description(item: Mapping[str, Any]) -> str:
+        if item.get("identity_state") != IDENTITY_CONFLICT:
+            return ""
+        try:
+            events = json.loads(str(item.get("identity_conflict_events_json") or "[]"))
+        except (TypeError, ValueError):
+            events = []
+        order_numbers: set[str] = set()
+        for raw_event in events if isinstance(events, list) else ():
+            try:
+                event = json.loads(raw_event) if isinstance(raw_event, str) else raw_event
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(event, dict):
+                continue
+            for prefix in ("existing", "new"):
+                platform = str(event.get(f"{prefix}_platform_order_no") or "").strip()
+                system = str(event.get(f"{prefix}_system_order_no") or "").strip()
+                if platform and platform != str(item.get("platform_order_no") or "").strip():
+                    order_numbers.add(platform)
+                elif system and system != str(item.get("system_order_no") or "").strip():
+                    order_numbers.add(f"系统单 {system}")
+        if order_numbers:
+            return f"与 {'、'.join(sorted(order_numbers))} 冲突：共用同一 ALS。"
+        return "同一 ALS 关联多个订单，关联单号未记录，请重新扫描核对。"
 
     @staticmethod
     def _tracking_validated(row: Mapping[str, Any]) -> bool:

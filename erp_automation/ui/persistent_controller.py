@@ -3036,6 +3036,9 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                             ),
                             identity_state=str(row.get("identity_state") or ""),
                             identity_status_text=str(row.get("identity_status_text") or ""),
+                            identity_conflict_description=str(
+                                row.get("identity_conflict_description") or ""
+                            ),
                             logistics_state=str(row.get("logistics_state") or ""),
                             logistics_next_attempt_at=str(
                                 row.get("logistics_next_attempt_at") or ""

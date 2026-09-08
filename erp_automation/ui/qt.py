@@ -1023,6 +1023,12 @@ def _shipment_execution_eligibility(
 
 
 def _shipment_status_explanation(row: ShipmentRow, status: str) -> str:
+    if status == "订单信息冲突":
+        return (
+            row.identity_conflict_description
+            or row.erp_last_error
+            or "同一 ALS 关联多个订单，关联单号未记录，请重新扫描核对。"
+        )
     if row.manual_review_reason:
         source = {"customization": "定制订单", "shipment": "自动标发"}.get(
             row.manual_review_source, row.manual_review_source or "历史任务",

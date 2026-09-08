@@ -139,6 +139,34 @@ def test_ready_status_fails_closed_when_required_logistics_detail_is_missing():
     assert _shipment_execution_eligibility(row) == (False, "物流信息需复核")
 
 
+def test_conflict_explanation_flows_from_stored_scan_to_desktop_and_blocks_shipment(tmp_path):
+    from dataclasses import asdict
+
+    from erp_automation.application.queue_queries import shipment_row_from_mapping
+    from erp_automation.coordination.codec import decode_shipment_page
+    from shipment_automation.models import ShipmentCandidate
+    from shipment_automation.queue_store import ShipmentWorkflowStore
+
+    store = ShipmentWorkflowStore(tmp_path / "shipment.sqlite3")
+    for platform, system in (("ORDER-A", "SYS-A"), ("ORDER-B", "SYS-B")):
+        store.upsert_candidate(ShipmentCandidate(
+            platform_order_no=platform, system_order_no=system, logistics_no="ALS01950858516",
+            shipment_tag_name="自动标发", tag_text="自动标发", sku_text="tent",
+            customer_remark="ALS01950858516", status_text="待审核",
+        ))
+    mapping = store.list_jobs_by_logistics_nos(["ALS01950858516"])[0]
+    mapping["erp_last_error"] = "旧的 ERP 错误"
+    mapping["logistics_last_error"] = "旧的物流错误"
+    # Exercise the same JSON representation used by the coordinated desktop.
+    row = decode_shipment_page({
+        "items": [asdict(shipment_row_from_mapping(mapping))], "total": 1,
+    }).items[0]
+    status = _shipment_business_status(row)
+    assert status == "订单信息冲突"
+    assert _shipment_status_explanation(row, status) == "与 ORDER-B 冲突：共用同一 ALS。"
+    assert _shipment_execution_eligibility(row)[0] is False
+
+
 def test_detected_waybill_change_is_prioritized_as_re_mark_not_ordinary_mark() -> None:
     row = _ready_row(
         erp_state="DONE",

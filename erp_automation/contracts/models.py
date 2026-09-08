@@ -503,6 +503,7 @@ class ShipmentRow:
     chargeable_weight_kg: str = ""
     identity_state: str = ""
     identity_status_text: str = ""
+    identity_conflict_description: str = ""
     logistics_state: str = ""
     logistics_next_attempt_at: str = ""
     erp_state: str = ""
