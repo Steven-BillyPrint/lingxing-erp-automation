@@ -209,7 +209,14 @@ async def run_logistics_worker(args: argparse.Namespace) -> dict[str, Any]:
         report.ready_count = len(report.ready_to_mark_items)
         return logistics_report_to_dict(report)
 
-    progress_callback = getattr(args, "progress_callback", None)
+    raw_progress_callback = getattr(args, "progress_callback", None)
+    last_progress_percent = 0
+
+    def progress_callback(message: str, percent: int) -> None:
+        nonlocal last_progress_percent
+        last_progress_percent = max(last_progress_percent, percent)
+        if raw_progress_callback is not None:
+            raw_progress_callback(message, last_progress_percent)
     manual_login_callback = getattr(args, "manual_login_callback", None)
     _notify_progress(
         progress_callback,

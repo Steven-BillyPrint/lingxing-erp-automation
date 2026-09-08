@@ -5,6 +5,7 @@ import hmac
 import json
 import time
 from typing import Any, Awaitable, Callable
+from urllib.parse import parse_qs, urlparse
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from .config import AlibabaLoginConfig
@@ -226,8 +227,13 @@ async def wait_for_alibaba_logistics_detail(
         if hasattr(page, "wait_for_function"):
             try:
                 await page.wait_for_function(
-                    """([url, markers]) => location.href.split('#')[0] === url.split('#')[0]
-                        && markers.some(marker => (document.body?.innerText || '').includes(marker))""",
+                    """([url, markers]) => {
+                        const expected = new URL(url), current = new URL(location.href);
+                        return current.origin === expected.origin && current.pathname === expected.pathname
+                            && expected.searchParams.has('id')
+                            && JSON.stringify(current.searchParams.getAll('id')) === JSON.stringify(expected.searchParams.getAll('id'))
+                            && markers.some(marker => (document.body?.innerText || '').includes(marker));
+                    }""",
                     arg=[detail_url, list(DETAIL_READY_MARKERS + DETAIL_ERROR_MARKERS)],
                     timeout=min(ALIBABA_DETAIL_POLL_INTERVAL_MS, max(1, int((deadline - time.monotonic()) * 1000))),
                     polling="raf",
@@ -503,9 +509,13 @@ def _is_logistics_detail_ready(url: str, body_text: str) -> bool:
 
 
 def _is_logistics_detail_url(current_url: object, expected_url: str) -> bool:
-    current = str(current_url or "").split("#", 1)[0]
-    expected = str(expected_url or "").split("#", 1)[0]
-    return bool(expected) and current == expected
+    current = urlparse(str(current_url or ""))
+    expected = urlparse(str(expected_url or ""))
+    expected_ids = parse_qs(expected.query).get("id")
+    return bool(expected_ids) and (
+        (current.scheme, current.netloc, current.path) == (expected.scheme, expected.netloc, expected.path)
+        and parse_qs(current.query).get("id") == expected_ids
+    )
 
 
 def _needs_manual_verification(body_text: str) -> bool:

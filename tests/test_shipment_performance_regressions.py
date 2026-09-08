@@ -231,3 +231,12 @@ def test_page_and_login_wait_budgets_are_separate(monkeypatch, mode, elapsed, er
     with pytest.raises(AlibabaAccountUnverifiedError if mode == "login" else error):
         asyncio.run(session.wait_for_alibaba_logistics_detail(Page(), Page.url, login_config=None, auto_login=False))
     assert ticks[0] == elapsed
+
+
+def test_detail_identity_allows_tracking_parameters_but_rejects_other_order():
+    from shipment_automation.alibaba_session import _is_logistics_detail_url
+    expected = "https://scm.alibaba.com/luyou/express/detail.htm?id=123"
+    assert _is_logistics_detail_url(expected + "&spm=redirect#detail", expected)
+    assert not _is_logistics_detail_url(expected.replace("id=123", "id=456"), expected)
+    assert not _is_logistics_detail_url(expected + "&id=456", expected)
+    assert not _is_logistics_detail_url(expected.replace("scm.alibaba.com", "example.com"), expected)
