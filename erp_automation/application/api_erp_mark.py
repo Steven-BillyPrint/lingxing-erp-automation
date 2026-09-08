@@ -381,13 +381,12 @@ class ApiErpMarkAdapter:
         *,
         sleeper: SleepFunc = asyncio.sleep,
     ) -> "ApiErpMarkAdapter":
-        strategy = configuration.get(
-            "lingxing.erp_mark.outbound_strategy", OutboundStrategy.STAGED
-        )
         return cls(
             gateway,
             routes_from_configuration(configuration),
-            outbound_strategy=str(strategy),
+            # Also enforce this at the execution boundary for legacy or raw
+            # configuration mappings that bypass configuration normalization.
+            outbound_strategy=OutboundStrategy.STAGED,
             wms_poll_attempts=_positive_int(
                 configuration.get("lingxing.erp_mark.wms_poll_attempts", 5),
                 "lingxing.erp_mark.wms_poll_attempts",

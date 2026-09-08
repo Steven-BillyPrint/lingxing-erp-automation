@@ -46,6 +46,17 @@ def test_desktop_payment_window_is_fixed_to_96_hours() -> None:
     ).validate()
 
 
+def test_retired_fast_outbound_configuration_cannot_be_reenabled() -> None:
+    normalized = with_configuration_defaults(
+        {"lingxing.erp_mark.outbound_strategy": "fast_outbound"}
+    )
+
+    assert normalized["lingxing.erp_mark.outbound_strategy"] == "staged"
+    assert "ERP 出库固定使用分阶段审核并出库。" in DesktopSettings(
+        erp_mark_outbound_strategy="fast_outbound"
+    ).validate()
+
+
 @pytest.mark.parametrize("weight_kg", [3, 4, 5])
 def test_high_value_split_weight_threshold_accepts_only_settings_options(
     weight_kg: int,

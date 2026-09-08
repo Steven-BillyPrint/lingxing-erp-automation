@@ -140,6 +140,7 @@ def shipment_row_from_mapping(row: Mapping[str, Any]) -> ShipmentRow:
         "logistics_no", "customer_shipping_service", "first_seen_at",
         "international_tracking_no", "carrier", "alibaba_status", "actual_total",
         "chargeable_weight_kg", "identity_state", "identity_status_text",
+        "identity_conflict_description",
         "logistics_state", "logistics_next_attempt_at", "erp_state",
         "erp_next_attempt_at", "lease_owner", "lease_stage", "lease_until",
         "last_error", "updated_at", "last_scanned_at", "identity_state_changed_at",

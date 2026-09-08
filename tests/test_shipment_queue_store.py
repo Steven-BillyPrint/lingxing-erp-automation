@@ -452,7 +452,85 @@ def test_same_logistics_no_on_different_order_is_frozen_as_conflict(tmp_path):
     row = store.get_by_logistics_no("ALS01781406025")
     assert row["identity_state"] == IDENTITY_CONFLICT
     assert row["system_order_no"] == "103710434633847501"
+    assert row["identity_conflict_description"] == (
+        "与 111-8854282-5961022 冲突：共用同一 ALS。"
+    )
+    assert row["last_error"] == row["identity_conflict_description"]
     assert store.history("ALS01781406025")[-1].event_type == "LOGISTICS_NUMBER_CONFLICT"
+
+
+def test_conflict_description_uses_all_unresolved_orders_and_survives_reopen(tmp_path):
+    path = tmp_path / "shipment_queue.sqlite3"
+    store = ShipmentWorkflowStore(path)
+    original = _candidate()
+    store.upsert_candidate(original)
+    for number in ("ORDER-B", "ORDER-C", "ORDER-B"):
+        store.upsert_candidate(_candidate(system_order_no=f"SYS-{number}", platform_order_no=number))
+    # A routine refresh of the original row must not erase its conflict peers.
+    store.upsert_candidate(original)
+    with store.connect() as conn:
+        conn.execute("UPDATE shipment_erp SET last_error = '物流资料不完整'")
+    reopened = ShipmentWorkflowStore(path)
+    row = reopened.list_jobs_by_logistics_nos([original.logistics_no])[0]
+    assert row["identity_conflict_description"] == "与 ORDER-B、ORDER-C 冲突：共用同一 ALS。"
+    assert row["erp_last_error"] == "物流资料不完整"
+    assert row["last_error"] == row["identity_conflict_description"]
+
+
+def test_conflict_description_excludes_previously_resolved_peers(tmp_path):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    original = _candidate()
+    store.upsert_candidate(original)
+    store.upsert_candidate(_candidate(system_order_no="SYS-B", platform_order_no="ORDER-B"))
+    assert store.resolve_conflict(original.logistics_no, original.system_order_no, original.platform_order_no)
+    assert store.get_by_logistics_no(original.logistics_no)["identity_conflict_description"] == ""
+    store.upsert_candidate(_candidate(system_order_no="SYS-C", platform_order_no="ORDER-C"))
+    assert store.get_by_logistics_no(original.logistics_no)["identity_conflict_description"] == (
+        "与 ORDER-C 冲突：共用同一 ALS。"
+    )
+
+
+def test_conflict_description_falls_back_to_system_order_number(tmp_path):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    store.upsert_candidate(_candidate())
+    store.upsert_candidate(_candidate(system_order_no="SYS-B", platform_order_no=""))
+    assert store.get_by_logistics_no("ALS01781406025")["identity_conflict_description"] == (
+        "与 系统单 SYS-B 冲突：共用同一 ALS。"
+    )
+
+
+def test_conflict_description_does_not_reuse_old_als_peers_after_replacement(tmp_path):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    store.upsert_candidate(_candidate())
+    store.upsert_candidate(_candidate(system_order_no="SYS-B", platform_order_no="ORDER-B"))
+    replacement = _candidate(logistics_no="ALS01950858517")
+    store.upsert_candidate(replacement)
+    # Replacing ALS alone does not resolve the identity hold, but its old
+    # conflict peer must not be claimed to share the new ALS.
+    row = store.get_by_logistics_no(replacement.logistics_no)
+    assert row["identity_state"] == IDENTITY_CONFLICT
+    assert "ORDER-B" not in row["identity_conflict_description"]
+    store.upsert_candidate(_candidate(
+        logistics_no=replacement.logistics_no, system_order_no="SYS-C", platform_order_no="ORDER-C",
+    ))
+    assert store.get_by_logistics_no(replacement.logistics_no)["identity_conflict_description"] == (
+        "与 ORDER-C 冲突：共用同一 ALS。"
+    )
+
+
+@pytest.mark.parametrize("details_json", ["{}", "null", "[]", "invalid json"])
+def test_legacy_conflict_without_valid_details_still_has_readable_explanation(tmp_path, details_json):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    store.upsert_candidate(_candidate())
+    store.upsert_candidate(_candidate(system_order_no="SYS-B", platform_order_no="ORDER-B"))
+    with store.connect() as conn:
+        conn.execute(
+            "UPDATE shipment_events SET details_json = ? WHERE event_type = 'LOGISTICS_NUMBER_CONFLICT'",
+            (details_json,),
+        )
+    assert store.get_by_logistics_no("ALS01781406025")["identity_conflict_description"] == (
+        "同一 ALS 关联多个订单，关联单号未记录，请重新扫描核对。"
+    )
 
 
 def test_repeat_scan_refreshes_source_without_resetting_stage(tmp_path):

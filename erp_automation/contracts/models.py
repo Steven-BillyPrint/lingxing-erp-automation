@@ -503,6 +503,7 @@ class ShipmentRow:
     chargeable_weight_kg: str = ""
     identity_state: str = ""
     identity_status_text: str = ""
+    identity_conflict_description: str = ""
     logistics_state: str = ""
     logistics_next_attempt_at: str = ""
     erp_state: str = ""
@@ -726,8 +727,8 @@ class DesktopSettings:
         else:
             if not isinstance(routes, dict):
                 errors.append("ERP 仓库/物流 ID 映射必须是 JSON 对象。")
-        if self.erp_mark_outbound_strategy not in {"staged", "fast_outbound"}:
-            errors.append("ERP 出库策略无效。")
+        if self.erp_mark_outbound_strategy != "staged":
+            errors.append("ERP 出库固定使用分阶段审核并出库。")
         for label, address in (
             ("Amazon 发件邮箱", self.alimail_amazon_sender_email),
             ("独立站发件邮箱", self.alimail_independent_sender_email),

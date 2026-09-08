@@ -173,6 +173,9 @@ def with_configuration_defaults(values: Mapping[str, Any] | None = None) -> dict
 
     merged = dict(DEFAULT_CONFIGURATION_VALUES)
     merged.update(dict(values or {}))
+    # Outbound strategy is a product policy. Retired client configurations must
+    # not re-enable fast outbound after the setting has been removed.
+    merged["lingxing.erp_mark.outbound_strategy"] = "staged"
     default_routes = DEFAULT_CONFIGURATION_VALUES["lingxing.erp_mark.routes"]
     raw_routes = merged.get("lingxing.erp_mark.routes", {})
     parsed_routes = raw_routes
