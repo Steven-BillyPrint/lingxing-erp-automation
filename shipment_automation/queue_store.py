@@ -2004,7 +2004,9 @@ class ShipmentWorkflowStore:
                              SELECT MAX(resolved_event.id)
                              FROM shipment_events resolved_event
                              WHERE resolved_event.job_id = j.id
-                               AND resolved_event.event_type = 'CONFLICT_RESOLVED'
+                               AND resolved_event.event_type IN (
+                                   'CONFLICT_RESOLVED', 'PLATFORM_LOGISTICS_NUMBER_REPLACED'
+                               )
                          ), 0)
                    ) END AS identity_conflict_events_json,
                    l.state AS logistics_state, l.alibaba_status, l.service_type,

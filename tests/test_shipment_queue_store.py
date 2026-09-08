@@ -499,6 +499,25 @@ def test_conflict_description_falls_back_to_system_order_number(tmp_path):
     )
 
 
+def test_conflict_description_does_not_reuse_old_als_peers_after_replacement(tmp_path):
+    store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
+    store.upsert_candidate(_candidate())
+    store.upsert_candidate(_candidate(system_order_no="SYS-B", platform_order_no="ORDER-B"))
+    replacement = _candidate(logistics_no="ALS01950858517")
+    store.upsert_candidate(replacement)
+    # Replacing ALS alone does not resolve the identity hold, but its old
+    # conflict peer must not be claimed to share the new ALS.
+    row = store.get_by_logistics_no(replacement.logistics_no)
+    assert row["identity_state"] == IDENTITY_CONFLICT
+    assert "ORDER-B" not in row["identity_conflict_description"]
+    store.upsert_candidate(_candidate(
+        logistics_no=replacement.logistics_no, system_order_no="SYS-C", platform_order_no="ORDER-C",
+    ))
+    assert store.get_by_logistics_no(replacement.logistics_no)["identity_conflict_description"] == (
+        "与 ORDER-C 冲突：共用同一 ALS。"
+    )
+
+
 @pytest.mark.parametrize("details_json", ["{}", "null", "[]", "invalid json"])
 def test_legacy_conflict_without_valid_details_still_has_readable_explanation(tmp_path, details_json):
     store = ShipmentWorkflowStore(tmp_path / "shipment_queue.sqlite3")
