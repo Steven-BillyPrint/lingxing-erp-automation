@@ -548,6 +548,7 @@ def test_notification_queue_uses_reviewed_business_priority_and_descending_time(
         ("REJECTED", {}),
         ("CANCELLED", {}),
         ("DRAFT", {}),
+        ("FAILED", {"last_error": "状态核验超时：provider timeout"}),
     ]
     notifications = [
         {
@@ -584,14 +585,15 @@ def test_notification_queue_uses_reviewed_business_priority_and_descending_time(
         4,
         101,
         5,
+        12,
+        13,
+        20,
         6,
         7,
         8,
         9,
         10,
         11,
-        12,
-        13,
         14,
         15,
         16,
