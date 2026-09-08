@@ -218,175 +218,76 @@ class MissingSizeRuleError(ValueError):
     pass
 
 
-class VinylBannerFolderError(ValueError):
+class _ProductFolderError(ValueError):
+    """Common structured fields; subclasses retain product-specific identities."""
+
+    def __init__(
+        self,
+        status: str,
+        message: str,
+        *,
+        title: str | None = None,
+        value: str | None = None,
+        parent_asin: str | None = None,
+    ):
+        super().__init__(message)
+        self.status = status
+        self.title = title
+        self.value = value
+        self.parent_asin = parent_asin
+        self.missing_rule_line: str | None = None
+
+
+class VinylBannerFolderError(_ProductFolderError):
     """喷绘文件夹生成错误。
 
     喷绘规则独立于帐篷/汽车磁贴，状态值需要保留产品名前缀，方便批量日志快速定位。
     """
 
-    def __init__(
-        self,
-        status: str,
-        message: str,
-        *,
-        title: str | None = None,
-        value: str | None = None,
-        parent_asin: str | None = None,
-    ):
-        """初始化vinyl banner 文件夹错误的运行状态。"""
-        super().__init__(message)
-        self.status = status
-        self.title = title
-        self.value = value
-        self.parent_asin = parent_asin
-        self.missing_rule_line: str | None = None
 
-
-class PosterFolderError(ValueError):
+class PosterFolderError(_ProductFolderError):
     """海报文件夹生成错误。
 
     海报只有 Proof 一个可选定制项，尺寸规格由 ASIN 决定；单独状态能让日志直接定位到海报规则。
     """
 
-    def __init__(
-        self,
-        status: str,
-        message: str,
-        *,
-        title: str | None = None,
-        value: str | None = None,
-        parent_asin: str | None = None,
-    ):
-        """初始化poster 文件夹错误的运行状态。"""
-        super().__init__(message)
-        self.status = status
-        self.title = title
-        self.value = value
-        self.parent_asin = parent_asin
-        self.missing_rule_line: str | None = None
 
-
-class TableRunnerFolderError(ValueError):
+class TableRunnerFolderError(_ProductFolderError):
     """桌旗文件夹生成错误。
 
     桌旗规则独立于桌布和喷绘，单独状态方便批量日志直接定位到桌旗规则缺失。
     """
 
-    def __init__(
-        self,
-        status: str,
-        message: str,
-        *,
-        title: str | None = None,
-        value: str | None = None,
-        parent_asin: str | None = None,
-    ):
-        """初始化表格 runner 文件夹错误的运行状态。"""
-        super().__init__(message)
-        self.status = status
-        self.title = title
-        self.value = value
-        self.parent_asin = parent_asin
-        self.missing_rule_line: str | None = None
 
-
-class PopUpDisplayFolderError(ValueError):
+class PopUpDisplayFolderError(_ProductFolderError):
     """拉网展架文件夹生成错误。
 
     拉网展架的尺寸、带/不带支架和选项规则都来自独立 PDF 文本节点；
     使用单独状态能让批量日志准确定位缺失的是哪一类规则。
     """
 
-    def __init__(
-        self,
-        status: str,
-        message: str,
-        *,
-        title: str | None = None,
-        value: str | None = None,
-        parent_asin: str | None = None,
-    ):
-        """初始化弹出 up display 文件夹错误的运行状态。"""
-        super().__init__(message)
-        self.status = status
-        self.title = title
-        self.value = value
-        self.parent_asin = parent_asin
-        self.missing_rule_line: str | None = None
 
-
-class RollUpBannerFolderError(ValueError):
+class RollUpBannerFolderError(_ProductFolderError):
     """易拉宝文件夹生成错误。
 
     易拉宝的品名片段只由子 ASIN 决定，Proof 出现时需要严格匹配；
     单独错误状态可以让巡检日志直接看出是易拉宝规则缺失或 ASIN 映射缺失。
     """
 
-    def __init__(
-        self,
-        status: str,
-        message: str,
-        *,
-        title: str | None = None,
-        value: str | None = None,
-        parent_asin: str | None = None,
-    ):
-        """初始化roll up banner 文件夹错误的运行状态。"""
-        super().__init__(message)
-        self.status = status
-        self.title = title
-        self.value = value
-        self.parent_asin = parent_asin
-        self.missing_rule_line: str | None = None
 
-
-class XStandFolderError(ValueError):
+class XStandFolderError(_ProductFolderError):
     """X展架文件夹生成错误。
 
     X展架独立于易拉宝和拉网展架，尺寸片段只由子 ASIN 决定；单独状态方便巡检日志定位。
     """
 
-    def __init__(
-        self,
-        status: str,
-        message: str,
-        *,
-        title: str | None = None,
-        value: str | None = None,
-        parent_asin: str | None = None,
-    ):
-        """初始化x 展架文件夹错误的运行状态。"""
-        super().__init__(message)
-        self.status = status
-        self.title = title
-        self.value = value
-        self.parent_asin = parent_asin
-        self.missing_rule_line: str | None = None
 
-
-class FeatherFlagFolderError(ValueError):
+class FeatherFlagFolderError(_ProductFolderError):
     """刀旗文件夹生成错误。
 
     刀旗的规则来自 flag.pdf 文本层，单双面还会嵌入品名片段；
     独立状态方便在批量日志里直接定位缺少的是尺寸、Printing Side 还是配件规则。
     """
-
-    def __init__(
-        self,
-        status: str,
-        message: str,
-        *,
-        title: str | None = None,
-        value: str | None = None,
-        parent_asin: str | None = None,
-    ):
-        """初始化feather 旗帜文件夹错误的运行状态。"""
-        super().__init__(message)
-        self.status = status
-        self.title = title
-        self.value = value
-        self.parent_asin = parent_asin
-        self.missing_rule_line: str | None = None
 
 
 def parse_folder_date_override(value: str | date | datetime | None) -> date | None:

@@ -5,6 +5,7 @@ import hmac
 import json
 import time
 from typing import Any, Awaitable, Callable
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from .config import AlibabaLoginConfig
 
@@ -98,7 +99,8 @@ VERIFICATION_CLOSE_SELECTORS = (
 )
 VERIFICATION_DIALOG_CLOSE_DELAY_MS = 300
 POST_LOGIN_SUBMIT_DELAY_MS = 1_800
-ALIBABA_DETAIL_POLL_INTERVAL_MS = 3_000
+ALIBABA_DETAIL_POLL_INTERVAL_MS = 500
+ALIBABA_DETAIL_TIMEOUT_SECONDS = 30
 ManualLoginCallback = Callable[[str], Awaitable[bool]]
 
 
@@ -110,10 +112,14 @@ async def wait_for_alibaba_logistics_detail(
     auto_login: bool = True,
     timeout_sec: int = 300,
     manual_login_callback: ManualLoginCallback | None = None,
+    detail_timeout_sec: float = ALIBABA_DETAIL_TIMEOUT_SECONDS,
 ) -> None:
     """Wait until an Alibaba logistics detail page is readable, logging in when possible."""
 
-    deadline = time.monotonic() + max(timeout_sec, 1)
+    page_budget = min(max(detail_timeout_sec, 1), max(timeout_sec, 1))
+    deadline = time.monotonic() + page_budget
+    login_deadline: float | None = None
+    waiting_for_login = False
     auto_login_attempted = False
     auto_login_submitted = False
     login_page_observed = False
@@ -125,7 +131,7 @@ async def wait_for_alibaba_logistics_detail(
 
     while time.monotonic() < deadline:
         body_text = await _safe_body_text(page)
-        if _is_logistics_detail_ready(page.url, body_text):
+        if _is_logistics_detail_url(page.url, detail_url) and _is_logistics_detail_ready(page.url, body_text):
             if config.account:
                 await verify_alibaba_logistics_account(
                     page,
@@ -136,6 +142,14 @@ async def wait_for_alibaba_logistics_detail(
 
         login_page = await is_alibaba_login_page(page, body_text)
         needs_manual_verification = _needs_manual_verification(body_text)
+        if login_page or needs_manual_verification:
+            if login_deadline is None:
+                login_deadline = time.monotonic() + max(timeout_sec, 1)
+            deadline = login_deadline
+            waiting_for_login = True
+        elif waiting_for_login:
+            deadline = time.monotonic() + page_budget
+            waiting_for_login = False
         if (
             needs_manual_verification
             and not verification_login_retried
@@ -173,6 +187,9 @@ async def wait_for_alibaba_logistics_detail(
                         "用户取消了阿里物流站人工登录，本批物流查询已停止并保留待重试。"
                     )
                 print("已收到人工登录完成确认，正在继续读取阿里物流订单信息。")
+                # Time spent by the operator is not a page/network timeout.
+                login_deadline = time.monotonic() + max(timeout_sec, 1)
+                deadline = time.monotonic() + page_budget
                 if not _is_logistics_detail_url(page.url, detail_url):
                     await page.goto(detail_url, wait_until="domcontentloaded")
                 continue
@@ -206,9 +223,25 @@ async def wait_for_alibaba_logistics_detail(
             print("阿里页面重试后仍需要验证码或安全验证，请在浏览器里手动处理；脚本会自动继续。")
             printed_manual_message = True
 
-        await page.wait_for_timeout(ALIBABA_DETAIL_POLL_INTERVAL_MS)
+        if hasattr(page, "wait_for_function"):
+            try:
+                await page.wait_for_function(
+                    """([url, markers]) => location.href.split('#')[0] === url.split('#')[0]
+                        && markers.some(marker => (document.body?.innerText || '').includes(marker))""",
+                    arg=[detail_url, list(DETAIL_READY_MARKERS + DETAIL_ERROR_MARKERS)],
+                    timeout=min(ALIBABA_DETAIL_POLL_INTERVAL_MS, max(1, int((deadline - time.monotonic()) * 1000))),
+                    polling="raf",
+                )
+            except PlaywrightTimeoutError:
+                pass
+        else:
+            await page.wait_for_timeout(ALIBABA_DETAIL_POLL_INTERVAL_MS)
 
-    raise RuntimeError("等待阿里国际站物流详情页加载或登录完成超时。")
+    if waiting_for_login:
+        raise AlibabaAccountUnverifiedError(
+            "等待阿里物流站登录完成超时，已停止整批查询。请完成登录后重试。"
+        )
+    raise RuntimeError("等待阿里国际站物流详情页加载超时（未检测到登录页）。")
 
 
 async def is_alibaba_login_page(page, body_text: str | None = None) -> bool:

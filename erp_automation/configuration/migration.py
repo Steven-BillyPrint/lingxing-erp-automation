@@ -5,7 +5,6 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
-import os
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
@@ -22,7 +21,6 @@ from .errors import (
     MigrationValidationError,
 )
 from .models import (
-    CONFIGURATION_SCHEMA_VERSION,
     ConfigurationDocument,
     MigrationFileEntry,
     MigrationImportResult,

@@ -97,7 +97,7 @@ from .re_mark_domain import (
 )
 
 
-SCHEMA_VERSION = 23
+SCHEMA_VERSION = 24
 COMPLETED_REFRESH_WINDOW_DAYS = 15
 CUSTOMER_SHIPPING_SERVICE_SCAN_ISSUE = "customer_shipping_service_unavailable"
 SCAN_ISSUE_KEY_PREFIX = "scan-issue:"
@@ -324,12 +324,28 @@ class TagSnapshotReconcileResult:
     resumed_logistics_numbers: tuple[str, ...] = ()
 
 
+class _ClosingReadConnection(sqlite3.Connection):
+    """A read transaction also releases its handle when leaving its context."""
+
+    def __exit__(self, *args):
+        try:
+            return super().__exit__(*args)
+        finally:
+            self.close()
+
+
 class ShipmentWorkflowStore:
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, *, read_only: bool = False):
         self.path = Path(path)
         self._initialized = False
+        self._read_only = read_only
 
     def connect(self) -> sqlite3.Connection:
+        if self._read_only:
+            conn = sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True, timeout=2, factory=_ClosingReadConnection)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA query_only = ON")
+            return conn
         self.path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(self.path, timeout=15)
         conn.row_factory = sqlite3.Row
@@ -340,6 +356,16 @@ class ShipmentWorkflowStore:
     def initialize(self) -> None:
         if self._initialized:
             return
+        if self.path.is_file():
+            with sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True, factory=_ClosingReadConnection) as conn:
+                version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+            if version == SCHEMA_VERSION:
+                self._initialized = True
+                return
+            if version > SCHEMA_VERSION:
+                raise RuntimeError("自动标发数据库来自更新版本，请先更新客户端。")
+        if self._read_only:
+            raise RuntimeError("自动标发数据库尚未完成初始化，请等待服务器初始化完成。")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         needs_v1_backup = False
         needs_v3_migration = False
@@ -363,6 +389,7 @@ class ShipmentWorkflowStore:
         needs_v21_migration = False
         needs_v22_migration = False
         needs_v23_migration = False
+        needs_v24_migration = False
         if self.path.exists():
             with self.connect() as conn:
                 names = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
@@ -372,6 +399,7 @@ class ShipmentWorkflowStore:
                     job_columns = self._table_columns(conn, "shipment_jobs") if "shipment_jobs" in names else set()
                     logistics_columns = self._table_columns(conn, "shipment_logistics") if "shipment_logistics" in names else set()
                     current_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+                    needs_v24_migration = current_version < 24
                     needs_v3_migration = (
                         current_version < 3
                         or not {"completion_source", "externally_completed_at"}.issubset(erp_columns)
@@ -609,6 +637,8 @@ class ShipmentWorkflowStore:
             self._backup_before_v22()
         elif needs_v23_migration:
             self._backup_before_v23()
+        elif needs_v24_migration:
+            self._backup_before_version("v24")
         with self.connect() as conn:
             conn.execute("PRAGMA journal_mode = WAL")
             try:
@@ -654,12 +684,70 @@ class ShipmentWorkflowStore:
                 self._protect_legacy_table(conn)
                 self._reconcile_duplicate_business_identities_conn(conn)
                 self._reconcile_cancelled_logistics_states_conn(conn)
+                self._migrate_to_v24(conn)
                 conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
                 conn.commit()
             except Exception:
                 conn.rollback()
                 raise
         self._initialized = True
+
+    def reconcile_persistent_rules(self) -> None:
+        """Run business repairs explicitly at startup, never during a read."""
+        self.initialize()
+        from .notification_store import initialize_notification_schema
+
+        with self.connect() as conn:
+            initialize_notification_schema(conn)
+            self._refresh_order_policy_evidence_conn(conn)
+            self._reconcile_amazon_main_image_policy_conn(conn)
+            self._reconcile_duplicate_business_identities_conn(conn)
+            self._reconcile_cancelled_logistics_states_conn(conn)
+            self._reconcile_logistics_overdue_conn(conn, include_historical=True)
+            conn.commit()
+
+    def _migrate_to_v24(self, conn: sqlite3.Connection) -> None:
+        columns = self._table_columns(conn, "shipment_logistics")
+        for column in ("completed_evidence_checked_at", "completed_evidence_next_at", "completed_evidence_version"):
+            if column not in columns:
+                kind = "INTEGER" if column == "completed_evidence_version" else "TEXT"
+                conn.execute(f"ALTER TABLE shipment_logistics ADD COLUMN {column} {kind}")
+        conn.execute("""CREATE TABLE IF NOT EXISTS shipment_queue_revision (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            generation TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 0
+        )""")
+        conn.execute(
+            "INSERT OR IGNORE INTO shipment_queue_revision(singleton, generation) VALUES (1, ?)",
+            (uuid.uuid4().hex,),
+        )
+        for table in ("shipment_jobs", "shipment_logistics", "shipment_erp",
+                      "shipment_re_mark_cycles", "shipment_scan_issues",
+                      "shipment_email_batches", "shipment_email_batch_items"):
+            for operation in ("INSERT", "UPDATE", "DELETE"):
+                conn.execute(f"""CREATE TRIGGER IF NOT EXISTS revision_{table}_{operation.lower()}
+                    AFTER {operation} ON {table} BEGIN
+                        UPDATE shipment_queue_revision SET revision = revision + 1 WHERE singleton = 1;
+                    END""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_shipment_jobs_system ON shipment_jobs(system_order_no)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_shipment_re_mark_job ON shipment_re_mark_cycles(job_id, id)")
+        for operation in ("INSERT", "UPDATE", "DELETE"):
+            sources = ("OLD", "NEW") if operation == "UPDATE" else ("OLD",) if operation == "DELETE" else ("NEW",)
+            predicate = " OR ".join(
+                f"{source}.event_type IN ('PRODUCT_IDENTITY_BACKFILLED', 'PRODUCT_IDENTITY_CHECKED', 'PRODUCT_IDENTITY_RETRY_SCHEDULED')"
+                for source in sources
+            )
+            conn.execute(f"""CREATE TRIGGER IF NOT EXISTS revision_identity_event_{operation.lower()}
+                AFTER {operation} ON shipment_events WHEN {predicate} BEGIN
+                    UPDATE shipment_queue_revision SET revision = revision + 1 WHERE singleton = 1;
+                END""")
+
+    def queue_dataset_revision(self) -> str:
+        self.initialize()
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT generation, revision FROM shipment_queue_revision WHERE singleton = 1"
+            ).fetchone()
+        return f"{row[0]}:{row[1]}"
 
     def _reconcile_cancelled_logistics_states_conn(
         self,
@@ -2388,6 +2476,7 @@ class ShipmentWorkflowStore:
         days: int = COMPLETED_REFRESH_WINDOW_DAYS,
         eligible_only: bool = False,
         include_detected_reconciliation: bool = False,
+        evidence_only: bool = False,
         limit: int = 500,
     ) -> list[dict[str, Any]]:
         """Return automation-completed packages due for a 15-day recheck.
@@ -2404,10 +2493,12 @@ class ShipmentWorkflowStore:
             datetime.now(timezone.utc) - timedelta(days=bounded_days)
         )
         now = utc_now()
+        due_column = "l.completed_evidence_next_at" if evidence_only else "l.completed_refresh_next_at"
+        invalidated = "COALESCE(l.completed_evidence_version, -1) <> j.version" if evidence_only else "0"
         with self.connect() as conn:
             rows = conn.execute(
                 self._aggregate_sql()
-                + """
+                + f"""
                   WHERE j.identity_state = ?
                     AND e.state = ?
                     AND e.completion_source = ?
@@ -2427,9 +2518,10 @@ class ShipmentWorkflowStore:
                                   AND detected_re_mark.state = ?
                             )
                         )
-                        OR l.completed_refresh_next_at IS NULL
-                        OR l.completed_refresh_next_at = ''
-                        OR l.completed_refresh_next_at <= ?
+                        OR {due_column} IS NULL
+                        OR {due_column} = ''
+                        OR {due_column} <= ?
+                        OR {invalidated}
                     )
                     AND (j.lease_owner IS NULL OR j.lease_owner = '' OR j.lease_until <= ?)
                   ORDER BY COALESCE(l.completed_refresh_checked_at, ''), j.id
@@ -2444,7 +2536,7 @@ class ShipmentWorkflowStore:
                     REMARK_CANCELLED,
                     1 if include_detected_reconciliation else 0,
                     REMARK_DETECTED,
-                    1 if include_detected_reconciliation else 0,
+                    1 if include_detected_reconciliation and not evidence_only else 0,
                     REMARK_DETECTED,
                     now,
                     now,
@@ -2477,6 +2569,7 @@ class ShipmentWorkflowStore:
         logistics_provider_name: str = "",
         logistics_type_name: str = "",
         run_id: str | None = None,
+        next_hours: float = 3,
     ) -> int:
         """Persist only exact Lingxing detail evidence for completed packages."""
 
@@ -2509,6 +2602,11 @@ class ShipmentWorkflowStore:
                 ),
             ).fetchall()
             for row in rows:
+                conn.execute(
+                    "UPDATE shipment_logistics SET completed_evidence_checked_at = ?, completed_evidence_next_at = ?, "
+                    "completed_evidence_version = (SELECT version + 1 FROM shipment_jobs WHERE id = job_id) WHERE job_id = ?",
+                    (now, utc_after(next_hours), int(row["id"])),
+                )
                 conn.execute(
                     """
                     UPDATE shipment_jobs
@@ -2598,10 +2696,12 @@ class ShipmentWorkflowStore:
                     """
                     UPDATE shipment_logistics
                     SET completed_refresh_checked_at = ?, completed_refresh_next_at = ?,
+                        completed_evidence_checked_at = ?, completed_evidence_next_at = ?,
+                        completed_evidence_version = (SELECT version FROM shipment_jobs WHERE id = job_id),
                         completed_refresh_last_error = ?, updated_at = ?
                     WHERE job_id = ?
                     """,
-                    (now, next_at, message, now, int(row["id"])),
+                    (now, next_at, now, next_at, message, now, int(row["id"])),
                 )
                 self._insert_event_conn(
                     conn,
@@ -2907,6 +3007,10 @@ class ShipmentWorkflowStore:
                     ),
                 )
                 cycle_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+                conn.execute(
+                    "UPDATE shipment_logistics SET completed_evidence_version = NULL WHERE job_id = ?",
+                    (int(job["job_id"]),),
+                )
                 self._insert_event_conn(
                     conn,
                     job_id=int(job["job_id"]),
@@ -3577,6 +3681,21 @@ class ShipmentWorkflowStore:
                     and existing["platform_order_no"] == candidate.platform_order_no
                 )
                 if same_identity:
+                    evidence_changed = any(
+                        str(value or "").strip() and str(existing[key] or "").strip() != str(value).strip()
+                        for key, value in (
+                            ("sales_platform_code", candidate.sales_platform_code),
+                            ("sales_platform_name", candidate.sales_platform_name),
+                            ("logistics_provider_name", logistics_provider_name),
+                            ("logistics_type_name", logistics_type_name),
+                            ("platform_order_item_ids_json", platform_order_item_ids_json if platform_order_item_ids_json != "[]" else ""),
+                        )
+                    )
+                    if evidence_changed:
+                        conn.execute(
+                            "UPDATE shipment_logistics SET completed_evidence_version = NULL WHERE job_id = ?",
+                            (existing["id"],),
+                        )
                     stage_row = conn.execute(
                         """
                         SELECT l.state AS logistics_state, l.next_attempt_at AS logistics_next_attempt_at,
@@ -4410,8 +4529,16 @@ class ShipmentWorkflowStore:
             conn.commit()
         return tuple(changed)
 
-    def claim_logistics_jobs(self, owner: str, *, limit: int = 0, lease_seconds: int = 1200) -> list[dict[str, Any]]:
-        return self._claim_jobs("logistics", owner, limit=limit, lease_seconds=lease_seconds)
+    def claim_logistics_jobs(
+        self, owner: str, *, limit: int = 0, lease_seconds: int = 1200,
+        eligible_logistics_nos: Sequence[str] | None = None,
+        attempted_in_run_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        return self._claim_jobs(
+            "logistics", owner, limit=limit, lease_seconds=lease_seconds,
+            eligible_logistics_nos=eligible_logistics_nos,
+            attempted_in_run_id=attempted_in_run_id,
+        )
 
     def claim_erp_jobs(
         self,
@@ -4437,6 +4564,8 @@ class ShipmentWorkflowStore:
         limit: int,
         lease_seconds: int,
         logistics_no: str | None = None,
+        eligible_logistics_nos: Sequence[str] | None = None,
+        attempted_in_run_id: str | None = None,
     ) -> list[dict[str, Any]]:
         self.initialize()
         now = utc_now()
@@ -4483,6 +4612,20 @@ class ShipmentWorkflowStore:
                 )
             """
             params.append(SCAN_ISSUE_ACTIVE)
+            if stage == "logistics" and eligible_logistics_nos is not None:
+                # A run consumes its initial due set exactly once. An earlier
+                # failure becoming due again must belong to a later run.
+                where += " AND j.logistics_no IN (SELECT value FROM json_each(?))"
+                params.append(json.dumps(list(eligible_logistics_nos)))
+            if stage == "logistics" and attempted_in_run_id:
+                where += """
+                    AND NOT EXISTS (
+                        SELECT 1 FROM shipment_events attempted
+                        WHERE attempted.job_id = j.id AND attempted.run_id = ?
+                          AND attempted.event_type = 'LOGISTICS_ATTEMPT_COMPLETED'
+                    )
+                """
+                params.append(attempted_in_run_id)
             if logistics_no is not None:
                 where += " AND j.logistics_no = ?"
                 params.append(logistics_no)
@@ -6820,19 +6963,32 @@ class ShipmentWorkflowStore:
         rows = [*self.list_active_scan_issues(), *jobs]
         return rows[:limit] if limit > 0 else rows
 
-    def list_queue_index_rows(self) -> list[dict[str, Any]]:
+    def list_queue_index_rows(
+        self, *, search_field: str = "platform_order_no", search_query: str = "",
+    ) -> list[dict[str, Any]]:
         """Return a lightweight complete index for global page ordering."""
 
         self.initialize()
-        sql = self._queue_index_sql() + (
-            " WHERE j.identity_state <> ? ORDER BY j.id"
-        )
+        field = search_field if search_field in {"platform_order_no", "system_order_no"} else "platform_order_no"
+        needle = str(search_query or "").strip().casefold()
+        sql = self._queue_index_sql() + " WHERE j.identity_state <> ?"
+        params: list[Any] = [IDENTITY_SUPERSEDED]
+        if needle:
+            sql += f" AND instr(casefold(j.{field}), ?) > 0"
+            params.append(needle)
+        sql += " ORDER BY j.id"
         with self.connect() as conn:
+            # Preserve Python's Unicode/casefold and literal contains semantics;
+            # SQL LIKE would interpret user-supplied % and _ as wildcards.
+            conn.create_function("casefold", 1, lambda value: str(value or "").casefold(), deterministic=True)
             jobs = [
                 self._flatten(row)
-                for row in conn.execute(sql, (IDENTITY_SUPERSEDED,)).fetchall()
+                for row in conn.execute(sql, params).fetchall()
             ]
-        return [*self.list_active_scan_issues(), *jobs]
+        issues = self.list_active_scan_issues()
+        if needle:
+            issues = [row for row in issues if needle in str(row.get(field) or "").casefold()]
+        return [*issues, *jobs]
 
     def list_jobs_by_logistics_nos(
         self,

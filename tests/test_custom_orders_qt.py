@@ -6,8 +6,6 @@ from datetime import datetime, timedelta, timezone
 import os
 import threading
 import time
-from dataclasses import replace
-from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -2875,6 +2873,7 @@ def test_shipment_page_submits_named_completed_logistics_query(app):
     assert command.name == "查询已标发物流状态"
     assert command.area is TaskArea.SHIPMENT
     assert command.capability is Capability.ALIBABA_LOGISTICS
+    assert command.payload["logistics_scope"] == "completed"
 
 
 def test_completed_shipment_scan_starts_local_visible_logistics_task(app):
@@ -8947,3 +8946,91 @@ def test_custom_sync_label_keeps_last_confirmed_time_on_failure(app):
         assert "读取失败，显示上次数据" in page.sync_status_label.text()
     finally:
         page.deleteLater()
+
+
+
+def test_shipment_search_displays_current_result_despite_repeated_background_changes(app):
+    from erp_automation.contracts.models import ShipmentPage as Result
+    started = threading.Event()
+    release_first = threading.Event()
+    refresh_started = threading.Event()
+    release_refresh = threading.Event()
+
+    class Controller(InMemoryBackgroundTaskController):
+        snapshot_runs_in_background = True
+        search_calls = 0
+
+        def list_shipment_page(self, **query):
+            needle = query.get("search_query", "")
+            if needle:
+                self.search_calls += 1
+                if self.search_calls == 1:
+                    started.set()
+                    assert release_first.wait(4)
+                else:
+                    refresh_started.set()
+                    assert release_refresh.wait(4)
+            return Result(items=(ShipmentRow(needle or "INITIAL", logistics_no="ALS", identity_state="ACTIVE", logistics_state="WAITING", erp_state="WAITING"),), total=1)
+
+    controller = Controller()
+    page = ShipmentPage(controller, lambda _result: None)
+    def summary(revision):
+        return DesktopSnapshot(shipments_summary=DatasetSummary(1, revision), server_features=("shipment_pagination_v1", "snapshot_summary_v1"))
+    page.show()
+    try:
+        page.update_snapshot(summary("initial"))
+        deadline = time.monotonic() + 2
+        while page._server_page_state != "success" and time.monotonic() < deadline:
+            QTest.qWait(5)
+        page.search_edit.setText("CURRENT")
+        page._search_filter_timer.stop()
+        page._apply_search_filter()
+        assert started.wait(1)
+        generation = page._server_page_loader.generation
+        for i in range(20):
+            page.update_snapshot(summary(f"changed-{i}"))
+        assert page._server_page_loader.generation == generation
+        assert controller.search_calls == 1
+        assert "正在搜索" in page.server_page_state_label.text()
+        release_first.set()
+        deadline = time.monotonic() + 2
+        while not refresh_started.is_set() and time.monotonic() < deadline:
+            QTest.qWait(5)
+        assert refresh_started.is_set()
+        assert page._rows[0].platform_order_no == "CURRENT"
+        assert controller.search_calls == 2
+    finally:
+        release_first.set()
+        release_refresh.set()
+        deadline = time.monotonic() + 2
+        while page._server_page_loader.has_running_requests and time.monotonic() < deadline:
+            QTest.qWait(5)
+        page.close()
+        page.deleteLater()
+
+
+@pytest.mark.parametrize("status", [TaskStatus.SUCCEEDED, TaskStatus.FAILED])
+def test_history_followup_waits_for_successful_normal_logistics(app, status):
+    controller = RecordingController()
+    window = DesktopMainWindow(controller)
+    try:
+        window._timer.stop()
+        window._custom_scan_timer.stop()
+        window._shipment_scan_timer.stop()
+        window._pending_completed_logistics_task_ids.add("normal")
+        task = TaskRecord(task_id="normal", name="normal", area=TaskArea.SHIPMENT,
+                          capability=Capability.ALIBABA_LOGISTICS, status=TaskStatus.RUNNING)
+        window._capture_local_logistics_followups(DesktopSnapshot(tasks=[task]))
+        assert controller.submitted_commands == []
+        window._capture_local_logistics_followups(DesktopSnapshot(tasks=[replace(task, status=status)]))
+        deadline = time.monotonic() + 2
+        while window._local_logistics_followup_thread is not None and time.monotonic() < deadline:
+            QTest.qWait(5)
+        if status is TaskStatus.SUCCEEDED:
+            assert len(controller.submitted_commands) == 1
+            assert controller.submitted_commands[0].payload["logistics_scope"] == "completed"
+        else:
+            assert controller.submitted_commands == []
+        assert window._pending_completed_logistics_task_ids == set()
+    finally:
+        window.close()

@@ -68,6 +68,7 @@ BROWSER_CLOSED_ERROR_KEYWORDS = (
 READY_RESPONSE_DRAIN_TIMEOUT_SECONDS = 1.0
 STRUCTURED_FIELD_EXTRACTION_TIMEOUT_SECONDS = 5.0
 PAGE_CLOSE_TIMEOUT_SECONDS = 3.0
+MAX_CONSECUTIVE_PAGE_FAILURES = 3
 ALIBABA_SCM_WARMUP_LOAD_TIMEOUT_MS = 10_000
 ALIBABA_SCM_WARMUP_POLL_INTERVAL_MS = 250
 ALIBABA_SCM_WARMUP_STABLE_OBSERVATIONS = 3
@@ -147,7 +148,7 @@ async def run_logistics_worker(args: argparse.Namespace) -> dict[str, Any]:
         and update_queue
     )
     batch_size = max(1, limit or 20)
-    run_id = uuid.uuid4().hex
+    run_id = str(getattr(args, "logistics_run_id", "") or uuid.uuid4().hex)
     parser_artifact_requeued = ()
     tracking_rule_requeued = ()
     automated_block_requeued = ()
@@ -164,12 +165,14 @@ async def run_logistics_worker(args: argparse.Namespace) -> dict[str, Any]:
             run_id=run_id,
         )
     worker_id = f"logistics-{uuid.uuid4().hex}"
-    rows = store.list_logistics_check_candidates(
-        limit=0 if process_all_batches else limit
+    scope = str(getattr(args, "logistics_scope", "all"))
+    rows = (
+        store.list_logistics_check_candidates(limit=0 if process_all_batches else limit)
+        if scope != "completed" else []
     )
-    completed_refresh_rows = store.list_completed_refresh_targets(
-        eligible_only=True,
-        limit=500,
+    completed_refresh_rows = (
+        store.list_completed_refresh_targets(eligible_only=True, limit=500)
+        if scope != "normal" else []
     )
     normal_target_count = len(_dedupe_rows_by_logistics_no(rows))
     completed_refresh_target_count = len(
@@ -287,6 +290,8 @@ async def run_logistics_worker(args: argparse.Namespace) -> dict[str, Any]:
             ) from exc
         return await fetch_with_current_browser(logistics_no)
 
+    query_started = time.perf_counter()
+    normal_end_percent = 20 + int(70 * normal_target_count / max(target_count, 1))
     try:
         if process_all_batches:
             report = LogisticsWorkerReport(
@@ -297,13 +302,21 @@ async def run_logistics_worker(args: argparse.Namespace) -> dict[str, Any]:
                 target_count=target_count,
             )
             queried_logistics_numbers: set[str] = set()
+            remaining_logistics_numbers = {
+                str(row["logistics_no"]) for row in rows if row.get("logistics_no")
+            }
             while True:
                 batch_rows = store.claim_logistics_jobs(
                     worker_id,
                     limit=batch_size,
+                    eligible_logistics_nos=tuple(remaining_logistics_numbers),
+                    attempted_in_run_id=run_id,
                 )
                 if not batch_rows:
                     break
+                remaining_logistics_numbers.difference_update(
+                    str(row["logistics_no"]) for row in batch_rows
+                )
                 batch_report = await process_logistics_queue_once(
                     store,
                     fetch_detail=fetch_with_current_browser,
@@ -318,7 +331,9 @@ async def run_logistics_worker(args: argparse.Namespace) -> dict[str, Any]:
                     progress_offset=report.scanned_page_count,
                     progress_total=target_count,
                     finalize_report=False,
+                    consecutive_page_failures=report.consecutive_page_failures,
                 )
+                report.consecutive_page_failures = batch_report.consecutive_page_failures
                 report.batch_count += 1
                 report.scanned_page_count += batch_report.scanned_page_count
                 report.parsed_count += batch_report.parsed_count
@@ -357,6 +372,12 @@ async def run_logistics_worker(args: argparse.Namespace) -> dict[str, Any]:
                 for record in store.list_logistics_skipped_records(limit=50)
                 if record.logistics_no not in queried_logistics_numbers
             ]
+            if (
+                report.status == "completed"
+                and report.scanned_page_count
+                and report.consecutive_page_failures >= report.scanned_page_count
+            ):
+                report.status = "failed"
             if report.status == "failed":
                 report.message = (
                     "物流查询因浏览器技术故障失败："
@@ -365,7 +386,7 @@ async def run_logistics_worker(args: argparse.Namespace) -> dict[str, Any]:
                     f"{report.browser_error_count} 次；"
                     f"另有 {report.aborted_count} 条未继续读取，已终止本批任务并保留自动重试。"
                 )
-                _notify_progress(progress_callback, report.message, 92)
+                _notify_progress(progress_callback, report.message, normal_end_percent)
             elif report.status not in {"identity_mismatch", "identity_unverified"}:
                 if report.retryable_count or report.blocked_count:
                     report.status = "completed_with_skips"
@@ -378,10 +399,10 @@ async def run_logistics_worker(args: argparse.Namespace) -> dict[str, Any]:
                 _notify_progress(
                     progress_callback,
                     f"已完成全部 {report.scanned_page_count} 条阿里物流查询，正在刷新共享队列。",
-                    92,
+                    normal_end_percent,
                 )
         else:
-            if update_queue:
+            if update_queue and scope != "completed":
                 rows = store.claim_logistics_jobs(worker_id, limit=limit)
             report = await process_logistics_queue_once(
                 store,
@@ -401,17 +422,29 @@ async def run_logistics_worker(args: argparse.Namespace) -> dict[str, Any]:
                 report.aborted_count,
                 normal_target_count - report.scanned_page_count,
             )
-        await _process_completed_refresh_rows(
-            store,
-            completed_refresh_rows,
-            fetch_detail=fetch_with_current_browser,
-            retry_fetch_detail=restart_browser_and_fetch,
-            report=report,
-            update_queue=update_queue,
-            dry_run=dry_run,
-            run_id=run_id,
-            progress_callback=progress_callback,
-        )
+        report.phase_durations_ms["normal_query"] = round((time.perf_counter() - query_started) * 1000)
+        history_started = time.perf_counter()
+        if report.status not in {"failed", "identity_mismatch", "identity_unverified"}:
+            await _process_completed_refresh_rows(
+                store,
+                completed_refresh_rows,
+                fetch_detail=fetch_with_current_browser,
+                retry_fetch_detail=restart_browser_and_fetch,
+                report=report,
+                update_queue=update_queue,
+                dry_run=dry_run,
+                run_id=run_id,
+                progress_callback=progress_callback,
+            )
+        report.phase_durations_ms["completed_refresh"] = round((time.perf_counter() - history_started) * 1000)
+        if report.completed_refresh_target_count and report.status in {"completed", "completed_with_skips"}:
+            report.message = (
+                f"普通物流已查询 {report.scanned_page_count} 条；"
+                f"历史物流已复查 {report.completed_refresh_checked_count}/{report.completed_refresh_target_count} 条，"
+                f"发现换号 {report.completed_refresh_changed_count} 条，"
+                f"读取失败 {report.completed_refresh_failed_count} 条。"
+            )
+        _notify_progress(progress_callback, report.message, 98)
         report.parser_artifact_requeued_count = len(parser_artifact_requeued)
         report.tracking_rule_requeued_count = len(tracking_rule_requeued)
         if parser_artifact_requeued:
@@ -453,6 +486,7 @@ async def process_logistics_queue_once(
     progress_offset: int = 0,
     progress_total: int | None = None,
     finalize_report: bool = True,
+    consecutive_page_failures: int = 0,
 ) -> LogisticsWorkerReport:
     rows = preloaded_rows
     if rows is None:
@@ -464,6 +498,7 @@ async def process_logistics_queue_once(
         message="物流查询完成。",
         dry_run=dry_run,
         update_queue=update_queue,
+        consecutive_page_failures=consecutive_page_failures,
     )
     ready_this_run: list[ReadyToMarkItem] = []
 
@@ -528,6 +563,9 @@ async def process_logistics_queue_once(
                 report.parsed_count += 1
             if page_read_failed:
                 report.failed_count += 1
+            report.consecutive_page_failures = (
+                report.consecutive_page_failures + 1 if page_read_failed else 0
+            )
             if logistics_state == LOGISTICS_READY:
                 ready_this_run.append(_ready_item_from_row_and_detail(row, detail))
             elif logistics_state == LOGISTICS_WAITING:
@@ -540,6 +578,15 @@ async def process_logistics_queue_once(
                 report.retryable_count += 1
                 if not page_read_failed:
                     report.failed_count += 1
+            if report.consecutive_page_failures >= MAX_CONSECUTIVE_PAGE_FAILURES:
+                report.status = "failed"
+                report.browser_error_count += 1
+                report.aborted_count = total_rows - index
+                report.message = (
+                    "阿里页面连续读取失败，已停止本批。请恢复浏览器登录或连接后重试；"
+                    "剩余订单保留待查询，未消耗重试次数。"
+                )
+                break
         except LogisticsBrowserRecoveryFailed as exc:
             message = _logistics_query_error_message(exc)
             report.status = "failed"
@@ -612,13 +659,25 @@ async def process_logistics_queue_once(
                     run_id=run_id,
                 )
 
+            report.consecutive_page_failures += 1
+            if report.consecutive_page_failures >= MAX_CONSECUTIVE_PAGE_FAILURES:
+                report.status = "failed"
+                report.browser_error_count += 1
+                report.aborted_count = total_rows - index
+                report.message = "阿里页面连续读取失败，已停止本批并保留剩余订单待查询。"
+                break
+
+    if finalize_report and report.scanned_page_count and report.consecutive_page_failures >= report.scanned_page_count:
+        report.status = "failed"
+        report.message = f"本批物流页面全部读取失败 {report.failed_count} 条，请恢复浏览器会话后重试。"
+
     if finalize_report:
         _notify_progress(
             progress_callback,
             (
                 report.message
-                if report.status in {"identity_mismatch", "identity_unverified"}
-                else f"已完成 {total_rows} 条阿里物流查询，正在刷新共享队列。"
+                if report.status in {"failed", "identity_mismatch", "identity_unverified"}
+                else f"已完成 {report.scanned_page_count} 条阿里物流查询，正在刷新共享队列。"
             ),
             92,
         )
@@ -634,7 +693,7 @@ async def process_logistics_queue_once(
             for record in store.list_logistics_skipped_records(limit=50)
             if record.logistics_no not in queried_logistics_numbers
         ]
-        if report.status != "failed" and (
+        if report.status == "completed" and (
             report.failed_count or report.retryable_count or report.blocked_count
         ):
             report.status = "completed_with_skips"
@@ -1010,12 +1069,13 @@ async def _process_completed_refresh_rows(
 
     unique_rows = _dedupe_rows_by_logistics_no(rows)
     report.completed_refresh_target_count = len(unique_rows)
+    consecutive_failures = 0
     for index, row in enumerate(unique_rows, start=1):
         logistics_no = str(row.get("logistics_no") or "").strip()
         _notify_progress(
             progress_callback,
             f"正在复查近 15 天已完成物流（{index}/{len(unique_rows)}）：{logistics_no}",
-            90 + int((index / max(len(unique_rows), 1)) * 8),
+            20 + int(70 * (report.scanned_page_count + index) / max(report.target_count, len(unique_rows), 1)),
         )
         try:
             detail = await _fetch_detail_with_optional_retry(
@@ -1026,6 +1086,7 @@ async def _process_completed_refresh_rows(
             )
             if not detail.logistics_no:
                 detail.logistics_no = logistics_no
+            consecutive_failures = consecutive_failures + 1 if detail.page_error else 0
             snapshot = completed_refresh_snapshot(detail)
             readiness = logistics_readiness_decision(detail)
             report.completed_refresh_checked_count += 1
@@ -1045,15 +1106,39 @@ async def _process_completed_refresh_rows(
                     run_id=run_id,
                 )
                 changed = cycle is not None
-            if changed:
+            if detail.page_error:
+                report.completed_refresh_failed_count += 1
+            elif changed:
                 report.completed_refresh_changed_count += 1
             else:
                 report.completed_refresh_unchanged_count += 1
+        except AlibabaAccountVerificationError as exc:
+            report.status = "identity_unverified" if isinstance(exc, AlibabaAccountUnverifiedError) else "identity_mismatch"
+            report.message = str(exc)
+            report.warnings.append(str(exc))
+            report.aborted_count += len(unique_rows) - index + 1
+            break
         except Exception as exc:
+            report.completed_refresh_checked_count = index
             report.completed_refresh_failed_count += 1
+            consecutive_failures += 1
             report.warnings.append(
                 f"已完成物流复查失败 {logistics_no}：{compact_exception_message(exc)}"
             )
+            if isinstance(exc, LogisticsBrowserRecoveryFailed):
+                consecutive_failures = MAX_CONSECUTIVE_PAGE_FAILURES
+        if consecutive_failures >= MAX_CONSECUTIVE_PAGE_FAILURES:
+            report.status = "failed"
+            report.browser_error_count += 1
+            report.aborted_count += len(unique_rows) - index
+            report.message = "历史物流连续读取失败，已停止复查；请恢复浏览器会话后重试。"
+            break
+    if report.status not in {"failed", "identity_mismatch", "identity_unverified"} and report.completed_refresh_failed_count:
+        report.status = (
+            "failed" if report.completed_refresh_failed_count == report.completed_refresh_checked_count
+            else "completed_with_skips"
+        )
+        report.message = f"历史物流复查读取失败 {report.completed_refresh_failed_count} 条，已保留待重试。"
 
 
 def logistics_report_to_dict(report: LogisticsWorkerReport) -> dict[str, Any]:

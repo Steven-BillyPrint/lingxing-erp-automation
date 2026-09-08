@@ -2237,6 +2237,7 @@ def test_marketplace_product_id_migration_requeues_active_full_scan_sources(
             "ALTER TABLE shipment_order_product_snapshots "
             "DROP COLUMN marketplace_product_id"
         )
+        conn.execute("PRAGMA user_version = 23")
         conn.commit()
 
     ShipmentWorkflowStore(path).initialize()

@@ -57,17 +57,9 @@ class LocalAlibabaOrderActionExecutor:
     async def _shipping_address(
         detail: Mapping[str, Any],
     ) -> tuple[Any, str]:
-        from shipment_automation.alibaba_ordering import (
-            AlibabaOrderRuleError,
-            extract_shipping_address,
-        )
+        from shipment_automation.alibaba_ordering import extract_lingxing_shipping_address
 
-        try:
-            return extract_shipping_address(detail), "lingxing_openapi"
-        except AlibabaOrderRuleError as exc:
-            raise AlibabaOrderRuleError(
-                f"领星公开 API 订单列表地址不完整：{exc}"
-            ) from exc
+        return extract_lingxing_shipping_address(detail)
 
     async def _prepare(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
         from shipment_automation.alibaba_order_browser import (
