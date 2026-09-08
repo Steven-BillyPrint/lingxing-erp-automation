@@ -8974,9 +8974,6 @@ if PYSIDE6_AVAILABLE:
                 '{\n  "UPS": {"warehouse_id": 1, "logistics_type_id": 2, '
                 '"freight_currency_code": "USD"}\n}'
             )
-            self.erp_outbound_strategy = QComboBox()
-            self.erp_outbound_strategy.addItem("分阶段审核并出库（推荐）", "staged")
-            self.erp_outbound_strategy.addItem("快速出库", "fast_outbound")
             self.alibaba_account = QLineEdit()
             self.alibaba_password = QLineEdit()
             self.alibaba_auto_login = QCheckBox("允许自动登录阿里物流下单账号")
@@ -9054,7 +9051,6 @@ if PYSIDE6_AVAILABLE:
             account_form.addRow("领星网页登录", self.lingxing_remember)
             account_form.addRow("当前电脑登录", self.lingxing_login_button)
             account_form.addRow("ERP 仓库/物流 ID 映射", self.erp_mark_routes)
-            account_form.addRow("ERP 出库策略", self.erp_outbound_strategy)
             account_form.addRow("阿里物流下单账号", self.alibaba_account)
             account_form.addRow("阿里物流下单密码", self.alibaba_password)
             account_form.addRow("阿里下单网页登录", self.alibaba_auto_login)
@@ -9233,7 +9229,6 @@ if PYSIDE6_AVAILABLE:
                     editor.textEdited.connect(self._mark_dirty)
             self.erp_mark_routes.textChanged.connect(self._mark_dirty)
             self.virtual_email_domains.textChanged.connect(self._mark_dirty)
-            self.erp_outbound_strategy.currentIndexChanged.connect(self._mark_dirty)
             self.high_value_split_weight.currentIndexChanged.connect(
                 self._mark_dirty
             )
@@ -9561,7 +9556,7 @@ if PYSIDE6_AVAILABLE:
                 lingxing_password=self._secret_value(self.lingxing_password),
                 lingxing_remember_login=self.lingxing_remember.isChecked(),
                 erp_mark_routes_json=self.erp_mark_routes.toPlainText().strip() or "{}",
-                erp_mark_outbound_strategy=str(self.erp_outbound_strategy.currentData()),
+                erp_mark_outbound_strategy="staged",
                 alibaba_account=self.alibaba_account.text().strip(),
                 alibaba_password=self._secret_value(self.alibaba_password),
                 alibaba_auto_login=self.alibaba_auto_login.isChecked(),
@@ -10203,10 +10198,6 @@ if PYSIDE6_AVAILABLE:
                 self.virtual_email_domains.setPlainText(
                     settings.notification_virtual_email_domains_json
                 )
-                strategy_index = self.erp_outbound_strategy.findData(
-                    settings.erp_mark_outbound_strategy
-                )
-                self.erp_outbound_strategy.setCurrentIndex(max(0, strategy_index))
                 self.payment_window.setValue(settings.payment_window_hours)
                 weight_index = self.high_value_split_weight.findData(
                     settings.high_value_split_weight_kg

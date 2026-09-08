@@ -1400,15 +1400,7 @@ def test_managed_callback_creates_and_closes_client_per_asyncio_run() -> None:
 
     async def gateway_factory():
         gateway = FakeGateway()
-        gateway.fast_results = [
-            [
-                {
-                    "global_order_no": "103710434633847501",
-                    "wo_number": "WO-1",
-                    FAST_OUTBOUND_RESULT_STATE_KEY: FAST_OUTBOUND_SUCCEEDED,
-                }
-            ]
-        ]
+        gateway.wms_pages = [[_wms_row(status=3, tracked=True)]]
         client = FakeClient()
         gateways.append(gateway)
         clients.append(client)
@@ -1433,7 +1425,7 @@ def test_managed_callback_creates_and_closes_client_per_asyncio_run() -> None:
     assert len(clients) == len(gateways) == 2
     assert all(client.closed for client in clients)
     assert all(
-        [name for name, _ in gateway.calls] == ["get_fast_outbound_result"]
+        [name for name, _ in gateway.calls] == ["list_wms_orders"]
         for gateway in gateways
     )
 
@@ -1467,15 +1459,7 @@ def test_managed_callback_cleanup_error_does_not_turn_success_into_retry() -> No
 
     async def gateway_factory():
         gateway = FakeGateway()
-        gateway.fast_results = [
-            [
-                {
-                    "global_order_no": "103710434633847501",
-                    "wo_number": "WO-1",
-                    FAST_OUTBOUND_RESULT_STATE_KEY: FAST_OUTBOUND_SUCCEEDED,
-                }
-            ]
-        ]
+        gateway.wms_pages = [[_wms_row(status=3, tracked=True)]]
         return gateway, BadCloseClient()
 
     callback = ManagedApiErpMarkFunc(

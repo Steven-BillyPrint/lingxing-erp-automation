@@ -1510,6 +1510,29 @@ def test_settings_page_saves_the_configurable_shipment_scan_tag(
     page.deleteLater()
 
 
+def test_settings_page_removes_fast_outbound_and_saves_legacy_selection_as_staged(
+    app,
+    monkeypatch,
+) -> None:
+    controller = RecordingController()
+    page = SettingsPage(controller, lambda _result: None)
+    page.update_snapshot(
+        DesktopSnapshot(settings=DesktopSettings(erp_mark_outbound_strategy="fast_outbound"))
+    )
+    monkeypatch.setattr(QMessageBox, "information", lambda *_args: None)
+
+    assert not hasattr(page, "erp_outbound_strategy")
+    assert not any(
+        combo.itemData(index) == "fast_outbound"
+        for combo in page.findChildren(QComboBox)
+        for index in range(combo.count())
+    )
+    page._save()
+
+    assert controller.snapshot().settings.erp_mark_outbound_strategy == "staged"
+    page.deleteLater()
+
+
 def test_settings_page_saves_high_value_split_thresholds(
     app,
     monkeypatch,
