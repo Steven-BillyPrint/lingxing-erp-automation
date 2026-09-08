@@ -5809,7 +5809,13 @@ if PYSIDE6_AVAILABLE:
             self.quote_category_label.setText(category_label)
             self._selected_alibaba_category = category
             is_tent = not category or category == "tent"
-            tent_frame_detected = bool(values.get("tent_frame_detected"))
+            # Display values are transported as strings, so bool("False")
+            # would incorrectly enable and lock the weight rule.
+            tent_frame_detected = (
+                is_tent
+                and str(values.get("tent_frame_detected") or "").strip().casefold()
+                == "true"
+            )
             if tent_frame_detected:
                 self.heavy_checkbox.setChecked(True)
                 self.heavy_checkbox.setEnabled(False)

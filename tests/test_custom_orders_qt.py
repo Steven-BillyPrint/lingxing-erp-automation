@@ -14,6 +14,7 @@ import pytest
 from erp_automation.client_version import CLIENT_VERSION
 from erp_automation.contracts.controller import TaskSubmissionReceipt
 from erp_automation.contracts.models import CUSTOM_ORDER_SUBMISSION_ID_PAYLOAD_KEY
+from erp_automation.coordination.codec import decode_interactions, to_jsonable
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 pytest.importorskip("PySide6")
@@ -1050,6 +1051,67 @@ def test_alibaba_order_page_locks_weight_rule_for_detected_tent_frame(app) -> No
     assert page.heavy_checkbox.isChecked() is False
     assert page.heavy_checkbox.isEnabled() is True
     page.deleteLater()
+
+
+@pytest.mark.parametrize("category", ["tent", "vinyl_banner"])
+@pytest.mark.parametrize(
+    ("raw_flag", "has_frame"),
+    [
+        (False, False),
+        ("False", False),
+        ("false", False),
+        ("", False),
+        (None, False),
+        (True, True),
+        ("True", True),
+        ("true", True),
+    ],
+)
+def test_alibaba_order_page_parses_transported_frame_flag_before_draft(
+    app, monkeypatch, category, raw_flag, has_frame
+) -> None:
+    controller = RecordingController()
+    page = AlibabaOrderPage(controller, lambda _result: None)
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args: QMessageBox.StandardButton.Yes,
+    )
+    try:
+        page.system_order_edit.setText("SYS-QUOTE-FLAG")
+        request = DesktopInteractionRequest(
+            request_id="quote-details-flag",
+            task_id="task-quote-flag",
+            stage="alibaba_order:quote_details",
+            title="阿里查价资料已准备",
+            message="transient",
+            display_data={
+                "requested_order_no": "SYS-QUOTE-FLAG",
+                "destination_country_code": "US",
+                "destination_postal_code": "22312",
+                "category": category,
+                "tent_frame_detected": raw_flag,
+            },
+        )
+        # The interaction contract transports display values as strings,
+        # including a boolean False from the order preparation worker.
+        transported = decode_interactions([to_jsonable(request)])[0]
+        assert isinstance(transported.display_data["tent_frame_detected"], str)
+        assert page.heavy_checkbox.isChecked() is False
+
+        assert page.apply_quote_details(transported) is True
+
+        expected_checked = category == "tent" and has_frame
+        assert page.heavy_checkbox.isChecked() is expected_checked
+        assert page.heavy_checkbox.isEnabled() is (
+            category == "tent" and not has_frame
+        )
+        page._fill_draft()
+        command = controller.submitted_commands[-1]
+        assert command.capability is Capability.ALIBABA_ORDER_DRAFT
+        assert command.payload["heavy_or_frame"] is expected_checked
+    finally:
+        page.deleteLater()
 
 
 def test_main_window_routes_quote_details_to_page_without_a_modal(app) -> None:
