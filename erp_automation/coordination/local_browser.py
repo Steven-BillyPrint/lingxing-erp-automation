@@ -11,6 +11,8 @@ from urllib.parse import quote, urlparse
 
 import httpx
 
+from shipment_automation.config import ALIBABA_SESSION_HOSTS
+
 ALIBABA_SCM_HOME_URL = "https://scm.alibaba.com/"
 ALIBABA_QUOTE_URL = "https://i.alibaba.com/logistics/web/shipping/query"
 LINGXING_ORDER_MANAGEMENT_URL = (
@@ -220,7 +222,11 @@ class LocalChromeHost:
                 )
             raise self._remember_start_failure(message)
 
-    def open_url(self, url: str) -> None:
+    def prepare_logistics_session(self) -> None:
+        """Keep an existing logistics/login tab; open SCM only without one."""
+        self.open_url(ALIBABA_SCM_HOME_URL, reuse_logistics_session=True)
+
+    def open_url(self, url: str, *, reuse_logistics_session: bool = False) -> None:
         """Open or activate one trusted business page in the dedicated Chrome."""
 
         target_url = _safe_start_url(url)
@@ -232,7 +238,14 @@ class LocalChromeHost:
                 if (
                     isinstance(target, dict)
                     and str(target.get("type") or "") == "page"
-                    and str(target.get("url") or "") == target_url
+                    and (
+                        str(target.get("url") or "") == target_url
+                        or (
+                            reuse_logistics_session
+                            and urlparse(str(target.get("url") or "")).scheme == "https"
+                            and urlparse(str(target.get("url") or "")).hostname in ALIBABA_SESSION_HOSTS
+                        )
+                    )
                     and str(target.get("id") or "")
                 ):
                     httpx.get(

@@ -53,7 +53,6 @@ from .codec import (
 )
 from .local_browser import (
     ALIBABA_QUOTE_URL,
-    ALIBABA_SCM_HOME_URL,
     LINGXING_ORDER_MANAGEMENT_URL,
     LocalBrowserUnavailable,
     LocalChromeHost,
@@ -306,8 +305,6 @@ class RemoteBackgroundTaskController:
         self._last_error = ""
         self._browser_cleanup_task_ids: set[str] = set()
         self._browser_close_pending = False
-        self._logistics_browser_cleanup_task_ids: set[str] = set()
-        self._logistics_browser_close_pending = False
         try:
             self._register_instance()
         except CoordinationConnectionError as exc:
@@ -943,7 +940,6 @@ class RemoteBackgroundTaskController:
             return command.capability is not Capability.LIST_ORDERS
         if command.area is TaskArea.SHIPMENT:
             return command.capability in {
-                Capability.ALIBABA_LOGISTICS,
                 Capability.OUTBOUND_ORDER,
                 Capability.REMARK_SHIPMENT,
             }
@@ -974,16 +970,8 @@ class RemoteBackgroundTaskController:
                 )
             ),
         )
-        self._cleanup_browser_lane_after_terminal_tasks(
-            snapshot,
-            host_attr="_logistics_browser_host",
-            cleanup_ids_attr="_logistics_browser_cleanup_task_ids",
-            close_pending_attr="_logistics_browser_close_pending",
-            task_uses_lane=lambda task: (
-                task.area is TaskArea.SHIPMENT
-                and task.capability is Capability.ALIBABA_LOGISTICS
-            ),
-        )
+        # Logistics tasks share the logged-in page across normal scans and
+        # independently queued historical checks. prepare_close owns cleanup.
 
     def _cleanup_browser_lane_after_terminal_tasks(
         self,
@@ -1338,16 +1326,7 @@ class RemoteBackgroundTaskController:
                                             and result.task_id
                                             and self._closes_browser_after_task(command)
                                         ):
-                                            cleanup_ids = (
-                                                self._logistics_browser_cleanup_task_ids
-                                                if (
-                                                    command.area is TaskArea.SHIPMENT
-                                                    and command.capability
-                                                    is Capability.ALIBABA_LOGISTICS
-                                                )
-                                                else self._browser_cleanup_task_ids
-                                            )
-                                            cleanup_ids.add(str(result.task_id))
+                                            self._browser_cleanup_task_ids.add(str(result.task_id))
                             raw_result = response.get("result")
                             result_type = str(response.get("result_type") or "")
                             if result_type == "control_result" and not submitted_commands:
@@ -1626,13 +1605,7 @@ class RemoteBackgroundTaskController:
                                 LINGXING_ORDER_MANAGEMENT_URL
                             )
                         elif logistics_query:
-                            # Always open or activate the low-risk SCM landing
-                            # page before the remote worker deep-links into a
-                            # logistics detail.  ``ensure_started`` only uses
-                            # its initial URL for a cold Chrome process, while
-                            # ``open_url`` also handles an already healthy
-                            # process whose previous task closed all pages.
-                            browser_host.open_url(ALIBABA_SCM_HOME_URL)
+                            browser_host.prepare_logistics_session()
                         else:
                             browser_host.ensure_started()
                         prepared_browser_lanes.add(lane_key)
@@ -1679,16 +1652,7 @@ class RemoteBackgroundTaskController:
                         and control_result.task_id
                         and self._closes_browser_after_task(args[0])
                     ):
-                        cleanup_ids = (
-                            self._logistics_browser_cleanup_task_ids
-                            if (
-                                args[0].area is TaskArea.SHIPMENT
-                                and args[0].capability
-                                is Capability.ALIBABA_LOGISTICS
-                            )
-                            else self._browser_cleanup_task_ids
-                        )
-                        cleanup_ids.add(str(control_result.task_id))
+                        self._browser_cleanup_task_ids.add(str(control_result.task_id))
                     if method == "respond_interaction" and args:
                         response = args[0]
                         interaction_id = str(
@@ -1735,16 +1699,7 @@ class RemoteBackgroundTaskController:
                             and control_result.task_id
                             and self._closes_browser_after_task(command)
                         ):
-                            cleanup_ids = (
-                                self._logistics_browser_cleanup_task_ids
-                                if (
-                                    command.area is TaskArea.SHIPMENT
-                                    and command.capability
-                                    is Capability.ALIBABA_LOGISTICS
-                                )
-                                else self._browser_cleanup_task_ids
-                            )
-                            cleanup_ids.add(str(control_result.task_id))
+                            self._browser_cleanup_task_ids.add(str(control_result.task_id))
                     return control_results
                 if result_type == "log_page":
                     return decode_log_page(result)

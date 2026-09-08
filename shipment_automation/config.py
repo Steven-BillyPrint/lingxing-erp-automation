@@ -8,6 +8,12 @@ from typing import Any
 from erp_automation.configuration.legacy_env import read_legacy_env
 
 DEFAULT_SHIPMENT_QUEUE_PATH = "data/shipment_queue.sqlite3"
+ALIBABA_SESSION_HOSTS = frozenset({
+    "scm.alibaba.com",
+    "login.alibaba.com",
+    "passport.alibaba.com",
+    "login.aliexpress.com",
+})
 
 # Default Lingxing custom-order tag used by the shipment candidate scanner.
 # The desktop application exposes this value in Settings and passes the saved
