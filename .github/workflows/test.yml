@@ -34,6 +34,7 @@ jobs:
             tests/test_coordination_state_refresh.py \
             tests/test_shipment_review_projection.py \
             tests/test_shipment_performance_regressions.py \
+            tests/test_notification_query_performance.py \
             tests/test_task_submission_receipts.py
 
   windows-tests:

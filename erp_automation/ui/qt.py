@@ -10547,9 +10547,9 @@ if PYSIDE6_AVAILABLE:
             detail = QWidget()
             detail_layout = QVBoxLayout(detail)
             detail_layout.setContentsMargins(0, 8, 0, 0)
-            self.summary = QLabel("请选择一条通知。")
-            self.summary.setWordWrap(True)
-            detail_layout.addWidget(self.summary)
+            self.package_status_label = QLabel("请选择一条通知查看包裹。")
+            self.package_status_label.setWordWrap(True)
+            detail_layout.addWidget(self.package_status_label)
             self.package_table = QTableWidget(0, 7)
             self.package_table.setHorizontalHeaderLabels(
                 [
@@ -10571,7 +10571,9 @@ if PYSIDE6_AVAILABLE:
             )
             detail_layout.addWidget(self.package_table)
             splitter.addWidget(detail)
-            splitter.setSizes([360, 320])
+            splitter.setSizes([560, 120])
+            splitter.setStretchFactor(0, 1)
+            splitter.setStretchFactor(1, 0)
             layout.addWidget(splitter, 1)
             layout.addWidget(self.pagination_bar)
             self._receipt_ui_refresh_timer = QTimer(self)
@@ -11433,7 +11435,7 @@ if PYSIDE6_AVAILABLE:
                 self.table.setCurrentCell(0, 1)
             else:
                 self._selected_id = None
-                self.summary.setText(
+                self._set_package_status(
                     "当前筛选没有匹配的客户通知。"
                     if self._notifications
                     else "当前没有客户通知草稿。"
@@ -12038,6 +12040,10 @@ if PYSIDE6_AVAILABLE:
             )
             return False
 
+        def _set_package_status(self, message: str) -> None:
+            self.package_status_label.setText(message)
+            self.package_status_label.setVisible(bool(message))
+
         def _show_selected(self) -> None:
             notification = self._selected()
             if notification is None:
@@ -12048,36 +12054,14 @@ if PYSIDE6_AVAILABLE:
             if not full_details_loaded and not package_preview_loaded:
                 self.package_table.setRowCount(0)
                 if self._selected_id in self._notification_detail_failed_ids:
-                    self.summary.setText(
+                    self._set_package_status(
                         "通知摘要已保留，但详情加载失败。刷新列表后可重试。"
                     )
                     return
-                self.summary.setText("正在加载通知包裹与正文详情…")
+                self._set_package_status("正在加载通知包裹与正文详情…")
                 self._request_selected_notification_detail(self._selected_id)
                 return
-            display_state, status_explanation, _timestamp = (
-                self._notification_status_presentation(notification)
-            )
-            status_label = _notification_state_label(
-                display_state,
-                notification.get("package_missing"),
-                notification.get("is_supplemental_revision"),
-                notification.get("last_error"),
-            )
-            status_detail = (
-                f"\n状态说明：{status_explanation}"
-                if status_explanation
-                else ""
-            )
-            self.summary.setText(
-                f"状态：{status_label}{status_detail}\n"
-                f"平台单号：{notification.get('platform_order_no') or '-'}\n"
-                f"收件人：{notification.get('recipient_name') or '-'}\n"
-                f"邮箱：{notification.get('recipient_email') or '-'}\n"
-                f"电话：{notification.get('recipient_phone') or '-'}\n"
-                f"包裹：总数 {notification.get('package_total')}，已有物流 "
-                f"{notification.get('package_complete')}，待补 {notification.get('package_missing')}"
-            )
+            self._set_package_status("")
             raw_items = (
                 notification.get("items")
                 if full_details_loaded
