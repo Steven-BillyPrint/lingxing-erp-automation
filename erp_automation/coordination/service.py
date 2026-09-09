@@ -1222,7 +1222,14 @@ class CoordinatedControllerService:
         evicted = 0
         for key, controller, observed_last_used in candidates:
             try:
-                if any(not task.status.terminal for task in _task_records(controller)):
+                if any(
+                    not task.status.terminal or bool(task.payload.get("_manual_review_lock"))
+                    for task in _task_records(controller)
+                ):
+                    continue
+                # Terminal tasks can still own a pending desktop interaction
+                # or an unverified external result. Reclaim after resolution.
+                if controller.pending_interactions():
                     continue
             except Exception:
                 continue
