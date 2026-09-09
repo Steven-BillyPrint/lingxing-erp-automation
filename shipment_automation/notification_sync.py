@@ -1270,10 +1270,11 @@ def _order_record_is_inactive(record: Any) -> bool:
         for alias in _ORDER_RECORD_INACTIVE_FLAG_ALIASES:
             if _truthy_deleted(getattr(record, alias, None)):
                 return True
-    for mapping in _mapping_tree(_order_record_payload(record), max_depth=2):
-        for key, value in mapping.items():
-            if _canonical_key(key) in wanted and _truthy_deleted(value):
-                return True
+    # Item history has its own deletion flags.  A deleted/replaced product
+    # does not delete the containing system order or its live WMS packages.
+    for key, value in _order_record_payload(record).items():
+        if _canonical_key(key) in wanted and _truthy_deleted(value):
+            return True
     return False
 
 
@@ -1765,7 +1766,10 @@ async def _discover_recent_amazon_order_snapshot(
     api_call_count = 0
     for raw_window in filter_windows:
         offset = 0
-        for _page_number in range(_MAX_ORDER_PAGES):
+        seen_system_orders: set[str] = set()
+        # This is a whole date window, not the small exact-order lookup that
+        # uses _MAX_ORDER_PAGES.  Follow pagination until the window is complete.
+        while True:
             page = await gateway.list_orders(
                 offset=offset,
                 length=_ORDER_PAGE_SIZE,
@@ -1774,6 +1778,20 @@ async def _discover_recent_amazon_order_snapshot(
             )
             api_call_count += 1
             items = tuple(page.items)
+            if not items:
+                if page.total is not None and offset < int(page.total):
+                    raise ValueError(
+                        "recent Amazon order pagination ended before its reported total"
+                    )
+                break
+            page_system_orders = {
+                system
+                for record in items
+                if (system := _order_record_system_order_no(record))
+            }
+            if not page_system_orders - seen_system_orders:
+                raise ValueError("recent Amazon order pagination made no progress")
+            seen_system_orders.update(page_system_orders)
             for record in items:
                 system_order_no = _order_record_system_order_no(record)
                 for platform_order_no in _order_record_platform_numbers(record):
@@ -1781,14 +1799,10 @@ async def _discover_recent_amazon_order_snapshot(
                         continue
                     records[(platform_order_no, system_order_no)] = record
             offset += len(items)
-            if not items:
-                break
             if page.total is not None and offset >= int(page.total):
                 break
             if page.total is None and len(items) < _ORDER_PAGE_SIZE:
                 break
-        else:
-            raise ValueError("recent Amazon order pagination exceeded safety limit")
 
     grouped: dict[str, dict[str, Any]] = {}
     for (platform, system), record in records.items():

@@ -1174,6 +1174,148 @@ def test_amazon_full_scan_includes_manual_fulfillment_item_without_marketplace_i
     assert discovered[0]["eligibility_reason"] == "MANUAL_FULFILLMENT_ITEM"
 
 
+@pytest.mark.parametrize("reported_total", [2140, None])
+def test_amazon_full_scan_reads_more_than_ten_pages_and_overlapping_windows(
+    reported_total,
+) -> None:
+    rows = [
+        SimpleNamespace(
+            global_order_no=str(20000 + index),
+            order_number=f"112-{index:07d}-1234567",
+            payload={
+                "status": 6,
+                "platform_name": "Amazon",
+                "item_info": [{"local_sku": "MANUAL-PRODUCT"}],
+            },
+        )
+        for index in range(2140)
+    ]
+
+    class _Gateway:
+        def __init__(self):
+            self.offsets = []
+
+        async def list_orders(self, *, offset, length, filters, **_kwargs):
+            window_rows = rows if filters["window"] == 1 else rows[-2:]
+            self.offsets.append((filters["window"], offset))
+            return SimpleNamespace(
+                items=window_rows[offset:offset + length],
+                total=len(window_rows) if reported_total is not None else None,
+            )
+
+    gateway = _Gateway()
+    discovered = asyncio.run(
+        _discover_recent_amazon_orders(
+            gateway, _config(), ({"window": 1}, {"window": 2})
+        )
+    )
+
+    assert len(discovered) == 2140
+    assert {source["platform_order_no"] for source in discovered} == {
+        row.order_number for row in rows
+    }
+    assert gateway.offsets == [(1, offset) for offset in range(0, 2140, 200)] + [
+        (2, 0)
+    ]
+
+
+@pytest.mark.parametrize("repeat_page", [True, False])
+def test_amazon_full_scan_rejects_stalled_or_incomplete_pagination(repeat_page) -> None:
+    row = SimpleNamespace(
+        global_order_no="20001",
+        order_number="112-1234567-1234567",
+        payload={
+            "status": 6,
+            "platform_name": "Amazon",
+            "item_info": [{"local_sku": "MANUAL-PRODUCT"}],
+        },
+    )
+
+    class _Gateway:
+        def __init__(self):
+            self.calls = 0
+
+        async def list_orders(self, *, offset, **_kwargs):
+            self.calls += 1
+            assert self.calls <= 2, "a broken API must not cause an endless scan"
+            return SimpleNamespace(
+                items=[row] if offset == 0 or repeat_page else [], total=2140
+            )
+
+    gateway = _Gateway()
+    reason = "made no progress" if repeat_page else "before its reported total"
+    with pytest.raises(ValueError, match=reason):
+        asyncio.run(_discover_recent_amazon_orders(gateway, _config(), ({},)))
+    assert gateway.calls == 2
+
+
+@pytest.mark.parametrize("order_deleted", [False, True])
+def test_amazon_discovery_distinguishes_deleted_products_from_deleted_orders(
+    order_deleted,
+) -> None:
+    platform = "112-1234567-1234567"
+
+    class _Gateway:
+        async def list_orders(self, **_kwargs):
+            return SimpleNamespace(
+                total=1,
+                items=[{
+                    "global_order_no": "20001",
+                    "is_delete": int(order_deleted),
+                    "status": 6,
+                    "platform_name": "Amazon",
+                    "item_info": [
+                        {"platform_order_no": platform, "local_sku": "FRAME",
+                         "product_no": "", "is_delete": 0},
+                        {"platform_order_no": platform, "local_sku": "Instruction",
+                         "product_no": "B0ORIGINAL", "is_delete": 1},
+                    ],
+                    "metadata": {"is_deleted": True},
+                }],
+            )
+
+    discovered = asyncio.run(
+        _discover_recent_amazon_orders(_Gateway(), _config(), ({},))
+    )
+    if order_deleted:
+        assert discovered == []
+    else:
+        assert len(discovered) == 1
+        assert discovered[0]["platform_order_no"] == platform
+        assert discovered[0]["eligibility_reason"] == "MANUAL_FULFILLMENT_ITEM"
+
+
+def test_deleted_product_history_keeps_live_outbound_package() -> None:
+    platform = "112-1234567-1234567"
+
+    class _Gateway(_OutboundScenarioGateway):
+        async def list_orders(self, **kwargs):
+            page = await super().list_orders(**kwargs)
+            # The original line was replaced inside an otherwise live order.
+            page.items[0].payload["item_info"].append({
+                "global_item_no": "DELETED-ORIGINAL",
+                "local_sku": "Instruction",
+                "product_no": "B0ORIGINAL",
+                "is_delete": 1,
+            })
+            return page
+
+    gateway = _Gateway(
+        [_outbound_scenario_row(tracking_no="LIVE-TRACKING")],
+        system_order_nos=("10001", "10002"),
+        order_statuses={"10001": 6, "10002": 4},
+    )
+    diagnostic = asyncio.run(diagnose_notification_outbound(gateway, platform))
+
+    assert diagnostic["outbound_state"] == "OUTBOUNDED"
+    assert diagnostic["known_customer_package_total"] == 2
+    assert diagnostic["package_complete"] == 1
+    assert diagnostic["package_missing"] == 1
+    assert [p["final_tracking_no"] for p in diagnostic["customer_packages"]] == [
+        "LIVE-TRACKING"
+    ]
+
+
 def test_full_scan_reuses_discovery_order_facts_and_reports_progress(tmp_path) -> None:
     path = tmp_path / "full-scan-performance.sqlite3"
     ShipmentWorkflowStore(path).initialize()
