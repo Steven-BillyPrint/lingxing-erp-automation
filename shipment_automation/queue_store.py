@@ -7011,17 +7011,18 @@ class ShipmentWorkflowStore:
         """
 
         from .queue_page_query import read_page_index
+        from .queue_read_limiter import queue_read_slot
 
         self.initialize()
-        observed_at = now or datetime.now(timezone.utc)
-        if observed_at.tzinfo is None:
-            observed_at = observed_at.replace(tzinfo=timezone.utc)
         active = dict(active_statuses or {})
         locks = dict(review_locks or {})
         context_key = hashlib.sha256(json.dumps(
             [active, locks], sort_keys=True, ensure_ascii=False,
         ).encode("utf-8")).hexdigest()
-        with self.connect() as conn:
+        with queue_read_slot(self.path), self.connect() as conn:
+            observed_at = now or datetime.now(timezone.utc)
+            if observed_at.tzinfo is None:
+                observed_at = observed_at.replace(tzinfo=timezone.utc)
             # SQLite's connection context alone does not start a read transaction.
             conn.execute("BEGIN")
             revision = self._queue_dataset_revision_conn(conn)

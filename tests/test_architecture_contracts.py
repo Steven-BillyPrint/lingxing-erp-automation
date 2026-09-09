@@ -115,7 +115,8 @@ def test_sqlite_connection_lifecycle_depends_only_on_standard_library() -> None:
 
 
 def test_shipment_page_policy_and_storage_adapter_do_not_depend_on_desktop() -> None:
-    for relative in ("shipment_automation/queue_policy.py", "shipment_automation/queue_page_query.py"):
+    for relative in ("shipment_automation/queue_policy.py", "shipment_automation/queue_page_query.py",
+                     "shipment_automation/queue_read_limiter.py"):
         for imported in _resolved_imports(ROOT / relative):
             assert not imported.startswith(("erp_automation", "PySide6", "playwright")), imported
     result = subprocess.run(

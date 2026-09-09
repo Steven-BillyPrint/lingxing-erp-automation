@@ -34,6 +34,7 @@ jobs:
             tests/test_coordination_state_refresh.py \
             tests/test_shipment_review_projection.py \
             tests/test_shipment_sql_pagination.py \
+            tests/test_shipment_query_concurrency.py \
             tests/test_queue_pagination.py \
             tests/test_shipment_performance_regressions.py \
             tests/test_logistics_session_reuse.py \
