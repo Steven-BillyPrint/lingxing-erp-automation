@@ -107,6 +107,11 @@ def assert_matches_reference(store, locks, overlays, **options):
     actual = ShipmentWorkflowStore(store.path, read_only=True).list_queue_page(
         review_locks=locks, active_statuses=overlays, now=NOW, **options,
     )
+    cached = ShipmentWorkflowStore(store.path, read_only=True).list_queue_page(
+        review_locks=locks, active_statuses=overlays, now=NOW,
+        cached_facets=actual["facets_cache"], **options,
+    )
+    assert cached == actual
     jobs = {row["logistics_no"]: row for row in store.list_jobs_by_logistics_nos(
         [row.logistics_no for row in expected.items if row.logistics_no and not row.scan_issue_code],
     )}
@@ -173,6 +178,18 @@ def test_empty_and_out_of_range_queue(tmp_path):
     assert result["total"] == 0
     assert result["items"] == []
     assert result["statuses"] == result["product_types"] == ()
+
+
+def test_unexpected_legacy_storage_types_keep_python_text_semantics(tmp_path):
+    store, _, _ = seed_queue(tmp_path / "legacy-types.sqlite3", count=3)
+    with store.connect() as conn:
+        conn.execute("UPDATE shipment_jobs SET platform_order_no=?, product_type=? WHERE id=2",
+                     (sqlite3.Binary(b"BLOB_ORDER"), sqlite3.Binary(b"tent | x_stands")))
+        conn.execute("UPDATE shipment_logistics SET carrier_normalized=?, chargeable_weight_kg=? WHERE job_id=2",
+                     (sqlite3.Binary(b"UPS"), sqlite3.Binary(b"0")))
+    assert_matches_reference(store, {}, {})
+    assert_matches_reference(store, {}, {}, search_query="BLOB_ORDER")
+    assert_matches_reference(store, {}, {}, product_types=("b'tent",))
 
 
 def test_hydration_total_and_revision_share_the_same_read_snapshot(tmp_path, monkeypatch):

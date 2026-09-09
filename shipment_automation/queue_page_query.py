@@ -23,6 +23,24 @@ def _text(value: object) -> str:
     return str(value or "")
 
 
+def _text_sql(expression: str) -> str:
+    # Queue columns normally have TEXT affinity. Keep their normalization in
+    # SQLite; use Python only for unexpected legacy storage types so str(value
+    # or '') retains the same behavior even for numeric zero or a BLOB.
+    return (f"CASE typeof({expression}) WHEN 'text' THEN {expression} "
+            f"WHEN 'null' THEN '' ELSE queue_text({expression}) END")
+
+
+def _filter_sql(field: str, product: str) -> str:
+    return f"""
+        (:needle = '' OR instr(queue_casefold({field}), :needle) > 0)
+        AND (:products = '[]' OR EXISTS (
+          SELECT 1 FROM json_each(queue_products({product})) product
+          JOIN json_each(:products) wanted ON wanted.value = queue_casefold(product.value)
+        ))
+    """
+
+
 def _register_functions(connection: sqlite3.Connection, now: datetime) -> None:
     observed_at = now.timestamp()
 
@@ -80,7 +98,6 @@ _COLUMNS = (
 )
 _JOB_EXPRESSIONS = {
     "carrier": "COALESCE(NULLIF(carrier_normalized, ''), carrier_raw)",
-    "actual_total": "queue_actual_total(currency, fee_amount)",
     "scan_issue_code": "''", "scan_issue_state": "''", "scan_issue_state_changed_at": "''",
 }
 _ISSUE_EXPRESSIONS = {
@@ -156,17 +173,25 @@ def read_page_index(
 
     _register_functions(connection, now)
     field = search_field if search_field in {"platform_order_no", "system_order_no"} else "platform_order_no"
-    jobs = ", ".join(f"queue_text({_JOB_EXPRESSIONS.get(name, name)}) AS {name}" for name in _COLUMNS)
+    jobs = ", ".join(
+        ("COALESCE(queue_actual_total(currency, fee_amount), '')" if name == "actual_total"
+         else _text_sql(_JOB_EXPRESSIONS.get(name, name))) + f" AS {name}"
+        for name in _COLUMNS
+    )
     issue_expressions = (_ISSUE_EXPRESSIONS.get(name, "''") for name in _COLUMNS)
-    issues = ", ".join(f"queue_text({expression}) AS {name}" for name, expression in zip(_COLUMNS, issue_expressions))
+    issues = ", ".join(f"{_text_sql(expression)} AS {name}" for name, expression in zip(_COLUMNS, issue_expressions))
     sql = f"""
-        WITH raw_jobs AS ({job_index_sql} WHERE j.identity_state <> 'SUPERSEDED'),
+        WITH raw_jobs AS (
+          {job_index_sql} WHERE j.identity_state <> 'SUPERSEDED'
+          AND (:include_facets OR ({_filter_sql(f'j.{field}', 'j.product_type')}))
+        ),
         queue_rows AS (
           SELECT 'job' AS kind, id AS record_id, 1 AS source_order,
                  '' AS issue_order_time, id AS source_id, {jobs} FROM raw_jobs
           UNION ALL
           SELECT 'issue', id, 0, updated_at, -id, {issues}
-          FROM shipment_scan_issues WHERE resolved_at IS NULL OR management_state <> 'ACTIVE'
+          FROM shipment_scan_issues WHERE (resolved_at IS NULL OR management_state <> 'ACTIVE')
+            AND (:include_facets OR ({_filter_sql(field, "''")}))
         ),
         locks AS MATERIALIZED (SELECT key, value FROM json_each(:locks)),
         overrides AS MATERIALIZED (SELECT key, value FROM json_each(:overrides)),
@@ -180,13 +205,6 @@ def read_page_index(
           FROM queue_rows q
           LEFT JOIN locks ON locks.key = queue_casefold(q.platform_order_no)
           LEFT JOIN overrides ON overrides.key = q.logistics_no
-          WHERE :include_facets OR (
-            (:needle = '' OR instr(queue_casefold(q.{field}), :needle) > 0)
-            AND (:products = '[]' OR EXISTS (
-              SELECT 1 FROM json_each(queue_products(q.product_type)) product
-              JOIN json_each(:products) wanted ON wanted.value = queue_casefold(product.value)
-            ))
-          )
         ),
         effective AS MATERIALIZED (
           SELECT kind, record_id, source_order, issue_order_time, source_id,
@@ -198,11 +216,7 @@ def read_page_index(
         filtered AS (
           SELECT * FROM effective
           WHERE (:status = '' OR display_status = :status)
-            AND (:needle = '' OR instr(queue_casefold({field}), :needle) > 0)
-            AND (:products = '[]' OR EXISTS (
-              SELECT 1 FROM json_each(queue_products(product_type)) product
-              JOIN json_each(:products) wanted ON wanted.value = queue_casefold(product.value)
-            ))
+            AND (NOT :include_facets OR ({_filter_sql(field, 'product_type')}))
         ),
         counts AS (SELECT count(*) AS total FROM filtered),
         bounds AS (
