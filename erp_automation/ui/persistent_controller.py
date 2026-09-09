@@ -38,7 +38,6 @@ from erp_automation.persistence import (
 from erp_automation.application.queue_queries import (
     QUEUE_PAGINATION_FEATURES,
     custom_order_row_from_mapping,
-    paginate_shipment_rows,
     shipment_row_from_mapping,
     sqlite_dataset_revision,
 )
@@ -472,7 +471,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         self._shipment_rule_reconciliation_completed = False
         self._custom_rows_signature: tuple[Any, ...] | None = None
         self._shipment_rows_signature: tuple[Any, ...] | None = None
-        self._shipment_page_facets_cache: tuple[object, QueueFacets] | None = None
+        self._shipment_page_facets_cache: Mapping[str, Any] | None = None
         self._task_runner = task_runner
         self._executor = _DaemonTaskExecutor(thread_name="erp-desktop-worker")
         # Scans and business workflows use independent lanes so unrelated work
@@ -2984,72 +2983,32 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
         from shipment_automation.queue_store import ShipmentWorkflowStore
 
         store = ShipmentWorkflowStore(shipment_path, read_only=True)
-        dataset_revision = store.queue_dataset_revision()
-        locks = self._shipment_review_context()
-        active_statuses = self._active_shipment_statuses()
-        revision = self._shipment_review_revision(dataset_revision, locks)
-        facets_key = (str(shipment_path), revision, tuple(sorted(active_statuses.items())))
-        with self._lock:
-            cached_facets = self._shipment_page_facets_cache
-        raw_index_rows = store.list_queue_index_rows(
-            search_field=search_field, search_query=search_query,
-        )
-        index_rows = tuple(
-            shipment_row_from_mapping(row) for row in raw_index_rows
-        )
-        index_rows = self._shipment_rows_with_review_locks(index_rows, locks)
-        page_projection = paginate_shipment_rows(
-            index_rows,
-            page=page,
-            page_size=page_size,
-            status=status,
-            search_field=search_field,
-            search_query=search_query,
-            product_types=product_types,
-            active_statuses=active_statuses,
-            dataset_revision=revision,
-        )
-        if cached_facets is not None and cached_facets[0] == facets_key:
-            facets = cached_facets[1]
-        else:
-            all_rows = index_rows if not str(search_query or "").strip() else self._shipment_rows_with_review_locks(
-                tuple(shipment_row_from_mapping(row) for row in store.list_queue_index_rows()), locks,
-            )
-            facets = paginate_shipment_rows(all_rows, page_size=1, active_statuses=active_statuses).facets
+        for attempt in range(2):
+            locks = self._shipment_review_context()
+            active_statuses = self._active_shipment_statuses()
             with self._lock:
-                self._shipment_page_facets_cache = (facets_key, facets)
-        selected_logistics_nos = tuple(
-            row.logistics_no
-            for row in page_projection.items
-            if row.logistics_no and not row.scan_issue_code
-        )
-        complete_jobs = {
-            str(row.get("logistics_no") or ""): shipment_row_from_mapping(row)
-            for row in store.list_jobs_by_logistics_nos(
-                selected_logistics_nos
+                cached_facets = self._shipment_page_facets_cache
+            result = store.list_queue_page(
+                page=page, page_size=page_size, status=status,
+                search_field=search_field, search_query=search_query,
+                product_types=product_types, active_statuses=active_statuses,
+                review_locks=locks, cached_facets=cached_facets,
             )
-        }
-        complete_issues = {
-            str(row.get("scan_issue_key") or ""): shipment_row_from_mapping(row)
-            for row in raw_index_rows
-            if str(row.get("scan_issue_key") or "")
-        }
-        complete_items = tuple(
-            (
-                complete_issues.get(row.scan_issue_key)
-                if row.scan_issue_code
-                else complete_jobs.get(row.logistics_no)
-            )
-            or row
-            for row in page_projection.items
-        )
+            if (locks == self._shipment_review_context()
+                    and active_statuses == self._active_shipment_statuses()):
+                with self._lock:
+                    self._shipment_page_facets_cache = result["facets_cache"]
+                break
+            # A busy queue may change again during the retry. Return the second
+            # coherent snapshot with its original revision, so the next summary
+            # invalidates it; never retry forever or relabel it as newer state.
         return ShipmentPage(
-            items=self._shipment_rows_with_review_locks(complete_items, locks),
-            page=page_projection.page,
-            page_size=page_projection.page_size,
-            total=page_projection.total,
-            dataset_revision=page_projection.dataset_revision,
-            facets=facets,
+            items=self._shipment_rows_with_review_locks(
+                tuple(shipment_row_from_mapping(row) for row in result["items"]), locks,
+            ),
+            page=result["page"], page_size=result["page_size"], total=result["total"],
+            dataset_revision=self._shipment_review_revision(result["dataset_revision"], locks),
+            facets=QueueFacets(statuses=result["statuses"], product_types=result["product_types"]),
         )
 
     def _snapshot_projection(self, *, include_queue_rows: bool) -> DesktopSnapshot:

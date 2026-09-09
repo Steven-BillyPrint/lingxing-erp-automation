@@ -6,6 +6,7 @@ from erp_automation.coordination.store import CoordinationStore
 from erp_automation.ui.controller import InMemoryBackgroundTaskController
 from erp_automation.ui.persistent_controller import PersistentBackgroundTaskController
 from shipment_automation.queue_store import ShipmentWorkflowStore
+from shipment_automation.models import ShipmentCandidate
 
 
 def ready_row():
@@ -61,22 +62,20 @@ def test_shared_lock_invalidates_snapshot_and_filters_before_pagination(tmp_path
         service.close()
 
 
-def test_persistent_hydration_retains_lock_and_summary_revision(tmp_path, monkeypatch):
+def test_persistent_hydration_retains_lock_and_summary_revision(tmp_path):
     controller = PersistentBackgroundTaskController(tmp_path / "runtime", recover_interrupted_task_journal=False)
     store = CoordinationStore(tmp_path / "coordination.sqlite3")
     controller.set_shipment_review_lock_provider(store.order_review_locks)
     path = controller._shipment_state_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.touch()
-    row = ready_row()
-    raw = {"platform_order_no": row.platform_order_no, "logistics_no": row.logistics_no,
-           "carrier": "FedEx", "international_tracking_no": "123", "actual_total": "10",
-           "chargeable_weight_kg": "1", "identity_state": "ACTIVE", "logistics_state": "READY", "erp_state": "PENDING"}
-    monkeypatch.setattr(ShipmentWorkflowStore, "__init__", lambda *_a, **_kw: None)
-    monkeypatch.setattr(ShipmentWorkflowStore, "list_queue_index_rows", lambda _self, **_kwargs: [raw])
-    monkeypatch.setattr(ShipmentWorkflowStore, "list_jobs_by_logistics_nos", lambda _self, _ids: [{**raw, "sku_text": "detail"}])
-    monkeypatch.setattr(ShipmentWorkflowStore, "count_all_jobs", lambda _self: (1, ""))
-    monkeypatch.setattr(ShipmentWorkflowStore, "queue_dataset_revision", lambda _self: "queue-1")
+    queue = ShipmentWorkflowStore(path)
+    queue.upsert_candidate(ShipmentCandidate(
+        platform_order_no="ORDER", system_order_no="SYS", logistics_no="ALS",
+        shipment_tag_name="自动标发", sku_text="detail",
+    ))
+    with queue.connect() as conn:
+        conn.execute("UPDATE shipment_logistics SET state = 'READY', carrier_raw = 'FedEx', "
+                     "international_tracking_no = '123', currency = 'CNY', fee_amount = '10', "
+                     "chargeable_weight_kg = '1'")
     try:
         initial = controller.summary_snapshot().shipments_summary.revision
         store.set_manual_review_locks(("order:ORDER",), task_id="old", reason="需核对")
