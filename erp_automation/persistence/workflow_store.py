@@ -13,6 +13,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
+from lingxing_automation.storage.sqlite_connection import connect_database
+
 from lingxing_automation.storage.dedupe_schema import (
     CONTACT_WRITEBACK_COMPLETE_KEY,
     FOLDER_COMPLETE_KEY,
@@ -238,11 +240,10 @@ class CustomWorkflowStore:
 
     def connect(self) -> sqlite3.Connection:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(self.path, timeout=15)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys = ON")
-        conn.execute("PRAGMA busy_timeout = 15000")
-        return conn
+        return connect_database(
+            self.path, timeout=15,
+            pragmas=("PRAGMA foreign_keys = ON", "PRAGMA busy_timeout = 15000"),
+        )
 
     def initialize(self) -> None:
         if self._initialized:

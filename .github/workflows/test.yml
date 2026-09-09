@@ -37,6 +37,13 @@ jobs:
             tests/test_logistics_session_reuse.py \
             tests/test_notification_query_performance.py \
             tests/test_task_submission_receipts.py
+          python -m pytest -q \
+            tests/test_sqlite_connection_lifecycle.py \
+            tests/test_instance_coordination.py \
+            tests/test_custom_workflow_store.py \
+            tests/test_shipment_queue_store.py \
+            tests/test_shipment_notifications.py \
+            tests/test_architecture_contracts.py
 
   windows-tests:
     name: Windows tests

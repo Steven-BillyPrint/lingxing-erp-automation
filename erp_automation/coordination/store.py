@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
+from lingxing_automation.storage.sqlite_connection import connect_database
+
 from .access import OperatorIdentity
 
 
@@ -40,12 +42,11 @@ class CoordinationStore:
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=15)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA busy_timeout = 15000")
-        connection.execute("PRAGMA journal_mode = WAL")
-        connection.execute("PRAGMA foreign_keys = ON")
-        return connection
+        return connect_database(
+            self.path, timeout=15,
+            pragmas=("PRAGMA busy_timeout = 15000", "PRAGMA journal_mode = WAL",
+                     "PRAGMA foreign_keys = ON"),
+        )
 
     def _initialize(self) -> None:
         with self._initialize_lock:
@@ -863,7 +864,7 @@ class CoordinationStore:
                     f"{self.path.stem}-before-read-cache-cleanup-{timestamp}-{suffix}.sqlite3"
                 )
                 suffix += 1
-            with self._connect() as source, sqlite3.connect(backup_path) as target:
+            with self._connect() as source, connect_database(backup_path) as target:
                 source.backup(target)
                 integrity = str(
                     target.execute("PRAGMA integrity_check").fetchone()[0]
