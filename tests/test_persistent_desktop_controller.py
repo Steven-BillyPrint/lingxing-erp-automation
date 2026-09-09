@@ -544,7 +544,13 @@ def test_task_history_streams_and_reloads_after_append_truncation_and_day_change
         assert [item.task_id for item in controller._today_task_history()] == ["first"]
 
         # Undecodable files keep the previous all-or-nothing read contract.
-        path.write_bytes(first.encode("utf-8") + b"\xff")
+        prior_stat = path.stat()
+        # Two invalid bytes ensure a new length even when Windows text writes
+        # expanded the trailing LF to CRLF. Preserve mtime deliberately: this
+        # reload assertion must not depend on filesystem timestamp resolution.
+        path.write_bytes(first.encode("utf-8") + b"\xff\xff")
+        os.utime(path, ns=(prior_stat.st_atime_ns, prior_stat.st_mtime_ns))
+        assert path.stat().st_size != prior_stat.st_size
         assert controller._today_task_history() == []
         path.unlink()
         assert controller._today_task_history() == []
