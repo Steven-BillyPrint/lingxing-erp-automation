@@ -12,6 +12,8 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
+from lingxing_automation.storage.sqlite_connection import connect_database
+
 from lingxing_automation.products.catalog import (
     identify_product_types_from_skus,
     preferred_product_type,
@@ -324,16 +326,6 @@ class TagSnapshotReconcileResult:
     resumed_logistics_numbers: tuple[str, ...] = ()
 
 
-class _ClosingReadConnection(sqlite3.Connection):
-    """A read transaction also releases its handle when leaving its context."""
-
-    def __exit__(self, *args):
-        try:
-            return super().__exit__(*args)
-        finally:
-            self.close()
-
-
 class ShipmentWorkflowStore:
     def __init__(self, path: str | Path, *, read_only: bool = False):
         self.path = Path(path)
@@ -342,22 +334,21 @@ class ShipmentWorkflowStore:
 
     def connect(self) -> sqlite3.Connection:
         if self._read_only:
-            conn = sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True, timeout=2, factory=_ClosingReadConnection)
-            conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA query_only = ON")
-            return conn
+            return connect_database(
+                self.path.resolve().as_uri() + "?mode=ro", uri=True, timeout=2,
+                pragmas=("PRAGMA query_only = ON",),
+            )
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(self.path, timeout=15)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys = ON")
-        conn.execute("PRAGMA busy_timeout = 15000")
-        return conn
+        return connect_database(
+            self.path, timeout=15,
+            pragmas=("PRAGMA foreign_keys = ON", "PRAGMA busy_timeout = 15000"),
+        )
 
     def initialize(self) -> None:
         if self._initialized:
             return
         if self.path.is_file():
-            with sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True, factory=_ClosingReadConnection) as conn:
+            with connect_database(self.path.resolve().as_uri() + "?mode=ro", uri=True) as conn:
                 version = int(conn.execute("PRAGMA user_version").fetchone()[0])
             if version == SCHEMA_VERSION:
                 self._initialized = True
@@ -966,13 +957,8 @@ class ShipmentWorkflowStore:
     def _backup_before_version(self, version: str) -> Path:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         backup_path = self.path.with_name(f"{self.path.stem}.pre_{version}_{stamp}{self.path.suffix}")
-        source = sqlite3.connect(self.path)
-        target = sqlite3.connect(backup_path)
-        try:
+        with connect_database(self.path) as source, connect_database(backup_path) as target:
             source.backup(target)
-        finally:
-            target.close()
-            source.close()
         return backup_path
 
     @staticmethod

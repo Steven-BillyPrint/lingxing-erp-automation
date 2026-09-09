@@ -12,7 +12,6 @@ import hashlib
 import json
 import os
 import shutil
-import sqlite3
 import subprocess
 import sys
 import zipfile
@@ -20,6 +19,8 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable, Sequence
+
+from lingxing_automation.storage.sqlite_connection import connect_database
 
 
 ARCHIVE_SCHEMA = "erp-automation.business-history"
@@ -314,7 +315,7 @@ def _check_sqlite_integrity(workspace: Path) -> dict[str, str]:
         if not path.is_file():
             continue
         uri = f"file:{path.resolve().as_posix()}?mode=ro"
-        with sqlite3.connect(uri, uri=True) as connection:
+        with connect_database(uri, uri=True) as connection:
             result = str(connection.execute("PRAGMA integrity_check").fetchone()[0])
         results[name] = result
         if result.lower() != "ok":

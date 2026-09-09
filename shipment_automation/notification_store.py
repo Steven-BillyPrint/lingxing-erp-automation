@@ -11,6 +11,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
+from lingxing_automation.storage.sqlite_connection import connect_database
+
 from lingxing_automation.products.catalog import (
     identify_product_types,
     identify_product_types_from_skus,
@@ -971,12 +973,11 @@ class ShipmentNotificationStore:
 
     def connect(self) -> sqlite3.Connection:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(self.path, timeout=self.timeout_seconds)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys = ON")
         busy_timeout_ms = max(1, round(self.timeout_seconds * 1000))
-        conn.execute(f"PRAGMA busy_timeout = {busy_timeout_ms}")
-        return conn
+        return connect_database(
+            self.path, timeout=self.timeout_seconds,
+            pragmas=("PRAGMA foreign_keys = ON", f"PRAGMA busy_timeout = {busy_timeout_ms}"),
+        )
 
     def try_acquire_scan_lock(
         self,

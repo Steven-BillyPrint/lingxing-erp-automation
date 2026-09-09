@@ -104,3 +104,11 @@ def test_contract_layer_depends_only_on_stdlib_and_itself() -> None:
                 continue
             violations.append(f"{path.relative_to(ROOT)} imports {imported}")
     assert not violations, "\n".join(violations)
+
+
+def test_sqlite_connection_lifecycle_depends_only_on_standard_library() -> None:
+    path = ROOT / "lingxing_automation/storage/sqlite_connection.py"
+    assert all(
+        name.partition(".")[0] in sys.stdlib_module_names
+        for name in _resolved_imports(path)
+    )

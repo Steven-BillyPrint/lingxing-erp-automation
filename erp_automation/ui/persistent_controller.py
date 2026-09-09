@@ -48,6 +48,7 @@ from erp_automation.operations.product_identity_report import (
 )
 from erp_automation.operations.scan_audit import scan_audit_directory_name
 from lingxing_automation.products.catalog import PRODUCT_IDENTITY_CATALOG_VERSION
+from lingxing_automation.storage.sqlite_connection import connect_database
 
 from .controller import ControlResult, InMemoryBackgroundTaskController
 from .models import (
@@ -433,8 +434,7 @@ def _settings_values(settings: DesktopSettings) -> dict[str, Any]:
 def _checkpoint_sqlite(path: Path) -> None:
     if not path.is_file():
         return
-    with sqlite3.connect(path, timeout=15) as connection:
-        connection.execute("PRAGMA busy_timeout = 15000")
+    with connect_database(path, timeout=15, pragmas=("PRAGMA busy_timeout = 15000",)) as connection:
         connection.execute("PRAGMA wal_checkpoint(FULL)")
 
 
