@@ -180,6 +180,13 @@ def read_page_index(
           FROM queue_rows q
           LEFT JOIN locks ON locks.key = queue_casefold(q.platform_order_no)
           LEFT JOIN overrides ON overrides.key = q.logistics_no
+          WHERE :include_facets OR (
+            (:needle = '' OR instr(queue_casefold(q.{field}), :needle) > 0)
+            AND (:products = '[]' OR EXISTS (
+              SELECT 1 FROM json_each(queue_products(q.product_type)) product
+              JOIN json_each(:products) wanted ON wanted.value = queue_casefold(product.value)
+            ))
+          )
         ),
         effective AS MATERIALIZED (
           SELECT kind, record_id, source_order, issue_order_time, source_id,

@@ -170,3 +170,56 @@ def test_monitor_reads_task_snapshot_once_for_a_hundred_tracked_tasks(tmp_path, 
     finally:
         service.close()
         controller.close()
+
+
+def test_monitor_retains_snapshot_created_after_instance_observation(tmp_path, monkeypatch):
+    controller = controller_with_queue(tmp_path, 0)
+    service = CoordinatedControllerService(
+        controller, CoordinationStore(tmp_path / "coordination.sqlite3"),
+        settings=CoordinationSettings(monitor_interval_seconds=3600),
+    )
+    service._closed.set()
+    service._monitor.join(2)
+    service._receipt_monitor.join(2)
+    original_active_instances = service.store.active_instance_ids
+    initial = {}
+
+    class OneIteration:
+        calls = 0
+
+        def wait(self, _timeout):
+            self.calls += 1
+            return self.calls > 1
+
+    def register_after_observation():
+        observed = original_active_instances()
+        if not initial:
+            # Reproduce a registration and read between the monitor's database
+            # observation and its later cache cleanup, without timing sleeps.
+            service.register("new-desktop", "New operator")
+            initial.update(service.snapshot_payload("new-desktop", summary_only=True))
+        return observed
+
+    try:
+        service._snapshot_body_times[("expired-desktop", True)] = time.monotonic() - 60
+        with monkeypatch.context() as patch:
+            patch.setattr(service, "_closed", OneIteration())
+            patch.setattr(service.store, "active_instance_ids", register_after_observation)
+            service._monitor_loop()
+        assert initial
+        assert ("expired-desktop", True) not in service._snapshot_body_times
+        fresh = service.snapshot_payload(
+            "new-desktop", known_revision=initial["revision"], summary_only=True,
+        )
+        assert fresh["unchanged"] is True
+
+        # An older cache for the same client is still evicted after its lease
+        # expires; preserving new entries must not make them immortal.
+        with monkeypatch.context() as patch:
+            patch.setattr(service, "_closed", OneIteration())
+            patch.setattr(service.store, "active_instance_ids", lambda: set())
+            service._monitor_loop()
+        assert ("new-desktop", True) not in service._snapshot_body_times
+    finally:
+        service.close()
+        controller.close()

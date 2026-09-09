@@ -727,54 +727,56 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             if not cache_current:
                 parsed: dict[str, TaskRecord] = {}
                 try:
-                    lines = path.read_text(encoding="utf-8").splitlines()
-                except (OSError, UnicodeError):
-                    lines = []
-                for line in lines:
-                    try:
-                        item = json.loads(line)
-                        task = (
-                            item.get("task")
-                            if item.get("event_type") == "task_snapshot"
-                            else None
-                        )
-                        if not isinstance(task, Mapping):
-                            continue
-                        task_id = str(task.get("task_id") or "").strip()
-                        if not task_id:
-                            continue
-                        parsed[task_id] = TaskRecord(
-                            task_id=task_id,
-                            name=str(task.get("name") or "后台任务"),
-                            area=TaskArea(
-                                str(task.get("area") or TaskArea.MAINTENANCE.value)
-                            ),
-                            capability=Capability(
-                                str(
-                                    task.get("capability")
-                                    or Capability.LIST_ORDERS.value
+                    with path.open("r", encoding="utf-8") as stream:
+                        for line in stream:
+                            try:
+                                item = json.loads(line)
+                                if not isinstance(item, Mapping):
+                                    continue
+                                task = (
+                                    item.get("task")
+                                    if item.get("event_type") == "task_snapshot"
+                                    else None
                                 )
-                            ),
-                            status=TaskStatus(
-                                str(task.get("status") or TaskStatus.QUEUED.value)
-                            ),
-                            message=str(task.get("message") or ""),
-                            order_no=str(task.get("order_no") or "") or None,
-                            progress_percent=max(
-                                0,
-                                min(100, int(task.get("progress_percent") or 0)),
-                            ),
-                            created_at=self._parse_event_datetime(
-                                task.get("created_at")
-                            ),
-                            updated_at=self._parse_event_datetime(
-                                task.get("updated_at")
-                            ),
-                            operator_name=str(task.get("operator_name") or ""),
-                            operator_email=str(task.get("operator_email") or ""),
-                        )
-                    except (TypeError, ValueError, KeyError, json.JSONDecodeError):
-                        continue
+                                if not isinstance(task, Mapping):
+                                    continue
+                                task_id = str(task.get("task_id") or "").strip()
+                                if not task_id:
+                                    continue
+                                parsed[task_id] = TaskRecord(
+                                    task_id=task_id,
+                                    name=str(task.get("name") or "后台任务"),
+                                    area=TaskArea(
+                                        str(task.get("area") or TaskArea.MAINTENANCE.value)
+                                    ),
+                                    capability=Capability(
+                                        str(
+                                            task.get("capability")
+                                            or Capability.LIST_ORDERS.value
+                                        )
+                                    ),
+                                    status=TaskStatus(
+                                        str(task.get("status") or TaskStatus.QUEUED.value)
+                                    ),
+                                    message=str(task.get("message") or ""),
+                                    order_no=str(task.get("order_no") or "") or None,
+                                    progress_percent=max(
+                                        0,
+                                        min(100, int(task.get("progress_percent") or 0)),
+                                    ),
+                                    created_at=self._parse_event_datetime(
+                                        task.get("created_at")
+                                    ),
+                                    updated_at=self._parse_event_datetime(
+                                        task.get("updated_at")
+                                    ),
+                                    operator_name=str(task.get("operator_name") or ""),
+                                    operator_email=str(task.get("operator_email") or ""),
+                                )
+                            except (TypeError, ValueError, KeyError, json.JSONDecodeError):
+                                continue
+                except (OSError, UnicodeError):
+                    parsed.clear()
                 self._task_history_cache_day = local_day
                 self._task_history_cache_signature = signature
                 self._task_history_cache = parsed
@@ -2984,7 +2986,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
 
         store = ShipmentWorkflowStore(shipment_path, read_only=True)
         for attempt in range(2):
-            locks = self._shipment_review_context()
+            locks = deepcopy(self._shipment_review_context())
             active_statuses = self._active_shipment_statuses()
             with self._lock:
                 cached_facets = self._shipment_page_facets_cache

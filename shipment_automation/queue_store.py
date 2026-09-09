@@ -7055,6 +7055,9 @@ class ShipmentWorkflowStore:
         if reuse_facets:
             result["statuses"] = cached_facets["statuses"]
             result["product_types"] = cached_facets["product_types"]
+            # The searched subset may omit the next time-based transition.
+            # Keep the global cache's original expiry when filtering early.
+            result["facets_valid_until"] = cached_facets["valid_until"]
         result["dataset_revision"] = revision
         result["facets_cache"] = {
             "dataset_revision": revision, "context_key": context_key,

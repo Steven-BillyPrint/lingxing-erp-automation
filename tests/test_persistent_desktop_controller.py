@@ -7,7 +7,7 @@ import json
 import os
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from erp_automation.configuration import (
     ConfigurationDecryptionError,
@@ -456,16 +456,16 @@ def test_today_task_history_cache_updates_incrementally_without_reparsing(
         / f"{datetime.now().astimezone():%Y-%m-%d}.jsonl"
     )
     path_type = type(history_path)
-    original_read_text = path_type.read_text
+    original_open = path_type.open
     reads = 0
 
-    def counted_read_text(path, *args, **kwargs):
+    def counted_open(path, mode="r", *args, **kwargs):
         nonlocal reads
-        if path == history_path:
+        if path == history_path and "r" in mode:
             reads += 1
-        return original_read_text(path, *args, **kwargs)
+        return original_open(path, mode, *args, **kwargs)
 
-    monkeypatch.setattr(path_type, "read_text", counted_read_text)
+    monkeypatch.setattr(path_type, "open", counted_open)
     task = TaskRecord(
         "incremental-history-task",
         "增量历史任务",
@@ -483,6 +483,85 @@ def test_today_task_history_cache_updates_incrementally_without_reparsing(
     assert any(item.task_id == task.task_id for item in first.today_tasks)
     assert any(item.task_id == task.task_id for item in second.today_tasks)
     controller.close()
+
+
+def test_task_history_streams_and_reloads_after_append_truncation_and_day_change(tmp_path, monkeypatch):
+    import erp_automation.ui.persistent_controller as module
+
+    controller = _controller(tmp_path)
+    task = TaskRecord("first", "First task", TaskArea.SHIPMENT, Capability.LIST_ORDERS,
+                      status=TaskStatus.SUCCEEDED, message="completed")
+    controller._write_task_snapshot(task)
+    path = tmp_path / "logs" / "app_events" / f"{datetime.now().astimezone():%Y-%m-%d}.jsonl"
+    first = path.read_text(encoding="utf-8").splitlines()[-1] + "\n"
+    second = json.loads(first)
+    second["task"].update(task_id="second", status="running", message="interrupted")
+    second_line = json.dumps(second, ensure_ascii=False) + "\n"
+    path.write_text(first + 'not-json\n[]\n{"event_type":"ordinary_log"}\n' + second_line, encoding="utf-8")
+    original_open = type(path).open
+    opened = []
+
+    class StreamingRead:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.stream.close()
+
+        def __iter__(self):
+            return iter(self.stream)
+
+        def read(self, *args):
+            raise AssertionError("task history must not load the entire file")
+
+        readlines = read
+
+    def stream_only(candidate, mode="r", *args, **kwargs):
+        stream = original_open(candidate, mode, *args, **kwargs)
+        if candidate.parent == path.parent and "r" in mode:
+            opened.append(stream)
+            return StreamingRead(stream)
+        return stream
+
+    monkeypatch.setattr(type(path), "open", stream_only)
+    try:
+        history = {item.task_id: item for item in controller._today_task_history()}
+        assert set(history) == {"first", "second"}
+        assert history["first"].status is TaskStatus.SUCCEEDED
+        assert history["second"].status is TaskStatus.PAUSED
+        controller._today_task_history()
+        assert len(opened) == 1
+
+        second["task"].update(status="succeeded", message="finished externally")
+        with original_open(path, "a", encoding="utf-8") as stream:
+            stream.write(json.dumps(second) + "\n")
+        history = {item.task_id: item for item in controller._today_task_history()}
+        assert history["second"].message == "finished externally"
+        path.write_text(first, encoding="utf-8")
+        assert [item.task_id for item in controller._today_task_history()] == ["first"]
+
+        # Undecodable files keep the previous all-or-nothing read contract.
+        path.write_bytes(first.encode("utf-8") + b"\xff")
+        assert controller._today_task_history() == []
+        path.unlink()
+        assert controller._today_task_history() == []
+
+        tomorrow = datetime.now().astimezone() + timedelta(days=1)
+
+        class NextDay(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return tomorrow.astimezone(tz) if tz is not None else tomorrow.replace(tzinfo=None)
+
+        (path.parent / f"{tomorrow:%Y-%m-%d}.jsonl").write_text(second_line, encoding="utf-8")
+        monkeypatch.setattr(module, "datetime", NextDay)
+        assert [item.task_id for item in controller._today_task_history()] == ["second"]
+        assert all(stream.closed for stream in opened)
+    finally:
+        controller.close()
 
 
 def test_notification_store_is_reused_across_queue_reads(tmp_path) -> None:

@@ -112,3 +112,15 @@ def test_sqlite_connection_lifecycle_depends_only_on_standard_library() -> None:
         name.partition(".")[0] in sys.stdlib_module_names
         for name in _resolved_imports(path)
     )
+
+
+def test_shipment_page_policy_and_storage_adapter_do_not_depend_on_desktop() -> None:
+    for relative in ("shipment_automation/queue_policy.py", "shipment_automation/queue_page_query.py"):
+        for imported in _resolved_imports(ROOT / relative):
+            assert not imported.startswith(("erp_automation", "PySide6", "playwright")), imported
+    result = subprocess.run(
+        [sys.executable, "-c", "import sys; import shipment_automation.queue_page_query; "
+         "assert not any(n.startswith(('erp_automation.ui', 'PySide6', 'playwright')) for n in sys.modules)"],
+        cwd=ROOT, capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout

@@ -33,6 +33,7 @@ jobs:
             tests/test_desktop_api_services.py::test_notification_rescan_retains_discovery_error_detail_in_result_and_message \
             tests/test_coordination_state_refresh.py \
             tests/test_shipment_review_projection.py \
+            tests/test_shipment_sql_pagination.py \
             tests/test_shipment_performance_regressions.py \
             tests/test_logistics_session_reuse.py \
             tests/test_notification_query_performance.py \
@@ -42,6 +43,7 @@ jobs:
             tests/test_instance_coordination.py \
             tests/test_custom_workflow_store.py \
             tests/test_shipment_queue_store.py \
+            tests/test_persistent_desktop_controller.py \
             tests/test_shipment_notifications.py \
             tests/test_architecture_contracts.py
 

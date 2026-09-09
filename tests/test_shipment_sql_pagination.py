@@ -246,3 +246,66 @@ def test_tracking_deadline_invalidates_cached_facets_without_database_write(tmp_
     assert first["statuses"] == ("等待物流就绪",)
     assert second["statuses"] == ("物流逾期异常",)
     assert first["dataset_revision"] == second["dataset_revision"]
+
+
+def test_cached_search_filters_before_status_evaluation_and_preserves_global_expiry(tmp_path, monkeypatch):
+    from shipment_automation import queue_page_query
+
+    store, _, _ = seed_queue(tmp_path / "filtered.sqlite3", count=30)
+    with store.connect() as conn:
+        conn.execute("UPDATE shipment_jobs SET lease_until=? WHERE id=1",
+                     ((NOW + timedelta(seconds=1)).isoformat(),))
+    first = store.list_queue_page(now=NOW)
+    transitions = []
+    original = queue_page_query.shipment_tracking_deadline
+
+    def count_transition(**options):
+        transitions.append(options)
+        return original(**options)
+
+    monkeypatch.setattr(queue_page_query, "shipment_tracking_deadline", count_transition)
+    searched = store.list_queue_page(now=NOW, search_query="ORDER-0001", cached_facets=first["facets_cache"])
+    assert searched["total"] == 1
+    assert len(transitions) == 1
+    assert searched["statuses"] == first["statuses"]
+    assert searched["product_types"] == first["product_types"]
+    assert searched["facets_cache"]["valid_until"] == first["facets_cache"]["valid_until"]
+    assert searched["facets_cache"]["valid_until"] == (NOW + timedelta(seconds=1)).timestamp()
+    transitions.clear()
+    store.list_queue_page(now=NOW + timedelta(seconds=1), search_query="ORDER-0001", cached_facets=searched["facets_cache"])
+    assert len(transitions) > 1
+
+
+@pytest.mark.parametrize("keeps_changing", [False, True])
+def test_controller_retries_changed_dynamic_state_at_most_once(tmp_path, monkeypatch, keeps_changing):
+    from erp_automation.ui.persistent_controller import PersistentBackgroundTaskController
+
+    controller = PersistentBackgroundTaskController(tmp_path, recover_interrupted_task_journal=False)
+    store, _, _ = seed_queue(controller._shipment_state_path(), count=3)
+    calls = []
+    active = {"ALS-0001": "synthetic-a"}
+    original = ShipmentWorkflowStore.list_queue_page
+
+    def change_after_read(reader, **options):
+        calls.append(dict(options["active_statuses"]))
+        result = original(reader, **options)
+        active["ALS-0001"] = "synthetic-b" if len(calls) == 1 or not keeps_changing else "synthetic-c"
+        return result
+
+    monkeypatch.setattr(controller, "_active_shipment_statuses", lambda: dict(active))
+    monkeypatch.setattr(ShipmentWorkflowStore, "list_queue_page", change_after_read)
+    try:
+        page = controller.list_shipment_page(status="synthetic-b")
+        assert len(calls) == 2
+        assert calls[0]["ALS-0001"] == "synthetic-a"
+        assert calls[1]["ALS-0001"] == "synthetic-b"
+        assert [row.logistics_no for row in page.items] == ["ALS-0001"]
+        assert page.total == 1
+        assert "synthetic-b" in page.facets.statuses
+        assert page.dataset_revision == store.queue_dataset_revision()
+        if keeps_changing:
+            assert controller._shipment_page_facets_cache is None
+        else:
+            assert controller._shipment_page_facets_cache["statuses"] == page.facets.statuses
+    finally:
+        controller.close()
