@@ -1222,7 +1222,14 @@ class CoordinatedControllerService:
         evicted = 0
         for key, controller, observed_last_used in candidates:
             try:
-                if any(not task.status.terminal for task in _task_records(controller)):
+                if any(
+                    not task.status.terminal or bool(task.payload.get("_manual_review_lock"))
+                    for task in _task_records(controller)
+                ):
+                    continue
+                # Terminal tasks can still own a pending desktop interaction
+                # or an unverified external result. Reclaim after resolution.
+                if controller.pending_interactions():
                     continue
             except Exception:
                 continue
@@ -3604,6 +3611,7 @@ class CoordinatedControllerService:
     def _monitor_loop(self) -> None:
         while not self._closed.wait(self.settings.monitor_interval_seconds):
             try:
+                instances_observed_at = time.monotonic()
                 active_instances = self.store.active_instance_ids()
                 tasks_by_controller: dict[int, dict[str, TaskRecord] | None] = {}
                 for task_id in tuple(self._tracked_tasks):
@@ -3724,7 +3732,10 @@ class CoordinatedControllerService:
                 with self._snapshot_lock:
                     self._snapshot_body_times = {
                         key: timestamp for key, timestamp in self._snapshot_body_times.items()
-                        if key[0] in active_instances
+                        # Registration can occur after the active-instance
+                        # read. Retain snapshots created since that read; the
+                        # next iteration can retire them if still inactive.
+                        if key[0] in active_instances or timestamp >= instances_observed_at
                     }
                 # Task leases are released only after a terminal snapshot. A
                 # delayed monitor iteration must not erase a still-running

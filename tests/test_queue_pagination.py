@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import json
 import time
+import threading
+
+import pytest
 
 from erp_automation.application.queue_queries import (
     paginate_custom_order_rows,
@@ -13,11 +16,14 @@ from erp_automation.contracts.models import (
     CustomOrderRow,
     DatasetSummary,
     DesktopSnapshot,
+    DesktopInteractionRequest,
     QueueFacets,
     ShipmentPage,
     ShipmentRow,
     TaskArea,
     TaskCommand,
+    TaskRecord,
+    TaskStatus,
 )
 from erp_automation.coordination.codec import (
     decode_custom_order_page,
@@ -486,3 +492,60 @@ def test_operator_controller_reclamation_can_be_disabled(tmp_path) -> None:
         assert created[0].closed is False
     finally:
         service.close()
+
+
+@pytest.mark.parametrize("pending", ["manual_review", "interaction"])
+def test_idle_controller_preserves_pending_review_or_interaction(tmp_path, pending):
+    from erp_automation.ui.persistent_controller import PersistentBackgroundTaskController
+
+    created = []
+
+    def factory(_identity):
+        controller = PersistentBackgroundTaskController(
+            tmp_path / "runtime", recover_interrupted_task_journal=False,
+            initial=DesktopSnapshot(tasks=[TaskRecord(
+                "review-task", "Review external result", TaskArea.SHIPMENT, Capability.OUTBOUND_ORDER,
+                status=TaskStatus.BLOCKED,
+                payload={"_manual_review_lock": True} if pending == "manual_review" else {},
+            )]),
+        )
+        if pending == "interaction":
+            controller._pending_interactions["confirm"] = DesktopInteractionRequest(
+                "confirm", "review-task", "review", "Review", "Confirm external result", non_blocking=True,
+            )
+        created.append(controller)
+        return controller
+
+    service = CoordinatedControllerService(
+        None, CoordinationStore(tmp_path / "coordination.sqlite3"), controller_factory=factory,
+        settings=CoordinationSettings(operator_controller_idle_seconds=60, monitor_interval_seconds=3600),
+    )
+    identity = OperatorIdentity("alice@billyprint.com", "Alice", "alice-subject")
+    service.register("alice-pc", "PC", identity=identity)
+    service.snapshot_payload("alice-pc", identity=identity, summary_only=True)
+    controller = created[0]
+    # Start real executor threads with local no-op work so release is checked
+    # against actual thread lifetime, not just a mock close() flag.
+    workers = [executor.submit(threading.current_thread).result(timeout=2)
+               for executor in controller._active_executors()]
+    assert workers and all(worker.is_alive() for worker in workers)
+    service.store.deregister("alice-pc")
+    service._operator_controller_last_used[identity.email] -= 61
+    try:
+        assert service._evict_idle_operator_controllers(set()) == 0
+        assert all(worker.is_alive() for worker in workers)
+        if pending == "manual_review":
+            with controller._lock:
+                controller._set_manual_review_lock_locked("review-task", enabled=False)
+        else:
+            controller._pending_interactions.clear()
+        assert service._evict_idle_operator_controllers(set()) == 1
+        assert identity.email not in service._operator_controllers
+        assert identity.email not in service._operator_controller_last_used
+        assert identity.email not in service._last_snapshot_fingerprints
+        for worker in workers:
+            worker.join(timeout=2)
+            assert not worker.is_alive()
+    finally:
+        service.close()
+        controller.close()

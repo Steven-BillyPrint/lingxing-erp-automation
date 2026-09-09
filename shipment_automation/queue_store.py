@@ -14,6 +14,8 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from lingxing_automation.storage.sqlite_connection import connect_database
 
+from .queue_policy import actual_total as format_actual_total, tracking_validated
+
 from lingxing_automation.products.catalog import (
     identify_product_types_from_skus,
     preferred_product_type,
@@ -735,9 +737,13 @@ class ShipmentWorkflowStore:
     def queue_dataset_revision(self) -> str:
         self.initialize()
         with self.connect() as conn:
-            row = conn.execute(
-                "SELECT generation, revision FROM shipment_queue_revision WHERE singleton = 1"
-            ).fetchone()
+            return self._queue_dataset_revision_conn(conn)
+
+    @staticmethod
+    def _queue_dataset_revision_conn(conn: sqlite3.Connection) -> str:
+        row = conn.execute(
+            "SELECT generation, revision FROM shipment_queue_revision WHERE singleton = 1"
+        ).fetchone()
         return f"{row[0]}:{row[1]}"
 
     def _reconcile_cancelled_logistics_states_conn(
@@ -2256,12 +2262,10 @@ class ShipmentWorkflowStore:
             for value in raw_item_ids
             if str(value or "").strip()
         ) if isinstance(raw_item_ids, list) else ()
-        actual_total = None
+        actual_total = format_actual_total(item.get("currency"), item.get("fee_amount"))
         carrier = item.get("carrier_normalized") or item.get("carrier_raw")
         tracking_no = item.get("international_tracking_no")
         tracking_validated = self._tracking_validated(item)
-        if item.get("fee_amount"):
-            actual_total = f"{item.get('currency')} {item.get('fee_amount')}".strip()
         item.update(
             {
                 "job_id": item["id"],
@@ -2326,16 +2330,7 @@ class ShipmentWorkflowStore:
     @staticmethod
     def _tracking_validated(row: Mapping[str, Any]) -> bool:
         carrier = row.get("carrier_normalized") or row.get("carrier_raw")
-        tracking_no = row.get("international_tracking_no")
-        return bool(
-            str(carrier or "").strip()
-            and str(tracking_no or "").strip()
-            and (
-                str(row.get("logistics_state") or "").strip().upper()
-                == LOGISTICS_READY
-                or tracking_number_matches_carrier(carrier, tracking_no)
-            )
-        )
+        return tracking_validated(carrier, row.get("international_tracking_no"), row.get("logistics_state"))
 
     def _historical_overdue_resolution_at_conn(
         self,
@@ -6791,42 +6786,43 @@ class ShipmentWorkflowStore:
             params.append(limit)
         with self.connect() as conn:
             records = [dict(row) for row in conn.execute(sql, params).fetchall()]
-        return [
-            {
-                "job_id": f"scan-issue-{item['id']}",
-                "scan_issue_key": f"{SCAN_ISSUE_KEY_PREFIX}{item['id']}",
-                "scan_issue_state": str(
-                    item.get("management_state") or SCAN_ISSUE_ACTIVE
-                ),
-                "scan_issue_reason": str(item.get("management_reason") or ""),
-                "scan_issue_state_changed_at": str(
-                    item.get("management_updated_at") or ""
-                ),
-                "platform_order_no": item["platform_order_no"],
-                "system_order_no": item["system_order_no"],
-                "shipment_tag_name": item["shipment_tag_name"],
-                "tag_text": item["tag_text"],
-                "status_text": item["source_status_text"],
-                "source_status_text": item["source_status_text"],
-                "logistics_no": "",
-                "customer_shipping_service": "",
-                "identity_state": "SCAN_ERROR",
-                "identity_status_text": "扫描错误",
-                "logistics_state": "",
-                "erp_state": "",
-                "erp_checkpoint": "NONE",
-                "last_error": item["error_message"],
-                "logistics_last_error": "",
-                "erp_last_error": "",
-                "email_last_error": "",
-                "scan_issue_code": item["issue_code"],
-                "first_seen_at": item["first_seen_at"],
-                "last_seen_at": item["last_seen_at"],
-                "last_scanned_at": item["last_seen_at"],
-                "updated_at": item["updated_at"],
-            }
-            for item in records
-        ]
+        return [self._scan_issue_mapping(item) for item in records]
+
+    @staticmethod
+    def _scan_issue_mapping(item: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            "job_id": f"scan-issue-{item['id']}",
+            "scan_issue_key": f"{SCAN_ISSUE_KEY_PREFIX}{item['id']}",
+            "scan_issue_state": str(
+                item.get("management_state") or SCAN_ISSUE_ACTIVE
+            ),
+            "scan_issue_reason": str(item.get("management_reason") or ""),
+            "scan_issue_state_changed_at": str(
+                item.get("management_updated_at") or ""
+            ),
+            "platform_order_no": item["platform_order_no"],
+            "system_order_no": item["system_order_no"],
+            "shipment_tag_name": item["shipment_tag_name"],
+            "tag_text": item["tag_text"],
+            "status_text": item["source_status_text"],
+            "source_status_text": item["source_status_text"],
+            "logistics_no": "",
+            "customer_shipping_service": "",
+            "identity_state": "SCAN_ERROR",
+            "identity_status_text": "扫描错误",
+            "logistics_state": "",
+            "erp_state": "",
+            "erp_checkpoint": "NONE",
+            "last_error": item["error_message"],
+            "logistics_last_error": "",
+            "erp_last_error": "",
+            "email_last_error": "",
+            "scan_issue_code": item["issue_code"],
+            "first_seen_at": item["first_seen_at"],
+            "last_seen_at": item["last_seen_at"],
+            "last_scanned_at": item["last_seen_at"],
+            "updated_at": item["updated_at"],
+        }
 
     @staticmethod
     def _scan_issue_id_from_key(value: object) -> int | None:
@@ -6992,6 +6988,84 @@ class ShipmentWorkflowStore:
             jobs = [self._flatten(row) for row in conn.execute(sql, params).fetchall()]
         rows = [*self.list_active_scan_issues(), *jobs]
         return rows[:limit] if limit > 0 else rows
+
+    def list_queue_page(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = 50,
+        status: str = "",
+        search_field: str = "platform_order_no",
+        search_query: str = "",
+        product_types: Sequence[str] = (),
+        active_statuses: Mapping[str, str] | None = None,
+        review_locks: Mapping[str, Any] | None = None,
+        now: datetime | None = None,
+        cached_facets: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Page and hydrate one consistent read snapshot, without loading the queue.
+
+        Dynamic state is a frozen input from the application, never persisted as
+        business state. The cache contains aggregates only and is valid until the
+        first possible time-based status transition or a data/context change.
+        """
+
+        from .queue_page_query import read_page_index
+        from .queue_read_limiter import queue_read_slot
+
+        self.initialize()
+        active = dict(active_statuses or {})
+        locks = dict(review_locks or {})
+        context_key = hashlib.sha256(json.dumps(
+            [active, locks], sort_keys=True, ensure_ascii=False,
+        ).encode("utf-8")).hexdigest()
+        with queue_read_slot(self.path), self.connect() as conn:
+            observed_at = now or datetime.now(timezone.utc)
+            if observed_at.tzinfo is None:
+                observed_at = observed_at.replace(tzinfo=timezone.utc)
+            # SQLite's connection context alone does not start a read transaction.
+            conn.execute("BEGIN")
+            revision = self._queue_dataset_revision_conn(conn)
+            reuse_facets = bool(
+                cached_facets is not None
+                and cached_facets.get("dataset_revision") == revision
+                and cached_facets.get("context_key") == context_key
+                and observed_at.timestamp() >= cached_facets.get("sampled_at", float("inf"))
+                and (cached_facets.get("valid_until") is None
+                     or observed_at.timestamp() < cached_facets["valid_until"])
+            )
+            result = read_page_index(
+                conn, job_index_sql=self._queue_index_sql(), page=page, page_size=page_size,
+                status=status, search_field=search_field, search_query=search_query,
+                product_types=product_types, active_statuses=active, review_locks=locks,
+                now=observed_at, include_facets=not reuse_facets,
+            )
+            selected = result.pop("selected")
+            records: dict[tuple[str, int], dict[str, Any]] = {}
+            job_ids = [int(identifier) for kind, identifier in selected if kind == "job"]
+            if job_ids:
+                placeholders = ",".join("?" for _ in job_ids)
+                for row in conn.execute(self._aggregate_sql() + f" WHERE j.id IN ({placeholders})", job_ids):
+                    records[("job", int(row["id"]))] = self._flatten(row)
+            issue_ids = [int(identifier) for kind, identifier in selected if kind == "issue"]
+            if issue_ids:
+                placeholders = ",".join("?" for _ in issue_ids)
+                for row in conn.execute(f"SELECT * FROM shipment_scan_issues WHERE id IN ({placeholders})", issue_ids):
+                    records[("issue", int(row["id"]))] = self._scan_issue_mapping(dict(row))
+            result["items"] = [records[(kind, int(identifier))] for kind, identifier in selected]
+        if reuse_facets:
+            result["statuses"] = cached_facets["statuses"]
+            result["product_types"] = cached_facets["product_types"]
+            # The searched subset may omit the next time-based transition.
+            # Keep the global cache's original expiry when filtering early.
+            result["facets_valid_until"] = cached_facets["valid_until"]
+        result["dataset_revision"] = revision
+        result["facets_cache"] = {
+            "dataset_revision": revision, "context_key": context_key,
+            "sampled_at": observed_at.timestamp(), "valid_until": result.pop("facets_valid_until"),
+            "statuses": result["statuses"], "product_types": result["product_types"],
+        }
+        return result
 
     def list_queue_index_rows(
         self, *, search_field: str = "platform_order_no", search_query: str = "",
