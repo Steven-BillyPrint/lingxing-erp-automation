@@ -9,6 +9,8 @@ from email.utils import parseaddr
 from typing import Any, Iterable, Mapping, Sequence
 from urllib.parse import quote
 
+from erp_automation.domain.contact_phone import phone_placeholder_reason
+
 from .alibaba_logistics import (
     REAL_OVERSEAS_CARRIER_DISPLAY_NAMES,
     infer_carrier_from_tracking_number,
@@ -381,6 +383,8 @@ def stable_package_label(sequence: int) -> str:
 def normalize_phone(value: str | None) -> str | None:
     text = str(value or "").strip()
     if not text:
+        return None
+    if phone_placeholder_reason(text):
         return None
     if _E164_RE.fullmatch(text):
         return text

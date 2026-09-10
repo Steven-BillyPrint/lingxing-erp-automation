@@ -836,6 +836,7 @@ async def find_contact_from_system_orders(page, system_order_nos: list[str]) -> 
     partial_system_order_no: str | None = None
     partial_contact: ContactInfo | None = None
     partial_texts: list[str] = []
+    rejected_contact: tuple[str, ContactInfo, list[str]] | None = None
     for system_order_no in system_order_nos:
         contact, texts = await extract_contact_from_system_order(page, system_order_no)
         if not fallback_texts:
@@ -847,6 +848,10 @@ async def find_contact_from_system_orders(page, system_order_nos: list[str]) -> 
             partial_system_order_no = system_order_no
             partial_contact = contact
             partial_texts = texts
+        if contact.phone_rejection_reason and rejected_contact is None:
+            rejected_contact = (system_order_no, contact, texts)
     if partial_contact is not None:
         return partial_system_order_no, partial_contact, partial_texts
+    if rejected_contact is not None:
+        return rejected_contact
     return None, None, fallback_texts

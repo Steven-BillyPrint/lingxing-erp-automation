@@ -7,7 +7,7 @@ import json
 import re
 import time
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -56,6 +56,8 @@ from ..parsers.contact import (
     has_supported_contact_prompt,
     missing_contact_fields,
     normalize_text,
+    phone_skip_message,
+    sanitize_contact_phone,
 )
 from ..parsers.orders import guess_search_kind, validate_search_snapshot
 from ..products.car_magnets import PRODUCT_TYPE_CAR_MAGNET
@@ -323,6 +325,7 @@ def _contact_write_delta(
     current_values: Mapping[str, str],
 ) -> ContactInfo:
     """Return only fields whose normalized current value differs."""
+    contact = sanitize_contact_phone(contact)
 
     phone = contact.phone
     if phone and verify_saved_contact_values(
@@ -336,12 +339,10 @@ def _contact_write_delta(
         dict(current_values),
     ) is None:
         email = None
-    return ContactInfo(
+    return replace(
+        contact,
         phone=phone,
         email=email,
-        source_count=contact.source_count,
-        source_excerpt=contact.source_excerpt,
-        customization_text=contact.customization_text,
     )
 
 
@@ -462,7 +463,7 @@ async def confirm_writeback_in_cmd(context: dict[str, Any]) -> bool:
     if phone:
         print(f"电话：{before_values.get('phone') or '-'} -> {after_fill_values.get('phone') or phone}")
     else:
-        print("电话：定制化信息未提取，本次不写入")
+        print(context.get("phone_skip_message") or "电话：定制化信息未提取，本次不写入")
     if email:
         print(f"买家邮箱：{before_values.get('email') or '-'} -> {after_fill_values.get('email') or email}")
     else:
@@ -2837,6 +2838,8 @@ async def choose_contact_candidate_in_cmd(
         print(f"已提取电话：{contact.phone or '-'}")
         print(f"已提取买家邮箱：{contact.email or '-'}")
         print(f"缺少字段：{'、'.join(missing_fields)}")
+        if contact.phone_rejection_reason:
+            print(phone_skip_message(contact))
         answer = await asyncio.to_thread(input, "是否只写入已提取到的联系方式？输入 y 确认，输入其它内容跳过：")
         return contact if answer.strip().lower() in {"y", "yes", "1"} else None
 
@@ -3575,7 +3578,19 @@ async def _process_batch_order_item_impl(
         return payload
 
     contact_started = time.monotonic()
-    contact_candidates = extract_contact_candidates_from_json_items(getattr(zip_bundle, "customization_items", []) if zip_bundle is not None else [])
+    phone_rejections: list[str] = []
+    parsed_contacts = extract_contact_candidates_from_json_items(
+        getattr(zip_bundle, "customization_items", []) if zip_bundle is not None else [],
+        phone_rejections=phone_rejections,
+    )
+    contact_candidates: list[ContactInfo] = []
+    for candidate in parsed_contacts:
+        candidate = sanitize_contact_phone(candidate)
+        if candidate.phone_rejection_reason:
+            phone_rejections.append(candidate.phone_rejection_reason)
+        if candidate.phone or candidate.email:
+            contact_candidates.append(candidate)
+    payload["phone_rejections"] = list(dict.fromkeys(phone_rejections))
     contact_writeback_already_done = bool(
         dedupe_read_enabled and is_contact_writeback_done(dedupe_path, item.platform_order_no)
     )
@@ -3587,6 +3602,7 @@ async def _process_batch_order_item_impl(
             "email": contact.email,
             "missing_fields": missing_contact_fields(contact),
             "source_excerpt": contact.source_excerpt,
+            "phone_rejection_reason": contact.phone_rejection_reason,
         }
         for contact in contact_candidates
     ]
@@ -3603,7 +3619,17 @@ async def _process_batch_order_item_impl(
 
     skip_contact_writeback = False
     contact_stage_status = "written"
-    if contact_writeback_already_done and not contact_candidates:
+    if phone_rejections and not contact_candidates:
+        selected_contact = ContactInfo(
+            phone=None, email=None, source_count=0, source_excerpt="zip JSON rejected phone",
+            phone_rejection_reason=phone_rejections[0],
+        )
+        skip_contact_writeback = True
+        contact_stage_status = "skipped_invalid_phone"
+        payload["contact_writeback_skipped"] = True
+        payload["contact_writeback_skip_reason"] = "invalid_phone_no_usable_contact"
+        print(phone_skip_message(selected_contact) + "没有可更新的邮箱，本次不保存联系方式。")
+    elif contact_writeback_already_done and not contact_candidates:
         selected_contact = ContactInfo(phone=None, email=None, source_count=0, source_excerpt="zip JSON missing contact")
         skip_contact_writeback = True
         contact_stage_status = "already_done"
@@ -3637,6 +3663,15 @@ async def _process_batch_order_item_impl(
             await close_order_detail_dialog(page)
         return payload
 
+    selected_contact = sanitize_contact_phone(selected_contact)
+    if not selected_contact.phone and not selected_contact.email and selected_contact.phone_rejection_reason:
+        skip_contact_writeback = True
+        contact_stage_status = "skipped_invalid_phone"
+        payload["contact_writeback_skipped"] = True
+        payload["contact_writeback_skip_reason"] = "invalid_phone_no_usable_contact"
+    payload["phone_rejection_reason"] = selected_contact.phone_rejection_reason
+    payload["phone_writeback_skipped"] = not bool(selected_contact.phone)
+    payload["phone_skip_message"] = phone_skip_message(selected_contact)
     payload["phone"] = selected_contact.phone
     payload["email"] = selected_contact.email
     payload["customer_email_provided"] = bool(selected_contact.email)
@@ -3667,7 +3702,7 @@ async def _process_batch_order_item_impl(
     contact_verification_method: str | None = None
     if skip_contact_writeback:
         saved = True
-        message = (
+        message = phone_skip_message(selected_contact) or (
             "联系方式此前已完成，本轮跳过写回。"
             if contact_writeback_already_done
             else "定制化 JSON 中没有电话/邮箱，本次不写回联系方式。"
@@ -3754,6 +3789,10 @@ async def _process_batch_order_item_impl(
                 message=message,
                 before_values=dict(current_contact_values),
             )
+        if selected_contact.phone_rejection_reason:
+            note = phone_skip_message(selected_contact)
+            if note not in message:
+                message += " " + note
         payload["contact_writeback_source"] = "browser"
         payload["contact_write_status"] = writeback_result.status
         payload["contact_write_mutated"] = writeback_result.mutated
@@ -4066,7 +4105,9 @@ async def _process_batch_order_item_impl(
                 else:
                     payload["status"] = "updated"
                     payload["message"] = (
-                        "联系方式此前已完成，本轮跳过写回；文件夹和定制文件已完成，已加入最终完成列表。"
+                        phone_skip_message(selected_contact) + "没有可更新的邮箱，本次不保存联系方式；文件夹和定制文件已完成。"
+                        if skip_contact_writeback and selected_contact.phone_rejection_reason
+                        else "联系方式此前已完成，本轮跳过写回；文件夹和定制文件已完成，已加入最终完成列表。"
                         if contact_writeback_already_done
                         else "定制化 JSON 中没有电话/邮箱，本次不写回联系方式；文件夹和定制文件已完成，已加入最终完成列表。"
                         if skip_contact_writeback
@@ -4135,7 +4176,7 @@ async def process_batch_order_item(
     """Process one order and close any initialized detail on every exit path."""
 
     try:
-        return await _process_batch_order_item_impl(
+        payload = await _process_batch_order_item_impl(
             page,
             item,
             amazon_quantity_client,
@@ -4157,6 +4198,10 @@ async def process_batch_order_item(
             validated_search_context=validated_search_context,
             api_order_context=api_order_context,
         )
+        note = str(payload.get("phone_skip_message") or "")
+        if note and note not in str(payload.get("message") or ""):
+            payload["message"] = f"{payload.get('message') or ''} {note}".strip()
+        return payload
     finally:
         underlying_page = (
             page.page if isinstance(page, _LazyContactOrderPage) else page
@@ -4214,6 +4259,7 @@ def build_detail_text_preview(texts: list[str], *, limit: int = 8, width: int = 
 
 def contact_writeback_fields(contact: ContactInfo) -> list[str]:
     """提取联系方式写回相关字段，供结果消息和日志复用。"""
+    contact = sanitize_contact_phone(contact)
     fields: list[str] = []
     if contact.phone:
         fields.append("电话")
@@ -4224,6 +4270,7 @@ def contact_writeback_fields(contact: ContactInfo) -> list[str]:
 
 def build_writeback_success_message(contact: ContactInfo) -> str:
     """生成联系方式写回成功后的用户提示消息。"""
+    contact = sanitize_contact_phone(contact)
     fields = contact_writeback_fields(contact)
     missing_fields = missing_contact_fields(contact)
     field_text = "、".join(fields) if fields else "无字段"
@@ -4231,15 +4278,17 @@ def build_writeback_success_message(contact: ContactInfo) -> str:
         return (
             f"成功写回：{field_text}。缺少 {'、'.join(missing_fields)}，"
             "但用户已确认部分写入；文件夹和定制文件已完成，已加入最终完成列表，后续不再巡检。"
+            + phone_skip_message(contact)
         )
     return "已校验平台单号/系统单号并成功写回：电话、买家邮箱；文件夹和定制文件已完成，已加入最终完成列表，后续不再巡检。"
 
 
 def build_writeback_without_processed_message(contact: ContactInfo) -> str:
     """兼容旧调用方，仅返回联系方式阶段本身的简短结果。"""
+    contact = sanitize_contact_phone(contact)
     fields = contact_writeback_fields(contact)
     field_text = "、".join(fields) if fields else "无字段"
-    return f"联系方式处理完成：{field_text}。"
+    return f"联系方式处理完成：{field_text}。" + phone_skip_message(contact)
 
 
 def build_candidate_debug_summary(debug: dict[str, Any]) -> dict[str, Any]:
@@ -4549,6 +4598,10 @@ _BATCH_ITEM_BASE_KEYS: tuple[str, ...] = (
     "recipient_name",
     "recipient_name_source",
     "phone",
+    "phone_rejection_reason",
+    "phone_rejections",
+    "phone_writeback_skipped",
+    "phone_skip_message",
     "email",
     "shipping_address_text",
     "writeback_fields",
@@ -5613,17 +5666,30 @@ async def run_once(args: argparse.Namespace) -> SyncResult:
                     else ""
                 )
                 zip_bundle = single_folder_context.get("zip_bundle")
+                single_phone_rejections: list[str] = []
                 json_contacts = extract_contact_candidates_from_json_items(
-                    getattr(zip_bundle, "customization_items", []) if zip_bundle is not None else []
+                    getattr(zip_bundle, "customization_items", []) if zip_bundle is not None else [],
+                    phone_rejections=single_phone_rejections,
                 )
                 if json_contacts:
                     contact = json_contacts[0]
+                elif single_phone_rejections:
+                    contact = ContactInfo(
+                        None, None, 0, "zip JSON rejected phone",
+                        phone_rejection_reason=single_phone_rejections[0],
+                    )
         except Exception:
             single_folder_item = None
 
+        contact = sanitize_contact_phone(contact)
+        result.phone = contact.phone
+        result.email = contact.email
         missing_fields = missing_contact_fields(contact)
         skip_single_contact_writeback = bool(
-            single_folder_item and not (contact.phone or contact.email) and single_folder_context.get("zip_bundle") is not None
+            not (contact.phone or contact.email) and (
+                contact.phone_rejection_reason
+                or (single_folder_item and single_folder_context.get("zip_bundle") is not None)
+            )
         )
         if missing_fields and not (contact.phone or contact.email) and not skip_single_contact_writeback:
             result.screenshot_file = await save_screenshot(page, log_dir, "no_contact_found")
@@ -5667,9 +5733,12 @@ async def run_once(args: argparse.Namespace) -> SyncResult:
             )
         else:
             if skip_single_contact_writeback:
-                notify_no_contact_writeback_in_cmd(single_folder_item.platform_order_no, single_folder_item.system_order_no)
+                if contact.phone_rejection_reason:
+                    print(phone_skip_message(contact))
+                elif single_folder_item:
+                    notify_no_contact_writeback_in_cmd(single_folder_item.platform_order_no, single_folder_item.system_order_no)
                 updated = list(system_order_nos)
-                update_messages = ["定制化 JSON 中没有电话/邮箱，本次不写回联系方式。"]
+                update_messages = [phone_skip_message(contact) or "定制化 JSON 中没有电话/邮箱，本次不写回联系方式。"]
             else:
                 expected_platform_order_no = args.order_no if search_kind == "platform" else None
                 updated, update_messages = await update_contact_for_system_orders(
@@ -5689,6 +5758,10 @@ async def run_once(args: argparse.Namespace) -> SyncResult:
                     if skip_single_contact_writeback
                     else f"已从系统单号 {source_system_order_no} 获取联系方式，并写回 {len(updated)} 个系统单号。"
                 )
+                if contact.phone_rejection_reason:
+                    result.message = phone_skip_message(contact) + (
+                        "没有可更新的邮箱，已跳过联系方式保存。" if skip_single_contact_writeback else "买家邮箱已更新。"
+                    )
             else:
                 result.status = "needs_manual_save"
                 result.message = (
@@ -5775,6 +5848,9 @@ async def run_once(args: argparse.Namespace) -> SyncResult:
                     dedupe_write_enabled=not bool(getattr(args, "no_dedupe_write", False)),
                 )
 
+        note = phone_skip_message(contact)
+        if note and note not in result.message:
+            result.message = f"{result.message} {note}"
         write_result(log_dir, result, contact=contact, texts=texts)
         return result
     except Exception as exc:

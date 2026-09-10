@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass, replace
 from typing import Iterable
+
+from erp_automation.domain.contact_phone import phone_placeholder_reason
 
 from ..constants import (
     EMAIL_LABEL_RE,
@@ -110,9 +113,40 @@ def _normalize_phone_digits(raw: str, *, trim_trailing_noise: bool) -> str | Non
     return f"+{digits}" if has_plus else digits
 
 
+@dataclass(frozen=True)
+class PhoneAssessment:
+    phone: str | None = None
+    rejection_reason: str | None = None
+
+
+def assess_phone(value: str | None, *, trim_trailing_noise: bool = False) -> PhoneAssessment:
+    """Normalize a supplied phone and distinguish invalid input from no answer."""
+    if not str(value or "").strip():
+        return PhoneAssessment()
+    phone = _normalize_phone_digits(value, trim_trailing_noise=trim_trailing_noise)
+    reason = phone_placeholder_reason(phone or value)
+    if reason is None and phone is None:
+        reason = "电话格式或长度不符合要求"
+    return PhoneAssessment(None if reason else phone, reason)
+
+
 def normalize_phone(value: str) -> str | None:
-    """规范化电话号码文本，保留可写回的有效号码。"""
-    return _normalize_phone_digits(value, trim_trailing_noise=False)
+    """规范化电话号码文本，排除明显占位号码。"""
+    return assess_phone(value).phone
+
+
+def sanitize_contact_phone(contact: ContactInfo) -> ContactInfo:
+    """Recheck a candidate before any write or downstream contact capture."""
+    if not contact.phone:
+        return contact
+    assessment = assess_phone(contact.phone)
+    return replace(contact, phone=assessment.phone, phone_rejection_reason=assessment.rejection_reason)
+
+
+def phone_skip_message(contact: ContactInfo) -> str:
+    if contact.phone_rejection_reason:
+        return f"电话已跳过：{contact.phone_rejection_reason}，本次不替换原电话。"
+    return ""
 
 
 def has_supported_contact_prompt(value: str | None) -> bool:
@@ -120,7 +154,7 @@ def has_supported_contact_prompt(value: str | None) -> bool:
     text = str(value or "")
     return bool(FIXED_PROMPT_RE.search(text) or SINGLE_LINE_CONTACT_PROMPT_RE.search(text))
 
-def normalize_fixed_phone_answer(value: str) -> str | None:
+def assess_fixed_phone_answer(value: str) -> PhoneAssessment:
     """解析固定提示后的电话答案。
 
     详情页有时会把整页文字压成一行，电话后面紧跟金额/数量等数字。
@@ -134,8 +168,14 @@ def normalize_fixed_phone_answer(value: str) -> str | None:
     )[0]
     match = PHONE_ANSWER_RE.search(answer)
     if not match:
-        return None
-    return _normalize_phone_digits(match.group(0), trim_trailing_noise=True)
+        if not answer.strip():
+            return PhoneAssessment()
+        return PhoneAssessment(None, phone_placeholder_reason(answer) or "电话格式或长度不符合要求")
+    return assess_phone(match.group(0), trim_trailing_noise=True)
+
+
+def normalize_fixed_phone_answer(value: str) -> str | None:
+    return assess_fixed_phone_answer(value).phone
 
 def split_collapsed_fixed_prompts(value: str) -> str:
     """拆分粘连在一起的固定联系方式提示文本。"""
@@ -174,6 +214,7 @@ def extract_car_magnet_contact_info(texts: Iterable[str]) -> ContactInfo | None:
     raw_texts = [str(text) for text in texts if str(text).strip()]
     email: str | None = None
     phone: str | None = None
+    phone_rejection_reason: str | None = None
     excerpts: list[str] = []
     for raw_text in raw_texts:
         text = split_collapsed_fixed_prompts(raw_text)
@@ -189,7 +230,9 @@ def extract_car_magnet_contact_info(texts: Iterable[str]) -> ContactInfo | None:
                 email = email_match.group(1).strip().rstrip(".,;:")
         if phone is None:
             phone_source = EMAIL_RE.sub(" ", answer)
-            phone = normalize_fixed_phone_answer(phone_source)
+            assessment = assess_fixed_phone_answer(phone_source)
+            phone = assessment.phone
+            phone_rejection_reason = assessment.rejection_reason
         if email or phone:
             break
     if not excerpts:
@@ -200,6 +243,7 @@ def extract_car_magnet_contact_info(texts: Iterable[str]) -> ContactInfo | None:
         source_count=len(raw_texts),
         source_excerpt=normalize_text("\n".join(excerpts))[:500],
         customization_text="\n".join(excerpts).strip() or None,
+        phone_rejection_reason=phone_rejection_reason,
     )
 
 def extract_fixed_contact_info(texts: Iterable[str]) -> ContactInfo | None:
@@ -210,6 +254,7 @@ def extract_fixed_contact_info(texts: Iterable[str]) -> ContactInfo | None:
         return car_magnet_contact
     email: str | None = None
     phone: str | None = None
+    phone_rejection_reason: str | None = None
     prompt_seen = False
     excerpts: list[str] = []
 
@@ -228,7 +273,9 @@ def extract_fixed_contact_info(texts: Iterable[str]) -> ContactInfo | None:
         if phone is None:
             phone_match = FIXED_PHONE_RE.search(text)
             if phone_match:
-                phone = normalize_fixed_phone_answer(phone_match.group(1))
+                assessment = assess_fixed_phone_answer(phone_match.group(1))
+                phone = assessment.phone
+                phone_rejection_reason = assessment.rejection_reason
 
         if email and phone:
             break
@@ -241,6 +288,7 @@ def extract_fixed_contact_info(texts: Iterable[str]) -> ContactInfo | None:
         source_count=len(raw_texts),
         source_excerpt=normalize_text("\n".join(excerpts))[:500],
         customization_text="\n".join(excerpts).strip() or None,
+        phone_rejection_reason=phone_rejection_reason,
     )
 
 def extract_unique_fixed_contact_info(texts: Iterable[str]) -> ContactInfo | None:
@@ -290,6 +338,7 @@ def extract_unique_fixed_contact_info(texts: Iterable[str]) -> ContactInfo | Non
 
 def contact_identity(contact: ContactInfo) -> tuple[str, str] | None:
     """把联系方式归一化成查重键；电话或邮箱缺失时不能作为可写回候选。"""
+    contact = sanitize_contact_phone(contact)
     if not contact.phone or not contact.email:
         return None
     normalized_phone = normalize_fixed_phone_answer(contact.phone) or normalize_phone(contact.phone)
@@ -299,6 +348,7 @@ def contact_identity(contact: ContactInfo) -> tuple[str, str] | None:
 
 def contact_choice_identity(contact: ContactInfo) -> tuple[str, str, str] | None:
     """候选联系方式查重键：完整候选按电话+邮箱，部分候选按已有字段。"""
+    contact = sanitize_contact_phone(contact)
     if contact.phone and contact.email:
         key = contact_identity(contact)
         return ("complete", key[0], key[1]) if key else None
@@ -335,6 +385,7 @@ def extract_complete_contact_candidates(texts: Iterable[str]) -> list[ContactInf
                 source_count=1,
                 source_excerpt=contact.source_excerpt,
                 customization_text=text.strip(),
+                phone_rejection_reason=contact.phone_rejection_reason,
             )
             if key in complete_candidates_by_key:
                 # 同一联系方式可能同时来自“整页详情文本”和真正 tooltip。
@@ -358,6 +409,7 @@ def extract_complete_contact_candidates(texts: Iterable[str]) -> list[ContactInf
                 source_count=1,
                 source_excerpt=contact.source_excerpt,
                 customization_text=text.strip(),
+                phone_rejection_reason=contact.phone_rejection_reason,
             )
         )
     if complete_order:
@@ -405,8 +457,9 @@ def extract_json_contact_answer(value: str) -> ContactInfo | None:
         return None
     email = _extract_json_email_answer(answer)
     phone_source = _remove_json_email_answers(answer)
-    phone = normalize_fixed_phone_answer(phone_source)
-    if not email and not phone:
+    assessment = assess_fixed_phone_answer(phone_source)
+    phone = assessment.phone
+    if not email and not phone and not assessment.rejection_reason:
         return None
     return ContactInfo(
         phone=phone,
@@ -414,6 +467,7 @@ def extract_json_contact_answer(value: str) -> ContactInfo | None:
         source_count=1,
         source_excerpt=normalize_text(answer)[:500],
         customization_text=answer,
+        phone_rejection_reason=assessment.rejection_reason,
     )
 
 
@@ -424,9 +478,15 @@ def _add_json_contact_candidate(
     complete_order: list[tuple[str, str]],
     partial_candidates: list[ContactInfo],
     seen_partial: set[tuple[str, str, str]],
+    phone_rejections: list[str],
 ) -> None:
     """把 JSON 定制化联系方式追加为候选结果。"""
-    if contact is None or (not contact.phone and not contact.email):
+    if contact is None:
+        return
+    contact = sanitize_contact_phone(contact)
+    if contact.phone_rejection_reason and contact.phone_rejection_reason not in phone_rejections:
+        phone_rejections.append(contact.phone_rejection_reason)
+    if not contact.phone and not contact.email:
         return
     key = contact_identity(contact)
     if key is not None:
@@ -436,6 +496,7 @@ def _add_json_contact_candidate(
             source_count=contact.source_count,
             source_excerpt=contact.source_excerpt,
             customization_text=contact.customization_text,
+            phone_rejection_reason=contact.phone_rejection_reason,
         )
         if key not in complete_candidates_by_key:
             complete_order.append(key)
@@ -453,11 +514,14 @@ def _add_json_contact_candidate(
             source_count=contact.source_count,
             source_excerpt=contact.source_excerpt,
             customization_text=contact.customization_text,
+            phone_rejection_reason=contact.phone_rejection_reason,
         )
     )
 
 
-def extract_contact_candidates_from_json_items(items: Iterable[CustomizationJsonInfo]) -> list[ContactInfo]:
+def extract_contact_candidates_from_json_items(
+    items: Iterable[CustomizationJsonInfo], *, phone_rejections: list[str] | None = None,
+) -> list[ContactInfo]:
     """从 zip JSON pairs 中解析电话/邮箱候选。
 
     帐篷、汽车磁贴、喷绘迁移到 zip JSON 后，不再从 ERP tooltip 文本提取联系方式。
@@ -470,10 +534,13 @@ def extract_contact_candidates_from_json_items(items: Iterable[CustomizationJson
     seen_partial: set[tuple[str, str, str]] = set()
     global_emails: dict[str, str] = {}
     global_phones: dict[str, str] = {}
+    if phone_rejections is None:
+        phone_rejections = []
 
     for item in items:
         item_email: str | None = None
         item_phone: str | None = None
+        item_phone_rejection_reason: str | None = None
         item_excerpts: list[str] = []
         for title, value in item.pairs.items():
             if not value:
@@ -488,6 +555,7 @@ def extract_contact_candidates_from_json_items(items: Iterable[CustomizationJson
                     complete_order=complete_order,
                     partial_candidates=partial_candidates,
                     seen_partial=seen_partial,
+                    phone_rejections=phone_rejections,
                 )
                 if contact and contact.email:
                     global_emails[contact.email.lower()] = contact.email
@@ -504,11 +572,16 @@ def extract_contact_candidates_from_json_items(items: Iterable[CustomizationJson
                 continue
 
             if FIXED_PHONE_TITLE_RE.search(title_text):
-                phone = normalize_fixed_phone_answer(value_text)
+                assessment = assess_fixed_phone_answer(value_text)
+                phone = assessment.phone
                 if phone:
                     item_phone = item_phone or phone
                     global_phones[phone] = phone
-                    item_excerpts.append(value_text)
+                elif assessment.rejection_reason:
+                    if assessment.rejection_reason not in phone_rejections:
+                        phone_rejections.append(assessment.rejection_reason)
+                    item_phone_rejection_reason = assessment.rejection_reason
+                item_excerpts.append(value_text)
 
         if item_email or item_phone:
             _add_json_contact_candidate(
@@ -518,11 +591,13 @@ def extract_contact_candidates_from_json_items(items: Iterable[CustomizationJson
                     source_count=1,
                     source_excerpt=normalize_text("\n".join(item_excerpts))[:500],
                     customization_text="\n".join(item_excerpts).strip() or None,
+                    phone_rejection_reason=item_phone_rejection_reason if not item_phone else None,
                 ),
                 complete_candidates_by_key=complete_candidates_by_key,
                 complete_order=complete_order,
                 partial_candidates=partial_candidates,
                 seen_partial=seen_partial,
+                phone_rejections=phone_rejections,
             )
 
     if complete_order:
@@ -576,6 +651,7 @@ def extract_contact_info(texts: Iterable[str]) -> ContactInfo:
     combined = "\n".join(clean_texts)
     email: str | None = None
     phone: str | None = None
+    phone_rejection_reason: str | None = None
 
     email_match = EMAIL_LABEL_RE.search(combined)
     if email_match:
@@ -583,7 +659,9 @@ def extract_contact_info(texts: Iterable[str]) -> ContactInfo:
 
     phone_match = PHONE_LABEL_RE.search(combined)
     if phone_match:
-        phone = normalize_phone(phone_match.group(1))
+        assessment = assess_phone(phone_match.group(1))
+        phone = assessment.phone
+        phone_rejection_reason = assessment.rejection_reason
 
     excerpt_source = next(
         (text for text in clean_texts if (email and email in text) or (phone and phone in re.sub(r"\D", "", text))),
@@ -595,10 +673,12 @@ def extract_contact_info(texts: Iterable[str]) -> ContactInfo:
         source_count=len(clean_texts),
         source_excerpt=excerpt_source[:500],
         customization_text=fixed_contact.customization_text if fixed_contact is not None else combined,
+        phone_rejection_reason=phone_rejection_reason,
     )
 
 def missing_contact_fields(contact: ContactInfo) -> list[str]:
     """判断联系方式结果中缺失的必填字段。"""
+    contact = sanitize_contact_phone(contact)
     missing: list[str] = []
     if not contact.phone:
         missing.append("电话")

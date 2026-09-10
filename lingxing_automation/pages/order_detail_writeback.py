@@ -5,7 +5,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from ..models import ContactInfo
-from ..parsers.contact import normalize_phone
+from ..parsers.contact import normalize_phone, normalize_text, phone_skip_message, sanitize_contact_phone
 from .order_detail_navigation import (
     assert_current_detail_order,
     close_order_detail_dialog,
@@ -237,6 +237,9 @@ async def try_open_edit_mode(page) -> None:
 
 async def fill_shipping_contact_field(page, field: str, value: str) -> bool:
     """填写收货联系方式字段，并尽量兼容不同控件结构。"""
+    # Last guard also covers callers that bypass the normal candidate parser.
+    if field == "phone" and not normalize_phone(value):
+        return False
     return bool(
         await page.evaluate(
             """
@@ -653,7 +656,14 @@ async def read_shipping_contact_values(page) -> dict[str, str]:
 
 async def fill_contact_fields(page, contact: ContactInfo) -> tuple[bool, str]:
     """把提取到的电话和邮箱写入详情页对应字段。"""
+    contact = sanitize_contact_phone(contact)
+    if not contact.phone and not contact.email:
+        return False, phone_skip_message(contact) or "没有可写入的电话或邮箱，已跳过保存。"
     await try_open_edit_mode(page)
+    before_values = await read_shipping_contact_values(page)
+    if not contact.phone and "phone" not in before_values:
+        await click_cancel_edit_button(page)
+        return False, "未读取到原电话，无法确认仅更新邮箱时电话保持不变，已停止保存。"
     changed: list[str] = []
 
     if contact.phone:
@@ -669,10 +679,24 @@ async def fill_contact_fields(page, contact: ContactInfo) -> tuple[bool, str]:
     if not changed:
         return False, "没有在详情页“基本信息-收货信息”区域找到可编辑的电话/买家邮箱输入框。"
 
+    if not contact.phone:
+        error = verify_preserved_phone(before_values, await read_shipping_contact_values(page))
+        if error:
+            await click_cancel_edit_button(page)
+            return False, error
     saved = await click_save_button(page)
     if not saved:
         return False, f"已填入 {'、'.join(changed)}，但没有找到保存按钮，请在浏览器里检查后手动保存。"
-    return True, f"已填入并点击保存：{'、'.join(changed)}。"
+    return True, f"已填入并点击保存：{'、'.join(changed)}。" + phone_skip_message(contact)
+
+
+def verify_preserved_phone(before_values: dict[str, str], after_values: dict[str, str]) -> str | None:
+    """Compare the original field, even when it was itself an invalid placeholder."""
+    if "phone" not in before_values or "phone" not in after_values:
+        return "未读取到原电话或复核电话，无法确认电话保持不变。"
+    if normalize_text(before_values["phone"]) != normalize_text(after_values["phone"]):
+        return "仅更新邮箱时原电话发生变化，已停止标记成功。"
+    return None
 
 
 def verify_saved_contact_values(contact: ContactInfo, saved_values: dict[str, str]) -> str | None:
@@ -680,9 +704,9 @@ def verify_saved_contact_values(contact: ContactInfo, saved_values: dict[str, st
     if contact.phone:
         expected_phone = normalize_phone(contact.phone)
         actual_phone = normalize_phone(saved_values.get("phone") or "")
-        if not actual_phone:
+        if not (saved_values.get("phone") or "").strip():
             return "保存后没有重新读取到电话，已停止标记成功。"
-        if expected_phone != actual_phone:
+        if not expected_phone or expected_phone != actual_phone:
             return f"保存后电话校验失败：期望 {contact.phone}，页面为 {saved_values.get('phone') or '-'}。"
 
     if contact.email:
@@ -731,6 +755,9 @@ async def _update_current_detail_contact_impl(
     confirm_callback: WriteConfirmCallback | None = None,
 ) -> tuple[bool, str]:
     """更新当前详情弹窗中的联系方式并返回写回结果。"""
+    contact = sanitize_contact_phone(contact)
+    if not contact.phone and not contact.email:
+        return False, phone_skip_message(contact) or "没有可写入的电话或邮箱，已跳过保存。"
     before_identity = await assert_current_detail_order(
         page,
         expected_system_order_no,
@@ -745,6 +772,9 @@ async def _update_current_detail_contact_impl(
         "进入编辑后/写入前",
     )
     before_values = await read_shipping_contact_values(page)
+    if not contact.phone and "phone" not in before_values:
+        await click_cancel_edit_button(page)
+        return False, "未读取到原电话，无法确认仅更新邮箱时电话保持不变，已停止保存。"
 
     if confirm_callback is None:
         return False, "缺少保存前 CMD 二次确认回调，已停止写入。"
@@ -772,6 +802,8 @@ async def _update_current_detail_contact_impl(
     # 保存按钮前先校验填入后的页面值；如果页面读回值和待写入值不一致，
     # 必须取消编辑，避免用户确认后保存错误联系方式。
     fill_verify_message = verify_saved_contact_values(contact, after_fill_values)
+    if not fill_verify_message and not contact.phone:
+        fill_verify_message = verify_preserved_phone(before_values, after_fill_values)
     if fill_verify_message:
         canceled = await click_cancel_edit_button(page)
         cancel_message = "已点击取消，未保存。" if canceled else "未找到取消按钮，请在浏览器里手动取消或保存。"
@@ -787,6 +819,7 @@ async def _update_current_detail_contact_impl(
             "before_values": before_values,
             "after_fill_values": after_fill_values,
             "source_excerpt": contact.source_excerpt,
+            "phone_skip_message": phone_skip_message(contact),
         }
     )
     if not confirmed:
@@ -822,6 +855,8 @@ async def _update_current_detail_contact_impl(
         "保存后/重新打开详情",
     )
     after_save_values, verify_message = await wait_for_saved_contact_values(page, contact)
+    if not verify_message and not contact.phone:
+        verify_message = verify_preserved_phone(before_values, after_save_values)
     if verify_message:
         return False, f"重新打开订单后持久化校验失败：{verify_message}"
     after_identity = await assert_current_detail_order(
@@ -835,7 +870,9 @@ async def _update_current_detail_contact_impl(
         "已校验订单上下文并保存："
         f"{'、'.join(changed)}。"
         f" 写入前值={before_values}，填入后值={after_fill_values}，保存后值={after_save_values}，"
-        f"重新打开后系统单号={after_identity.get('system_order_no')}。",
+        f"重新打开后系统单号={after_identity.get('system_order_no')}。"
+        + phone_skip_message(contact)
+        + ("原电话已核验保持不变。" if not contact.phone else ""),
     )
 
 

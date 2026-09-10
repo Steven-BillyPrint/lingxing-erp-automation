@@ -87,6 +87,7 @@ class ContactInfo:
     source_count: int
     source_excerpt: str
     customization_text: str | None = None
+    phone_rejection_reason: str | None = None
 
 @dataclass
 class SyncResult:
