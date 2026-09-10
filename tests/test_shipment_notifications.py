@@ -149,6 +149,23 @@ def _products(system_count: int = 1) -> list[OrderProductSnapshot]:
     ]
 
 
+@pytest.mark.parametrize("phone", ["0000000000", "1234567890", "1111111111", "9876543210"])
+def test_placeholder_phone_never_becomes_sms_recipient_even_with_old_verification(phone) -> None:
+    contact = _contact(
+        email="alias@marketplace.amazon.com", phone_raw=phone,
+        verified_phone_e164=f"+1{phone}", phone_verification_state=PHONE_VERIFICATION_MATCHED,
+    )
+    assert render_notification(contact, [_package(1)], _config()).channel == CHANNEL_MANUAL_EMAIL
+    assert render_notification(
+        replace(contact, email="buyer@example.com"), [_package(1)], _config(),
+    ).channel == CHANNEL_EMAIL
+
+
+def test_repeated_group_phone_remains_usable_for_sms() -> None:
+    contact = _contact(email="alias@marketplace.amazon.com", phone_raw="1212121212")
+    assert render_notification(contact, [_package(1)], _config()).channel == CHANNEL_SMS
+
+
 def test_contact_channel_and_phone_rules() -> None:
     assert normalize_phone("415-555-2671") == "+14155552671"
     assert normalize_phone("14155552671") == "+14155552671"

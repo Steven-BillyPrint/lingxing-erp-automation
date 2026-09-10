@@ -222,7 +222,7 @@ def _patch_order_context(monkeypatch, contact: ContactInfo, *, web_saved: bool =
     monkeypatch.setattr(
         contact_sync,
         "extract_contact_candidates_from_json_items",
-        lambda _items: [contact],
+        lambda _items, **_kwargs: [contact],
     )
     monkeypatch.setattr(contact_sync, "update_current_detail_contact", update_web)
     monkeypatch.setattr(
@@ -287,6 +287,59 @@ def test_custom_order_contacts_always_use_browser(monkeypatch, contact):
         index for index, event in enumerate(events) if event[0] == "confirm"
     )
     assert ("guard", "contact_browser", PLATFORM_ORDER_NO, SYSTEM_ORDER_NO) in events
+
+
+@pytest.mark.parametrize("phone", ["0000000000", "1234567890", "1111111111", "9876543210"])
+@pytest.mark.parametrize("email", [None, "buyer@example.com"])
+def test_batch_rejects_placeholder_before_capture_and_writeback(monkeypatch, phone, email):
+    web_calls = _patch_order_context(monkeypatch, ContactInfo(phone, email, 1, "raw candidate"))
+    events = []
+    result = asyncio.run(contact_sync.process_batch_order_item(
+        object(),
+        BatchOrderItem(
+            system_order_no=SYSTEM_ORDER_NO, platform_order_no=PLATFORM_ORDER_NO,
+            row_text=f"{PLATFORM_ORDER_NO} {SYSTEM_ORDER_NO} B0CRRGTPFH", product_type="tent",
+        ),
+        object(), create_folder=False, ignore_payment_window=True, write_dedupe=False,
+        api_operations=ApiOperationsThatRejectPhoneUse(), interaction_policy=_interaction_policy(events),
+    ))
+    assert result["phone"] is None
+    assert result["phone_writeback_skipped"] is True
+    assert result["phone_rejection_reason"]
+    assert result["customer_phone_provided"] is False
+    assert "本次不替换原电话" in result["phone_skip_message"]
+    assert ("capture", PLATFORM_ORDER_NO, SYSTEM_ORDER_NO, "Test Buyer", None, email) in events
+    if email:
+        assert len(web_calls) == 1
+        assert web_calls[0].phone is None
+        assert web_calls[0].email == email
+        assert result["contact_written_fields"] == ["买家邮箱"]
+        assert "电话已跳过" in result["update_messages"][0]
+    else:
+        assert web_calls == []
+        assert result["contact_write_status"] == "skipped_invalid_phone"
+        assert result["contact_write_mutated"] is False
+        assert result["contact_writeback_verified"] is False
+
+
+@pytest.mark.parametrize("phone", ["1212121212", "123123123"])
+def test_batch_keeps_repeated_group_phone_eligible_for_automatic_write(monkeypatch, phone):
+    contact = ContactInfo(phone, "buyer@example.com", 1, "repeated group")
+    web_calls = _patch_order_context(monkeypatch, contact)
+    events = []
+    result = asyncio.run(contact_sync.process_batch_order_item(
+        object(),
+        BatchOrderItem(
+            system_order_no=SYSTEM_ORDER_NO, platform_order_no=PLATFORM_ORDER_NO,
+            row_text=f"{PLATFORM_ORDER_NO} {SYSTEM_ORDER_NO} B0CRRGTPFH", product_type="tent",
+        ),
+        object(), create_folder=False, ignore_payment_window=True, write_dedupe=False,
+        api_operations=ApiOperationsThatRejectPhoneUse(), interaction_policy=_interaction_policy(events),
+    ))
+    assert web_calls == [contact]
+    assert result["phone_writeback_skipped"] is False
+    assert result["phone_rejection_reason"] is None
+    assert result["contact_written_fields"] == ["电话", "买家邮箱"]
 
 
 def test_api_context_contact_writeback_reuses_verified_detail_without_system_search(
