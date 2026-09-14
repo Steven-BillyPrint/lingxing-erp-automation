@@ -1591,6 +1591,86 @@ def test_usps_tracking_number_overrides_stale_fedex_wms_carrier() -> None:
     assert "fedex.com" not in sms.body
 
 
+@pytest.mark.parametrize(
+    ("carrier_fields", "tracking_no", "expected_carrier", "expected_url"),
+    [
+        (
+            {
+                "actual_carrier": "",
+                "logistics_type_name": "加拿大邮政",
+                "track_record": {"carrier_name": "suratkargo"},
+            },
+            "1222622008481390",
+            "Canada Post",
+            "https://www.canadapost-postescanada.ca/track-reperage/en/details/1222622008481390",
+        ),
+        (
+            {
+                "actual_carrier": "",
+                "logistics_type_name": "Fedex-专线尾程",
+                "track_record": {"carrier_name": "4px"},
+            },
+            "874084304695",
+            "FedEx",
+            "https://www.fedex.com/fedextrack/?trknbr=874084304695&locale=en_US",
+        ),
+        (
+            {
+                "carrier_name": "UPS",
+                "actual_carrier": "FEDEX",
+                "logistics_type_name": "UPS-全程",
+                "track_record": {"carrier_name": "UPS"},
+            },
+            "874084304695",
+            "FedEx",
+            "https://www.fedex.com/fedextrack/?trknbr=874084304695&locale=en_US",
+        ),
+    ],
+)
+def test_wms_package_carrier_uses_shipping_fields_before_tracking_metadata(
+    carrier_fields, tracking_no, expected_carrier, expected_url
+) -> None:
+    package = package_from_wms_row(
+        {
+            "status": 3,
+            "order_number": "10001",
+            "wo_number": "WO-1",
+            "logistics_provider_name": "手动",
+            "waybill_no": tracking_no,
+            "tracking_no": "ALS00000000001",
+            **carrier_fields,
+        },
+        platform_order_no="112-1234567-1234567",
+    )
+    email = render_notification(_contact(), [package], _config())
+    sms = render_notification(_contact(email=""), [package], _config())
+
+    assert package.carrier == expected_carrier
+    assert f"Package a: {expected_carrier} {tracking_no}" in email.body
+    assert f'href="{expected_url.replace("&", "&amp;")}"' in email.body_html
+    assert f"Package a: {expected_carrier} {tracking_no}" in sms.body
+    assert f"Track: {expected_url}" in sms.body
+
+
+def test_wms_tracking_metadata_cannot_supply_an_unknown_package_carrier() -> None:
+    package = package_from_wms_row(
+        {
+            "status": 3,
+            "order_number": "10001",
+            "wo_number": "WO-1",
+            "logistics_provider_name": "手动",
+            "waybill_no": "AMBIGUOUS123",
+            "tracking_no": "ALS00000000001",
+            "track_record": {"carrier_name": "suratkargo"},
+        },
+        platform_order_no="112-1234567-1234567",
+    )
+
+    assert package.carrier_raw == ""
+    assert package.carrier == "International Carrier"
+    assert "suratkargo" not in render_notification(_contact(), [package], _config()).body
+
+
 def test_email_html_links_only_the_escaped_tracking_number() -> None:
     package = PackageSnapshot(
         package_key="10001:WO-1",

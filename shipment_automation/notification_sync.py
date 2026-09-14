@@ -741,9 +741,16 @@ def package_from_wms_row(
         and not _wms_package_is_instruction_only(row)
     )
     visibility_reason = selection_reason if customer_visible else "instruction"
-    carrier_raw = _lookup(mappings, _CARRIER_ALIASES)
+    # Carrier evidence belongs to the WMS package itself. Nested track_record
+    # metadata can contain a different carrier's tracking-provider guess and
+    # must not override the configured shipping method. Prefer an explicit
+    # actual carrier over other package labels, regardless of JSON key order.
+    carrier_mappings = (row,)
+    carrier_raw = _lookup(carrier_mappings, ("actual_carrier",))
     if not carrier_raw:
-        carrier_raw = _lookup(mappings, ("logistics_type_name",))
+        carrier_raw = _lookup(carrier_mappings, _CARRIER_ALIASES)
+    if not carrier_raw:
+        carrier_raw = _lookup(carrier_mappings, _LOGISTICS_TYPE_ALIASES)
         carrier_raw = re.sub(
             r"^(?:手动|manual)\s*[-–—]?\s*", "", carrier_raw, flags=re.I
         )
