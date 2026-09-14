@@ -39,12 +39,6 @@ def _detail() -> dict[str, object]:
     }
 
 
-def _frame_detail() -> dict[str, object]:
-    detail = _detail()
-    detail["order_item"] = [{"sku": "10X15-FRAME-38MM-SQUARE-RAIL"}]
-    return detail
-
-
 def test_local_browser_only_prepare_does_not_wait_for_order_detail(
     monkeypatch,
 ) -> None:
@@ -199,7 +193,20 @@ def test_local_fill_action_attaches_to_local_chrome_and_never_submits(
     assert observed["declaration"].name_cn == "喷绘"
 
 
-def test_local_fill_forces_tent_frame_weight_rule_from_order_sku(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("sku", "weight_requested", "expected_weight_rule", "expected_price"),
+    [
+        ("10X15-FRAME-38MM-SQUARE-RAIL", False, True, "8.00"),
+        ("10ft-Full-Wall", False, False, "2.50"),
+        ("10ft-Half-Wall", False, False, "2.50"),
+        ("15ft-Full-Wall-Double-Sided", False, False, "2.50"),
+        ("20ft-Half-Wall-Double-Sided", False, False, "2.50"),
+        ("10ft-Half-Wall", True, True, "8.00"),
+    ],
+)
+def test_local_fill_uses_tent_accessory_declaration_and_weight_rule(
+    monkeypatch, sku, weight_requested, expected_weight_rule, expected_price,
+) -> None:
     old_url = "https://scm.alibaba.com/web/express/order.htm?old=frame"
     new_url = "https://scm.alibaba.com/web/express/order.htm?new=frame"
     observed: dict[str, object] = {}
@@ -255,13 +262,15 @@ def test_local_fill_forces_tent_frame_weight_rule_from_order_sku(monkeypatch) ->
         "platform-frame",
         system_order_no="platform-frame",
     )
+    detail = _detail()
+    detail["order_item"] = [{"sku": sku, "quantity": 2}]
 
     result = LocalAlibabaOrderActionExecutor(
         "http://127.0.0.1:28076"
     ).execute(
         LOCAL_BROWSER_ACTION_ALIBABA_ORDER_FILL,
         {
-            "detail": _frame_detail(),
+            "detail": detail,
             "command_order_no": "platform-frame",
             "system_order_no": "system-frame",
             "platform_order_no": "platform-frame",
@@ -269,7 +278,7 @@ def test_local_fill_forces_tent_frame_weight_rule_from_order_sku(monkeypatch) ->
             "login_config": {"auto_login": False},
             "expedited": True,
             "signature_requested": False,
-            "heavy_or_frame": False,
+            "heavy_or_frame": weight_requested,
             "category": "tent",
             "confirmation": confirmation.to_payload(),
         },
@@ -277,8 +286,9 @@ def test_local_fill_forces_tent_frame_weight_rule_from_order_sku(monkeypatch) ->
 
     declaration = observed["declaration"]
     assert declaration.name_cn == "帐篷布顶"
-    assert declaration.declared_unit_price_usd == Decimal("8.00")
-    assert result["heavy_or_frame"] is True
+    assert declaration.declared_unit_price_usd == Decimal(expected_price)
+    assert result["heavy_or_frame"] is expected_weight_rule
+    assert result["alibaba_submit_calls"] == 0
 
 
 def test_local_fill_action_rejects_category_changed_after_prepare() -> None:

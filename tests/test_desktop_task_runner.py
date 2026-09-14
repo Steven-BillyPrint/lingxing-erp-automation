@@ -129,9 +129,13 @@ def _draft_confirmation(order_no: str = SYSTEM_ORDER_NO) -> DesktopWriteConfirma
     )
 
 
+@pytest.mark.parametrize(
+    "sku", ["10x10-Canopy-Topper", "10ft-Full-Wall", "10ft-Half-Wall"],
+)
 def test_prepare_alibaba_order_reads_lingxing_and_opens_quote(
     tmp_path,
     monkeypatch,
+    sku,
 ) -> None:
     observed: dict[str, Any] = {}
     original_address_loader = DesktopTaskRunner._alibaba_shipping_address
@@ -181,7 +185,9 @@ def test_prepare_alibaba_order_reads_lingxing_and_opens_quote(
 
     async def lookup(_settings, system_order_no):
         observed["system_order_no"] = system_order_no
-        return _alibaba_order_detail()
+        detail = _alibaba_order_detail()
+        detail["order_item"] = [{"sku": sku, "quantity": 2}]
+        return detail
 
     async def interaction_handler(**kwargs):
         observed["quote_details"] = dict(kwargs.get("display_data") or {})
