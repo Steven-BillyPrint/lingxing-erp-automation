@@ -20,6 +20,16 @@ TENT_TOP_SKU_BY_SIZE = MappingProxyType(
 )
 TENT_TOP_SKUS = frozenset(TENT_TOP_SKU_BY_SIZE.values())
 
+# Exact full/half-wall SKUs emitted by the tent SKU planner, including
+# double-sided fabric. Standalone walls belong to the tent family even when
+# the order has no top, frame, or ASIN.
+TENT_WALL_SKUS = frozenset(
+    f"{prefix}-{wall_kind}{suffix}"
+    for prefix in ("10ft", "15ft", "20ft")
+    for wall_kind in ("Full-Wall", "Half-Wall")
+    for suffix in ("", "-Double-Sided")
+)
+
 # Exact tent-frame SKUs emitted by the shared tent SKU planner.  Keep this
 # finite catalogue at the neutral product-identity boundary so shipment
 # classification and SKU generation cannot disagree about whether a standalone

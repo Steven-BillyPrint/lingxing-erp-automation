@@ -40,7 +40,9 @@ def test_audit_classifies_lingxing_product_no_without_raw_payload_output() -> No
 
     assert row.state == "classified"
     assert row.category == "tent"
-    assert row.matched_identifiers == "B0D6KZ7G88"
+    assert set(row.matched_identifiers.split(" | ")) == {
+        "B0D6KZ7G88", "10ft-Full-Wall",
+    }
     assert "must-not-leak" not in repr(row)
 
 

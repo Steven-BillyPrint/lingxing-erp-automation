@@ -4,10 +4,15 @@ from decimal import Decimal
 
 import pytest
 
-from erp_automation.domain.product_catalog import TENT_FRAME_SKUS, TENT_TOP_SKUS
+from erp_automation.domain.product_catalog import (
+    TENT_FRAME_SKUS,
+    TENT_TOP_SKUS,
+    TENT_WALL_SKUS,
+)
 from lingxing_automation.services.tent_sku_rules import (
     TENT_SIZE_RULES,
     frame_sku_for_component,
+    wall_sku_for_component,
 )
 from shipment_automation.alibaba_ordering import (
     AlibabaOrderRuleError,
@@ -36,6 +41,17 @@ from shipment_automation.alibaba_product_classification import (
 
 def test_shared_tent_catalog_matches_customization_rule_tops() -> None:
     assert TENT_TOP_SKUS == frozenset(rule["top"] for rule in TENT_SIZE_RULES.values())
+
+
+def test_shared_tent_wall_catalog_matches_every_planner_variant() -> None:
+    generated = frozenset(
+        item.sku
+        for size_key in TENT_SIZE_RULES
+        for component in ("全高背墙", "半高侧墙", "双面全高背墙", "双面半高侧墙")
+        if (item := wall_sku_for_component(size_key, component))
+    )
+
+    assert generated == TENT_WALL_SKUS
 
 
 def test_shared_tent_frame_catalog_matches_every_planner_variant() -> None:
@@ -143,11 +159,68 @@ def test_every_generated_tent_frame_uses_tent_declaration_category(sku: str) -> 
     assert order_contains_tent_frame_sku(payload) is True
 
 
-def test_wall_sku_without_an_asin_does_not_guess_a_tent_order() -> None:
+@pytest.mark.parametrize("prefix", ["10ft", "15ft", "20ft"])
+@pytest.mark.parametrize("wall_kind", ["Full-Wall", "Half-Wall"])
+@pytest.mark.parametrize("suffix", ["", "-Double-Sided"])
+def test_wall_sku_without_an_asin_uses_tent_category(
+    prefix: str, wall_kind: str, suffix: str,
+) -> None:
+    sku = f"{prefix}-{wall_kind}{suffix}"
+    payload = {"order_item": [{"sku": sku}]}
+
+    classification = classify_order_product(payload)
+
+    assert classification.category is ProductCategory.TENT
+    assert classification.matched_skus == (sku,)
+    assert classification.unmatched_identifiers == ()
+    assert order_contains_tent_frame_sku(payload) is False
+
+
+def test_reported_half_wall_order_without_asin_is_supported() -> None:
+    payload = {
+        "global_order_no": "103000000000000001",
+        "order_number": "111-2222222-3333333",
+        "order_item": [{"sku": "10ft-Half-Wall", "quantity": 2}],
+    }
+
+    classification = classify_order_product(payload)
+
+    assert classification.category is ProductCategory.TENT
+    assert classification.matched_skus == ("10ft-Half-Wall",)
+    assert payload["order_item"] == [{"sku": "10ft-Half-Wall", "quantity": 2}]
+
+
+@pytest.mark.parametrize(
+    "sku", [" 10FT full wall ", "15ft_half_wall_double_sided"],
+)
+def test_wall_sku_accepts_harmless_formatting(sku: str) -> None:
+    classification = classify_order_product({"order_item": [{"local_sku": sku}]})
+
+    assert classification.category is ProductCategory.TENT
+
+
+@pytest.mark.parametrize(
+    "sku",
+    [
+        "12ft-Full-Wall",
+        "10ft-Half-Wall-2",
+        "10ft-Full-Wall-Unknown",
+        "Custom-Full-Wall-for-Canopy-Tent",
+        "tent-roller-bag-unknown",
+    ],
+)
+def test_uncatalogued_tent_accessory_sku_is_not_guessed(sku: str) -> None:
     with pytest.raises(AlibabaOrderRuleError, match="未匹配"):
-        classify_order_product(
-            {"order_item": [{"sku": "10ft-Full-Wall"}]}
-        )
+        classify_order_product({"order_item": [{"sku": sku}]})
+
+
+def test_wall_sku_does_not_override_known_asin_category() -> None:
+    classification = classify_order_product(
+        {"order_item": [{"sku": "10ft-Full-Wall", "product_no": "B0CQLN5GNL"}]}
+    )
+
+    assert classification.category is ProductCategory.WALL_DECAL
+    assert classification.matched_skus == ("B0CQLN5GNL",)
 
 
 @pytest.mark.parametrize(
@@ -798,7 +871,7 @@ def test_lingxing_web_order_item_info_container_is_supported() -> None:
         "10ft-Half-Wall",
     )
     assert classification.category is ProductCategory.TENT
-    assert classification.matched_skus == ("10x10-Canopy-Topper",)
+    assert classification.matched_skus == skus
 
 
 def test_third_address_line_and_doorplate_are_preserved_without_duplication() -> None:
