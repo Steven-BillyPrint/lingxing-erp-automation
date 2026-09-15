@@ -1276,6 +1276,25 @@ def test_settings_page_marks_server_secrets_and_only_keeps_portable_actions(
     assert not hasattr(page, "migration_status")
 
 
+def test_processing_mode_button_saves_immediately_and_keeps_unsaved_fields(app) -> None:
+    controller = InMemoryBackgroundTaskController()
+    results = []
+    page = SettingsPage(controller, results.append)
+    page.update_snapshot(controller.snapshot())
+    page.folder_root.setText("unsaved-folder")
+    page._mark_dirty()
+    page.processing_mode_button.click()
+    assert controller.snapshot().settings.processing_mode == "manual"
+    assert controller.snapshot().settings.folder_root != "unsaved-folder"
+    assert "手动处理" in page.processing_mode_button.text()
+    page.update_snapshot(controller.snapshot())
+    assert page.folder_root.text() == "unsaved-folder"
+    page.processing_mode_button.click()
+    assert controller.snapshot().settings.processing_mode == "automatic"
+    assert all(result.accepted for result in results)
+    page.close()
+
+
 def test_settings_page_submits_current_host_lingxing_login_task(app) -> None:
     controller = RecordingController()
     results: list[ControlResult] = []

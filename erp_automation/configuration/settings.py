@@ -79,6 +79,7 @@ DEFAULT_CONFIGURATION_VALUES: dict[str, Any] = {
     "automation.high_value_split_weight_kg": 4,
     "automation.high_value_split_longest_side_cm": 55,
     "automation.shipment_tag_name": "标发",
+    "automation.processing_mode": "automatic",
     "automation.custom_order_review_enabled": False,
     "automation.shipment_review_enabled": False,
     "logs.retention_days": 90,

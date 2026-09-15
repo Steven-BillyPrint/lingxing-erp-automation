@@ -11,6 +11,9 @@ from time import monotonic
 from uuid import uuid4
 
 from erp_automation.contracts.controller import TaskSubmissionReceipt
+from erp_automation.application.automatic_processing import (
+    AUTOMATIC_PROCESSING_FEATURE, run_automatic_processing,
+)
 from erp_automation.contracts.operation_feedback import operation_rejection
 from erp_automation.contracts.models import CUSTOM_ORDER_SUBMISSION_ID_PAYLOAD_KEY, SHIPMENT_SUBMISSION_ID_PAYLOAD_KEY
 from erp_automation.coordination.remote_controller import (
@@ -8944,7 +8947,22 @@ if PYSIDE6_AVAILABLE:
                 high_value_threshold_widget,
             )
 
-            review_form = section("执行审核")
+            processing_form = section("处理模式")
+            self._processing_mode = "automatic"
+            self._processing_mode_saving = False
+            self.processing_mode_button = QPushButton("自动处理 · 点击切换手动")
+            self.processing_mode_button.setMinimumHeight(36)
+            self.processing_mode_button.clicked.connect(self._toggle_processing_mode)
+            processing_form.addRow("当前账号", self.processing_mode_button)
+            processing_note = QLabel(
+                "自动：每分钟扫描订单，发现可处理订单后自动处理定制、标发并发送客户通知。\n"
+                "手动：保留扫描，由你选择订单执行和审核通知。切换立即保存；已开始的订单完成当前任务。\n"
+                "自动处理需要保持客户端在线；登录验证、异常和未知结果仍需人工处理，急停始终有效。"
+            )
+            processing_note.setWordWrap(True)
+            processing_form.addRow(processing_note)
+
+            review_form = section("手动操作审核")
             self.custom_order_review_enabled = QCheckBox(
                 "处理勾选订单前显示审核确认"
             )
@@ -9109,6 +9127,31 @@ if PYSIDE6_AVAILABLE:
             body_layout.addStretch(1)
             scroll.setWidget(body)
             layout.addWidget(scroll, 1)
+
+        def _show_processing_mode(self, mode: str) -> None:
+            self._processing_mode = mode
+            self.processing_mode_button.setText(
+                "自动处理 · 点击切换手动" if mode == "automatic" else "手动处理 · 点击切换自动"
+            )
+
+        def _toggle_processing_mode(self) -> None:
+            if self._processing_mode_saving:
+                return
+            mode = "manual" if self._processing_mode == "automatic" else "automatic"
+            self._processing_mode_saving = True
+            self.processing_mode_button.setEnabled(False)
+
+            def finish(result: ControlResult) -> None:
+                self._processing_mode_saving = False
+                self.processing_mode_button.setEnabled(True)
+                if result.accepted:
+                    self._show_processing_mode(mode)
+                self._result_handler(result)
+
+            _run_control_result_responsive(
+                self, self._controller,
+                lambda: self._controller.set_processing_mode(mode), finish,
+            )
 
         def _mark_dirty(self, *_args) -> None:
             if self._hydrating:
@@ -9435,6 +9478,7 @@ if PYSIDE6_AVAILABLE:
                     self.high_value_split_longest_side.value()
                 ),
                 shipment_tag_name=self.shipment_tag_name.text().strip(),
+                processing_mode=self._processing_mode,
                 custom_order_review_enabled=(
                     self.custom_order_review_enabled.isChecked()
                 ),
@@ -9853,6 +9897,13 @@ if PYSIDE6_AVAILABLE:
                 snapshot.configured_secret_field_count,
                 snapshot.operator_email,
             )
+            if not self._processing_mode_saving:
+                self._show_processing_mode(snapshot.settings.processing_mode)
+            if getattr(self._controller, "snapshot_runs_in_background", False):
+                supported = AUTOMATIC_PROCESSING_FEATURE in snapshot.server_features
+                self.processing_mode_button.setEnabled(supported and not self._processing_mode_saving)
+                if not supported:
+                    self.processing_mode_button.setText("等待服务器支持自动处理")
             if self._dirty and self._hydrated:
                 return
             if self._hydrated and signature == self._last_signature:
@@ -13498,6 +13549,11 @@ if PYSIDE6_AVAILABLE:
             self._shipment_scan_timer = QTimer(self)
             self._shipment_scan_timer.setSingleShot(True)
             self._shipment_scan_timer.timeout.connect(self._run_automatic_shipment_scan)
+            self._automatic_dispatch_running = False
+            self._automatic_dispatch_timer = QTimer(self)
+            self._automatic_dispatch_timer.setInterval(5000)
+            self._automatic_dispatch_timer.timeout.connect(self._run_automatic_processing)
+            self._automatic_dispatch_timer.start()
             take_startup_snapshot = getattr(
                 self._controller,
                 "take_startup_snapshot",
@@ -14014,6 +14070,9 @@ if PYSIDE6_AVAILABLE:
             )
             now = datetime.now(timezone.utc)
             for timer, trigger, interval_ms in schedules:
+                if snapshot.settings.processing_mode == "automatic" and AUTOMATIC_PROCESSING_FEATURE in snapshot.server_features:
+                    timer.stop()
+                    continue
                 desired = _scheduled_scan_delay_ms(
                     snapshot,
                     trigger=trigger,
@@ -14335,6 +14394,25 @@ if PYSIDE6_AVAILABLE:
                 self,
                 "自动标发完成",
                 "\n\n".join(sections),
+            )
+
+        def _run_automatic_processing(self) -> None:
+            snapshot = self._latest_snapshot
+            if (self._close_pending or self._automatic_dispatch_running or snapshot is None
+                or AUTOMATIC_PROCESSING_FEATURE not in snapshot.server_features
+                or snapshot.settings.processing_mode != "automatic"
+                or not snapshot.is_scheduler_leader or snapshot.policy.execution_paused):
+                return
+            self._automatic_dispatch_running = True
+
+            def finish(result: ControlResult) -> None:
+                self._automatic_dispatch_running = False
+                if result.message:
+                    self.statusBar().showMessage(result.message, 8000)
+
+            _run_control_result_responsive(
+                self, self._controller,
+                lambda: run_automatic_processing(self._controller), finish,
             )
 
         def _run_automatic_custom_scan(self) -> None:
@@ -14681,6 +14759,7 @@ if PYSIDE6_AVAILABLE:
 
         def closeEvent(self, event) -> None:  # noqa: N802 - Qt callback name
             self._timer.stop()
+            self._automatic_dispatch_timer.stop()
             self._custom_scan_timer.stop()
             self._shipment_scan_timer.stop()
             if (

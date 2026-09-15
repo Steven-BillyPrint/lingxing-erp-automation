@@ -46,6 +46,7 @@ jobs:
             tests/test_custom_workflow_store.py \
             tests/test_shipment_queue_store.py \
             tests/test_persistent_desktop_controller.py \
+            tests/test_automatic_processing.py \
             tests/test_shipment_notifications.py \
             tests/test_architecture_contracts.py
 

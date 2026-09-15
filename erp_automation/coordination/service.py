@@ -17,6 +17,9 @@ from tempfile import TemporaryDirectory
 from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import urlparse
 
+from erp_automation.application.automatic_processing import (
+    AUTOMATIC_SCAN_INTERVALS, automatic_schedule_key, is_automatic,
+)
 from erp_automation.contracts.controller import BackgroundTaskController, ControlResult
 from erp_automation.contracts.models import (
     Capability,
@@ -67,6 +70,7 @@ def _task_records(controller: BackgroundTaskController) -> tuple[TaskRecord, ...
 MAX_PORTABLE_CONFIGURATION_PACKAGE_BYTES = 4 * 1024 * 1024
 
 SCHEDULED_SCAN_INTERVALS = {
+    **AUTOMATIC_SCAN_INTERVALS,
     "five_minute_timer": 5 * 60.0,
     "three_hour_timer": 3 * 60 * 60.0,
 }
@@ -99,6 +103,7 @@ def _with_configuration_identity(
 
 READ_METHODS = frozenset(
     {
+        "get_automatic_processing_tasks",
         "pending_interactions",
         "list_shipment_notifications",
         "get_shipment_notification_details",
@@ -116,6 +121,7 @@ READ_METHODS = frozenset(
 
 MUTATION_METHODS = frozenset(
     {
+        "set_processing_mode",
         "submit_task",
         "submit_tasks",
         "cancel_task",
@@ -541,6 +547,12 @@ def _decode_call(
             raise ValueError("update_capability_mode expects capability and mode.")
         args[0] = decode_capability(args[0])
         args[1] = decode_capability_mode(args[1])
+    elif method == "set_processing_mode":
+        if len(args) != 1 or kwargs or args[0] not in {"manual", "automatic"}:
+            raise ValueError("处理模式必须为手动或自动。")
+    elif method == "get_automatic_processing_tasks":
+        if args or kwargs:
+            raise ValueError("自动处理查询不接受参数。")
     elif method == "save_settings":
         if len(args) != 1:
             raise ValueError("save_settings expects one settings document.")
@@ -1868,9 +1880,18 @@ class CoordinatedControllerService:
         return max(0, int(self._client_rollout_grace_deadline_epoch))
 
     def _scheduler_status(self, instance_id: str) -> dict[str, Any]:
+        # Use already-loaded settings. Registration must not recover controllers
+        # or recursively observe the monitor's instance inventory.
+        with self._controller_lock:
+            controllers = tuple(self._operator_controllers.items())
+        manual_accounts = {
+            email for email, controller in controllers
+            if not controller.automatic_processing_enabled()
+        }
         status = self.store.elect_scheduler(
             instance_id,
             ttl_seconds=self.settings.scheduler_lease_seconds,
+            manual_operator_emails=manual_accounts,
         )
         if bool(status.get("changed")):
             self.store.publish_event(
@@ -2499,6 +2520,13 @@ class CoordinatedControllerService:
         if cached is not None:
             return cached
         args, kwargs = _decode_call(method, raw_args, raw_kwargs)
+        scheduler_leader = bool((heartbeat.get("scheduler") or {}).get("is_leader"))
+        if method == "get_automatic_processing_tasks" and not scheduler_leader:
+            return {"result_type": "json", "result": [], "revision": self.store.current_revision()}
+        if method == "submit_task" and is_automatic(args[0]) and not scheduler_leader:
+            return {"result_type": "control_result", "result": to_jsonable(ControlResult(
+                False, "自动处理主实例已变化，本次未提交。", details={"non_modal": True, "scheduler_rejected": True},
+            )), "revision": self.store.current_revision()}
         if method in MUTATION_METHODS:
             admission = self.store.begin_request(
                 request_id=request_id,
@@ -2759,7 +2787,7 @@ class CoordinatedControllerService:
                 _requires_persistent_notification_followup(args[0])
             )
 
-            trigger = str(payload.get("trigger") or "").strip()
+            trigger = automatic_schedule_key(args[0]) or str(payload.get("trigger") or "").strip()
             interval_seconds = SCHEDULED_SCAN_INTERVALS.get(trigger)
             if interval_seconds is not None:
                 claim = self.store.claim_scheduled_job(
@@ -2938,6 +2966,10 @@ class CoordinatedControllerService:
             current = controller.snapshot().settings
             args[0] = replace(
                 submitted,
+                processing_mode=(
+                    submitted.processing_mode if "processing_mode" in raw_args[0]
+                    else current.processing_mode
+                ),
                 **{
                     name: getattr(current, name)
                     for name in SENSITIVE_SETTINGS_FIELDS
@@ -2971,6 +3003,12 @@ class CoordinatedControllerService:
             }
         if method in READ_METHODS:
             value = getattr(controller, method)(*args, **kwargs)
+            if method == "get_automatic_processing_tasks":
+                due_times = self.store.scheduled_job_due_times(AUTOMATIC_SCAN_INTERVALS)
+                value = [item for item in value if not (
+                    (key := automatic_schedule_key(decode_task_command(item)))
+                    and due_times.get(key, 0) > time.time()
+                )]
             response = {
                 "result_type": _result_type(value),
                 "result": to_jsonable(value),

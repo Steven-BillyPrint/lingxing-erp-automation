@@ -2624,7 +2624,8 @@ class DesktopTaskRunner:
             product_type = str(current_job.get("product_type") or "").strip()
             auto_approve_stages = product_type.casefold() == "tent"
             auto_approve_current_stage = (
-                not settings.shipment_review_enabled
+                confirmation.source == "automatic_mode"
+                or not settings.shipment_review_enabled
                 or auto_approve_stages
                 or (not is_fallback and operation in {"审核发货", "出库发货"})
             )

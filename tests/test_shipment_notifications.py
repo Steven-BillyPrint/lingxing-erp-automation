@@ -2138,6 +2138,33 @@ def _ready_database(path, *, system_count: int = 5) -> ShipmentNotificationStore
     return store
 
 
+def test_automatic_notification_candidates_require_complete_outbound_and_no_send_evidence(tmp_path):
+    from erp_automation.persistence.automatic_dispatch import AutomaticDispatchStore
+
+    store = _ready_database(tmp_path / "automatic-notifications.sqlite3", system_count=1)
+    platform = "112-1234567-1234567"
+    store.upsert_contact(_contact(system_order_nos=("10001",)))
+    store.replace_package_scan(platform, [_package(1)])
+    notification = store.prepare_notification(platform, _config())
+    assert notification["state"] == NOTIFICATION_AWAITING_REVIEW
+    dispatch = AutomaticDispatchStore(store.path)
+    assert [item["id"] for item in dispatch.candidates("notification")] == [notification["id"]]
+
+    with store.connect() as connection:
+        connection.execute("UPDATE shipment_notification_outbound_eligibility SET snapshot_complete = 0")
+    assert dispatch.candidates("notification") == []
+    with store.connect() as connection:
+        connection.execute("UPDATE shipment_notification_outbound_eligibility SET snapshot_complete = 1")
+        connection.execute("UPDATE shipment_notifications SET provider_message_id = 'already-accepted'")
+    assert dispatch.candidates("notification") == []
+    with store.connect() as connection:
+        connection.execute("UPDATE shipment_notifications SET provider_message_id = '', last_error = 'unknown send result'")
+    assert dispatch.candidates("notification") == []
+    with store.connect() as connection:
+        connection.execute("UPDATE shipment_notifications SET last_error = '', state = 'CANCELLED'")
+    assert dispatch.candidates("notification") == []
+
+
 def test_notification_read_model_includes_shipment_product_types(tmp_path) -> None:
     path = tmp_path / "notification-product-type.sqlite3"
     store = _ready_database(path, system_count=1)

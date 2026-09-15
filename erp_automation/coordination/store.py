@@ -898,6 +898,7 @@ class CoordinationStore:
         *,
         ttl_seconds: float,
         slot: str = "automatic_scans",
+        manual_operator_emails: set[str] | None = None,
     ) -> dict[str, Any]:
         """Atomically renew or elect one online client as scheduler leader."""
 
@@ -911,6 +912,17 @@ class CoordinationStore:
         expires_at = now + max(5.0, float(ttl_seconds))
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            eligible_instance_ids = None
+            if manual_operator_emails:
+                accounts = tuple(sorted(email.casefold() for email in manual_operator_emails))
+                automatic_instances = connection.execute(
+                    "SELECT instance_id FROM coordination_instances "
+                    "WHERE expires_at > ? AND execution_paused = 0 "
+                    f"AND lower(operator_email) NOT IN ({','.join('?' for _ in accounts)})",
+                    (now, *accounts),
+                ).fetchall()
+                # If all online accounts are manual, retain ordinary scan leadership.
+                eligible_instance_ids = {str(row[0]) for row in automatic_instances} or None
             previous = connection.execute(
                 """
                 SELECT slot.owner_instance_id, slot.expires_at,
@@ -928,6 +940,7 @@ class CoordinationStore:
             )
             previous_valid = bool(
                 previous is not None
+                and (eligible_instance_ids is None or previous_owner in eligible_instance_ids)
                 and float(previous["expires_at"]) > now
                 and previous["instance_expires_at"] is not None
                 and float(previous["instance_expires_at"]) > now
@@ -943,6 +956,7 @@ class CoordinationStore:
             ).fetchone()
             candidate_valid = bool(
                 candidate is not None
+                and (eligible_instance_ids is None or instance in eligible_instance_ids)
                 and float(candidate["expires_at"]) > now
                 and not bool(int(candidate["execution_paused"] or 0))
             )
