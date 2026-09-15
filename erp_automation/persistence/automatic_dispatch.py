@@ -65,6 +65,11 @@ class AutomaticDispatchStore:
                   AND TRIM(COALESCE(l.carrier_normalized, l.carrier_raw, '')) <> ''
             """
         elif kind == "notification":
+            # Follow the existing notification workflow: send available outbound
+            # packages first, then only genuinely new customer-visible packages.
+            # A full source snapshot is still required; full shipment is not.
+            # Compare package keys across confirmed history, so tracking/text
+            # corrections and manually reopened identical drafts do not resend.
             source = """
                 SELECT n.id, n.platform_order_no, 'notification:' || n.id AS dispatch_identity
                 FROM shipment_notifications n
@@ -73,20 +78,37 @@ class AutomaticDispatchStore:
                 WHERE n.state = 'AWAITING_REVIEW' AND n.legacy_email_batch_id IS NULL
                   AND e.outbound_state = 'OUTBOUNDED' AND e.snapshot_complete = 1
                   AND TRIM(e.package_set_hash) <> ''
-                  AND n.package_total > 0 AND n.package_missing = 0
-                  AND n.package_complete = n.package_total
+                  AND n.package_total > 0 AND n.package_complete > 0
                   AND COALESCE(n.last_error, '') = '' AND n.attempt_count = 0
                   AND COALESCE(n.provider_message_id, '') = ''
+                  AND COALESCE(n.provider_status, '') = ''
+                  AND COALESCE(n.approved_at, '') = ''
+                  AND COALESCE(n.approved_content_hash, '') = ''
                   AND COALESCE(n.sent_at, '') = '' AND COALESCE(n.delivered_at, '') = ''
                   AND n.id = (SELECT MAX(latest.id) FROM shipment_notifications latest
                       WHERE latest.platform_order_no = n.platform_order_no
                         AND latest.legacy_email_batch_id IS NULL)
                   AND NOT EXISTS (SELECT 1 FROM shipment_notifications prior
                       WHERE prior.platform_order_no = n.platform_order_no AND prior.id <> n.id
-                        AND (COALESCE(prior.provider_message_id, '') <> ''
-                          OR COALESCE(prior.sent_at, '') <> '' OR COALESCE(prior.delivered_at, '') <> ''
-                          OR prior.state IN ('SENDING', 'ACCEPTED', 'DELIVERY_UNCONFIRMED',
-                                            'DELIVERED', 'MANUALLY_COMPLETED')))
+                        AND (prior.state IN ('SENDING', 'DELIVERY_UNCONFIRMED', 'RETRYABLE', 'FAILED')
+                          OR (prior.state NOT IN ('ACCEPTED', 'DELIVERED', 'MANUALLY_COMPLETED')
+                            AND (prior.attempt_count > 0 OR COALESCE(prior.provider_message_id, '') <> ''
+                              OR COALESCE(prior.sent_at, '') <> '' OR COALESCE(prior.delivered_at, '') <> ''))))
+                  AND EXISTS (
+                      SELECT 1 FROM shipment_notification_items current_item
+                      WHERE current_item.notification_id = n.id
+                        AND current_item.customer_visible = 1 AND current_item.is_complete = 1
+                        AND TRIM(COALESCE(current_item.final_tracking_no, '')) <> ''
+                        AND NOT EXISTS (
+                            SELECT 1 FROM shipment_notification_items sent_item
+                            JOIN shipment_notifications sent ON sent.id = sent_item.notification_id
+                            WHERE sent.platform_order_no = n.platform_order_no AND sent.id <> n.id
+                              AND sent.state IN ('ACCEPTED', 'DELIVERED', 'MANUALLY_COMPLETED')
+                              AND sent_item.customer_visible = 1 AND sent_item.is_complete = 1
+                              AND TRIM(COALESCE(sent_item.final_tracking_no, '')) <> ''
+                              AND sent_item.package_key = current_item.package_key
+                        )
+                  )
             """
         else:
             raise ValueError(kind)

@@ -183,6 +183,12 @@ class CoordinationStore:
                 self._ensure_column(
                     connection,
                     "coordination_instances",
+                    "client_version",
+                    "TEXT NOT NULL DEFAULT ''",
+                )
+                self._ensure_column(
+                    connection,
+                    "coordination_instances",
                     "operator_email",
                     "TEXT NOT NULL DEFAULT ''",
                 )
@@ -325,6 +331,7 @@ class CoordinationStore:
         *,
         ttl_seconds: float,
         identity: OperatorIdentity | None = None,
+        client_version: str = "",
     ) -> None:
         instance = self._validate_identifier(instance_id, label="instance_id")
         operator_email = str(identity.email if identity else "").strip().casefold()
@@ -371,8 +378,8 @@ class CoordinationStore:
                 """
                 INSERT INTO coordination_instances(
                     instance_id, display_name, operator_email, operator_name,
-                    identity_subject, created_at, last_seen_at, expires_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    identity_subject, client_version, created_at, last_seen_at, expires_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(instance_id) DO UPDATE SET
                     display_name = excluded.display_name,
                     operator_email = CASE
@@ -390,6 +397,7 @@ class CoordinationStore:
                         THEN excluded.identity_subject
                         ELSE coordination_instances.identity_subject
                     END,
+                    client_version = excluded.client_version,
                     last_seen_at = excluded.last_seen_at,
                     expires_at = excluded.expires_at
                 """,
@@ -399,6 +407,7 @@ class CoordinationStore:
                     operator_email,
                     operator_name,
                     identity_subject,
+                    str(client_version or "").strip(),
                     now,
                     now,
                     expires_at,
@@ -899,6 +908,7 @@ class CoordinationStore:
         ttl_seconds: float,
         slot: str = "automatic_scans",
         manual_operator_emails: set[str] | None = None,
+        automatic_client_min_version: str = "",
     ) -> dict[str, Any]:
         """Atomically renew or elect one online client as scheduler leader."""
 
@@ -912,17 +922,33 @@ class CoordinationStore:
         expires_at = now + max(5.0, float(ttl_seconds))
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            eligible_instance_ids = None
-            if manual_operator_emails:
-                accounts = tuple(sorted(email.casefold() for email in manual_operator_emails))
-                automatic_instances = connection.execute(
-                    "SELECT instance_id FROM coordination_instances "
-                    "WHERE expires_at > ? AND execution_paused = 0 "
-                    f"AND lower(operator_email) NOT IN ({','.join('?' for _ in accounts)})",
-                    (now, *accounts),
-                ).fetchall()
-                # If all online accounts are manual, retain ordinary scan leadership.
-                eligible_instance_ids = {str(row[0]) for row in automatic_instances} or None
+            online = connection.execute(
+                "SELECT instance_id, operator_email, client_version FROM coordination_instances "
+                "WHERE expires_at > ? AND execution_paused = 0", (now,),
+            ).fetchall()
+            manual_accounts = {email.casefold() for email in (manual_operator_emails or ())}
+            automatic_ids = {
+                str(row["instance_id"]) for row in online
+                if str(row["operator_email"]).casefold() not in manual_accounts
+            }
+            minimum = (
+                tuple(int(part) for part in automatic_client_min_version.split("."))
+                if automatic_client_min_version else ()
+            )
+            capable_ids: set[str] = set()
+            for row in online:
+                parts = str(row["client_version"] or "").split(".")
+                if not minimum or (
+                    len(parts) == 4 and all(part.isdigit() for part in parts)
+                    and tuple(map(int, parts)) >= minimum
+                ):
+                    capable_ids.add(str(row["instance_id"]))
+            # Old clients may scan during rollout, but must yield immediately
+            # when a client that can actually run automatic processing appears.
+            eligible_instance_ids = (
+                (capable_ids & automatic_ids) or capable_ids or automatic_ids
+                or {str(row["instance_id"]) for row in online}
+            )
             previous = connection.execute(
                 """
                 SELECT slot.owner_instance_id, slot.expires_at,
@@ -940,7 +966,7 @@ class CoordinationStore:
             )
             previous_valid = bool(
                 previous is not None
-                and (eligible_instance_ids is None or previous_owner in eligible_instance_ids)
+                and previous_owner in eligible_instance_ids
                 and float(previous["expires_at"]) > now
                 and previous["instance_expires_at"] is not None
                 and float(previous["instance_expires_at"]) > now
@@ -956,7 +982,7 @@ class CoordinationStore:
             ).fetchone()
             candidate_valid = bool(
                 candidate is not None
-                and (eligible_instance_ids is None or instance in eligible_instance_ids)
+                and instance in eligible_instance_ids
                 and float(candidate["expires_at"]) > now
                 and not bool(int(candidate["execution_paused"] or 0))
             )
