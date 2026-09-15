@@ -18,7 +18,8 @@ from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import urlparse
 
 from erp_automation.application.automatic_processing import (
-    AUTOMATIC_SCAN_INTERVALS, automatic_schedule_key, is_automatic,
+    AUTOMATIC_SCAN_INTERVALS, AUTOMATIC_PROCESSING_MIN_CLIENT_VERSION,
+    automatic_schedule_key, is_automatic,
 )
 from erp_automation.contracts.controller import BackgroundTaskController, ControlResult
 from erp_automation.contracts.models import (
@@ -1892,6 +1893,7 @@ class CoordinatedControllerService:
             instance_id,
             ttl_seconds=self.settings.scheduler_lease_seconds,
             manual_operator_emails=manual_accounts,
+            automatic_client_min_version=AUTOMATIC_PROCESSING_MIN_CLIENT_VERSION,
         )
         if bool(status.get("changed")):
             self.store.publish_event(
@@ -1995,6 +1997,7 @@ class CoordinatedControllerService:
             display_name,
             ttl_seconds=self.settings.instance_ttl_seconds,
             identity=identity,
+            client_version=client_version,
         )
         # Port allocation is an admission-plane operation. Full operator state
         # recovery may read encrypted configuration, SQLite queues and task
@@ -2079,6 +2082,7 @@ class CoordinatedControllerService:
             display_name,
             ttl_seconds=self.settings.instance_ttl_seconds,
             identity=identity,
+            client_version=client_version,
         )
         # The controller is initialized lazily by the first snapshot or RPC.
         # Registration therefore remains responsive while recovery runs.

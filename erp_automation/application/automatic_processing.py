@@ -5,7 +5,7 @@ from typing import Any, Mapping
 
 from erp_automation.contracts.models import (
     AUTOMATIC_PROCESSING_PAYLOAD_KEY,
-    Capability, TaskArea, TaskCommand, DesktopWriteAction,
+    Capability, TaskArea, TaskCommand, TaskRecord, DesktopWriteAction,
     DesktopWriteConfirmation, DESKTOP_CONFIRMATION_PAYLOAD_KEY,
     CUSTOM_ORDER_SUBMISSION_ID_PAYLOAD_KEY, SHIPMENT_SUBMISSION_ID_PAYLOAD_KEY,
     NOTIFICATION_REVIEW_RESCAN_TRIGGER, SHIPMENT_NOTIFICATION_SEND_TRIGGER,
@@ -14,10 +14,11 @@ from erp_automation.contracts.models import (
 )
 
 AUTOMATIC_PROCESSING_FEATURE = "automatic_processing_v1"
+AUTOMATIC_PROCESSING_MIN_CLIENT_VERSION = "2026.09.15.1"
 AUTOMATIC_SCAN_INTERVAL_SECONDS = 60.0
 
 
-def is_automatic(command: TaskCommand) -> bool:
+def is_automatic(command: TaskCommand | TaskRecord) -> bool:
     confirmation = command.payload.get(DESKTOP_CONFIRMATION_PAYLOAD_KEY) or {}
     return bool(command.payload.get(AUTOMATIC_PROCESSING_PAYLOAD_KEY)) or (
         isinstance(confirmation, Mapping) and confirmation.get("source") == "automatic_mode"

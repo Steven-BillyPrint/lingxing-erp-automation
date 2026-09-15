@@ -12,7 +12,7 @@ from uuid import uuid4
 
 from erp_automation.contracts.controller import TaskSubmissionReceipt
 from erp_automation.application.automatic_processing import (
-    AUTOMATIC_PROCESSING_FEATURE, run_automatic_processing,
+    AUTOMATIC_PROCESSING_FEATURE, run_automatic_processing, is_automatic,
 )
 from erp_automation.contracts.operation_feedback import operation_rejection
 from erp_automation.contracts.models import CUSTOM_ORDER_SUBMISSION_ID_PAYLOAD_KEY, SHIPMENT_SUBMISSION_ID_PAYLOAD_KEY
@@ -2472,6 +2472,42 @@ if PYSIDE6_AVAILABLE:
                 border-radius: 8px;
                 padding: 8px 11px;
             }
+            QFrame#settingsSection {
+                background: #FFFFFF;
+                border: 1px solid #E4E7EC;
+                border-radius: 10px;
+            }
+            QLabel#settingsSectionTitle { color: #101828; font-size: 12pt; font-weight: 600; }
+            QLabel#settingsHelper { color: #667085; background: transparent; border: none; }
+            QFrame#settingsSection QCheckBox, QWidget#settingsInlineFields { background: transparent; }
+            QFrame#processingModeCard {
+                background: #EFF6FF;
+                border: 1px solid #BFDBFE;
+                border-left: 4px solid #2563EB;
+                border-radius: 10px;
+            }
+            QLabel#processingModeStatus { color: #1D4ED8; font-size: 13pt; font-weight: 600; }
+            QFrame#processingModeCard[mode="manual"] {
+                background: #FFFBEB; border-color: #FDE68A; border-left-color: #F59E0B;
+            }
+            QLabel#processingModeStatus[mode="manual"] { color: #92400E; }
+            QPushButton#processingModeButton {
+                min-height: 48px;
+                font-size: 11pt;
+                font-weight: 600;
+                border-radius: 9px;
+            }
+            QPushButton#processingModeButton[mode="automatic"] {
+                color: #FFFFFF; background: #2563EB; border: 1px solid #2563EB;
+            }
+            QPushButton#processingModeButton[mode="automatic"]:hover { background: #1D4ED8; }
+            QPushButton#processingModeButton[mode="manual"] {
+                color: #92400E; background: #FEF3C7; border: 1px solid #F59E0B;
+            }
+            QPushButton#processingModeButton[mode="manual"]:hover { background: #FDE68A; }
+            QPushButton#processingModeButton:disabled {
+                color: #667085; background: #E4E7EC; border-color: #D0D5DD;
+            }
             QFrame#queueFilterPanel {
                 background: #FFFFFF;
                 border: 1px solid #E4E7EC;
@@ -3775,9 +3811,13 @@ if PYSIDE6_AVAILABLE:
                 finish,
             )
 
-        def set_scan_countdown(self, milliseconds: int) -> None:
+        def set_scan_countdown(self, milliseconds: int, *, automatic: bool = False) -> None:
+            mode_note = (
+                "自动模式：每分钟扫描，可处理订单自动执行 · " if automatic else
+                "手动模式：每 5 分钟扫描，由你选择订单执行 · "
+            )
             self.scan_schedule_label.setText(
-                "后台自动扫描：每 5 分钟 · "
+                mode_note +
                 f"下次扫描 {_scan_countdown_text(milliseconds)} · "
                 "范围：Amazon 待审核订单；自定义标签仅展示，不影响定制候选。"
                 "已入队订单若在下一轮完整快照中不再是候选，将按平台单号核对订单文件夹："
@@ -6381,9 +6421,13 @@ if PYSIDE6_AVAILABLE:
                 finish,
             )
 
-        def set_scan_countdown(self, milliseconds: int) -> None:
+        def set_scan_countdown(self, milliseconds: int, *, automatic: bool = False) -> None:
+            mode_note = (
+                "自动模式：每分钟扫描，物流就绪后自动标发 · " if automatic else
+                "手动模式：每 3 小时扫描，由你选择订单标发 · "
+            )
             self.scan_schedule_label.setText(
-                "● 每 3 小时自动扫描 · "
+                mode_note +
                 f"下次 {_scan_countdown_text(milliseconds)} · "
                 "服务器扫描领星待审核订单，本机负责物流查询"
             )
@@ -8764,22 +8808,30 @@ if PYSIDE6_AVAILABLE:
             scroll.setFrameShape(QFrame.Shape.NoFrame)
             body = QWidget()
             body_layout = QVBoxLayout(body)
+            body_layout.setContentsMargins(0, 0, 8, 12)
+            body_layout.setSpacing(16)
+            settings_forms = []
 
             def section(label: str) -> QFormLayout:
                 frame = QFrame()
-                frame.setStyleSheet(
-                    "background: white; border: 1px solid #dfe4ea; border-radius: 6px;"
-                )
+                frame.setObjectName("settingsSection")
                 section_layout = QVBoxLayout(frame)
+                section_layout.setContentsMargins(20, 16, 20, 20)
+                section_layout.setSpacing(14)
                 heading = QLabel(label)
-                heading.setStyleSheet("font-size: 16px; font-weight: bold; border: 0;")
+                heading.setObjectName("settingsSectionTitle")
                 section_layout.addWidget(heading)
                 form_layout = QFormLayout()
+                form_layout.setHorizontalSpacing(20)
+                form_layout.setVerticalSpacing(12)
+                form_layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+                form_layout.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+                settings_forms.append(form_layout)
                 section_layout.addLayout(form_layout)
                 body_layout.addWidget(frame)
                 return form_layout
 
-            account_form = section("账号与 API（阿里云服务器加密保存）")
+            account_form = section("领星接口与登录")
             self.app_id = QLineEdit()
             self.app_secret = QLineEdit()
             self.api_base_url = QLineEdit()
@@ -8798,7 +8850,7 @@ if PYSIDE6_AVAILABLE:
                 self._login_lingxing_browser
             )
             self.erp_mark_routes = QPlainTextEdit()
-            self.erp_mark_routes.setMinimumHeight(130)
+            self.erp_mark_routes.setFixedHeight(120)
             self.erp_mark_routes.setPlaceholderText(
                 '{\n  "UPS": {"warehouse_id": 1, "logistics_type_id": 2, '
                 '"freight_currency_code": "USD"}\n}'
@@ -8824,7 +8876,7 @@ if PYSIDE6_AVAILABLE:
             self.clicksend_api_key = QLineEdit()
             self.clicksend_sender_id = QLineEdit()
             self.virtual_email_domains = QPlainTextEdit()
-            self.virtual_email_domains.setMinimumHeight(90)
+            self.virtual_email_domains.setFixedHeight(96)
             self.amazon_sandbox = QCheckBox("使用 Amazon SP-API 沙箱")
             self._sensitive_editors = (
                 self.app_secret,
@@ -8880,6 +8932,7 @@ if PYSIDE6_AVAILABLE:
             account_form.addRow("领星网页登录", self.lingxing_remember)
             account_form.addRow("当前电脑登录", self.lingxing_login_button)
             account_form.addRow("ERP 仓库/物流 ID 映射", self.erp_mark_routes)
+            account_form = section("阿里物流账号")
             account_form.addRow("阿里物流下单账号", self.alibaba_account)
             account_form.addRow("阿里物流下单密码", self.alibaba_password)
             account_form.addRow("阿里下单网页登录", self.alibaba_auto_login)
@@ -8895,9 +8948,12 @@ if PYSIDE6_AVAILABLE:
                 "阿里查询网页登录",
                 self.alibaba_logistics_query_auto_login,
             )
+            account_form = section("Amazon 接口")
             account_form.addRow("Amazon LWA Client ID", self.amazon_client_id)
             account_form.addRow("Amazon LWA Client Secret", self.amazon_client_secret)
             account_form.addRow("Amazon Refresh Token", self.amazon_refresh_token)
+            account_form.addRow("Amazon 环境", self.amazon_sandbox)
+            account_form = section("客户通知 · 邮箱与短信")
             account_form.addRow("阿里邮箱应用名称", self.alimail_application_name)
             account_form.addRow("阿里邮箱 App ID", self.alimail_app_id)
             account_form.addRow("阿里邮箱 App Secret", self.alimail_app_secret)
@@ -8908,7 +8964,6 @@ if PYSIDE6_AVAILABLE:
             account_form.addRow("ClickSend API Key", self.clicksend_api_key)
             account_form.addRow("ClickSend Sender ID（可选）", self.clicksend_sender_id)
             account_form.addRow("平台虚拟邮箱域名映射", self.virtual_email_domains)
-            account_form.addRow("Amazon 环境", self.amazon_sandbox)
 
             rule_form = section("定制订单规则")
             self.high_value_split_weight = QComboBox()
@@ -8932,6 +8987,7 @@ if PYSIDE6_AVAILABLE:
                 "且金额和预估实重也同时超限时才拆单。"
             )
             high_value_threshold_widget = QWidget()
+            high_value_threshold_widget.setObjectName("settingsInlineFields")
             high_value_threshold_layout = QHBoxLayout(high_value_threshold_widget)
             high_value_threshold_layout.setContentsMargins(0, 0, 0, 0)
             high_value_threshold_layout.setSpacing(8)
@@ -8947,20 +9003,41 @@ if PYSIDE6_AVAILABLE:
                 high_value_threshold_widget,
             )
 
-            processing_form = section("处理模式")
+            self.processing_mode_card = processing_card = QFrame()
+            processing_card.setObjectName("processingModeCard")
+            processing_layout = QHBoxLayout(processing_card)
+            processing_layout.setContentsMargins(20, 16, 20, 16)
+            processing_layout.setSpacing(24)
+            mode_info = QVBoxLayout()
+            mode_info.setSpacing(7)
+            mode_title = QLabel("订单处理模式")
+            mode_title.setObjectName("settingsHelper")
+            self.processing_mode_status = QLabel()
+            self.processing_mode_status.setObjectName("processingModeStatus")
+            self.processing_mode_status.setWordWrap(True)
+            self.processing_mode_description = QLabel()
+            self.processing_mode_description.setWordWrap(True)
+            self.processing_mode_description.setObjectName("settingsHelper")
+            mode_info.addWidget(mode_title)
+            mode_info.addWidget(self.processing_mode_status)
+            mode_info.addWidget(self.processing_mode_description)
+            processing_layout.addLayout(mode_info, 1)
+            mode_action = QVBoxLayout()
             self._processing_mode = "automatic"
             self._processing_mode_saving = False
-            self.processing_mode_button = QPushButton("自动处理 · 点击切换手动")
-            self.processing_mode_button.setMinimumHeight(36)
+            self.processing_mode_button = QPushButton()
+            self.processing_mode_button.setObjectName("processingModeButton")
+            self.processing_mode_button.setMinimumSize(236, 50)
+            self.processing_mode_button.setCursor(Qt.CursorShape.PointingHandCursor)
             self.processing_mode_button.clicked.connect(self._toggle_processing_mode)
-            processing_form.addRow("当前账号", self.processing_mode_button)
-            processing_note = QLabel(
-                "自动：每分钟扫描订单，发现可处理订单后自动处理定制、标发并发送客户通知。\n"
-                "手动：保留扫描，由你选择订单执行和审核通知。切换立即保存；已开始的订单完成当前任务。\n"
-                "自动处理需要保持客户端在线；登录验证、异常和未知结果仍需人工处理，急停始终有效。"
-            )
-            processing_note.setWordWrap(True)
-            processing_form.addRow(processing_note)
+            self.processing_mode_action_hint = QLabel()
+            self.processing_mode_action_hint.setObjectName("settingsHelper")
+            self.processing_mode_action_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            mode_action.addWidget(self.processing_mode_button)
+            mode_action.addWidget(self.processing_mode_action_hint)
+            processing_layout.addLayout(mode_action)
+            layout.insertWidget(1, processing_card)
+            self._show_processing_mode("automatic")
 
             review_form = section("手动操作审核")
             self.custom_order_review_enabled = QCheckBox(
@@ -8979,6 +9056,10 @@ if PYSIDE6_AVAILABLE:
             )
             review_form.addRow("定制订单", self.custom_order_review_enabled)
             review_form.addRow("自动标发", self.shipment_review_enabled)
+            review_hint = QLabel("仅控制手动点击执行时的审核确认；自动任务无需勾选这两项。")
+            review_hint.setWordWrap(True)
+            review_hint.setObjectName("settingsHelper")
+            review_form.addRow(review_hint)
 
             path_form = section("路径与运行策略")
             self.folder_root = QLineEdit()
@@ -9030,7 +9111,9 @@ if PYSIDE6_AVAILABLE:
             path_form.addRow("日志保留（天）", self.log_retention)
             path_form.addRow("网页补位", self.browser_fallback)
             path_form.addRow("日志脱敏", self.redact_logs)
-            path_form.addRow("客户通知", QLabel("扫描仅生成审核草稿；审核通过后真实发送"))
+            notification_hint = QLabel("自动模式发送符合条件的首次通知和新增包裹补发；手动模式由你审核发送。")
+            notification_hint.setWordWrap(True)
+            path_form.addRow("客户通知", notification_hint)
 
             editors = (
                 self.app_id,
@@ -9124,14 +9207,43 @@ if PYSIDE6_AVAILABLE:
             actions.addStretch(1)
             body_layout.addLayout(actions)
 
+            for form in settings_forms:
+                for row in range(form.rowCount()):
+                    item = form.itemAt(row, QFormLayout.ItemRole.LabelRole)
+                    label = item.widget() if item else None
+                    if isinstance(label, QLabel):
+                        label.setFixedWidth(204)
+                        label.setWordWrap(True)
             body_layout.addStretch(1)
             scroll.setWidget(body)
             layout.addWidget(scroll, 1)
 
         def _show_processing_mode(self, mode: str) -> None:
             self._processing_mode = mode
+            automatic = mode == "automatic"
             self.processing_mode_button.setText(
-                "自动处理 · 点击切换手动" if mode == "automatic" else "手动处理 · 点击切换自动"
+                "自动处理 · 已开启" if automatic else "手动处理 · 已开启"
+            )
+            self.processing_mode_button.setAccessibleName("订单处理模式：" + self.processing_mode_button.text())
+            for widget in (self.processing_mode_button, self.processing_mode_card, self.processing_mode_status):
+                if widget.property("mode") != mode:
+                    widget.setProperty("mode", mode)
+                    widget.style().unpolish(widget)
+                    widget.style().polish(widget)
+            action = "切换为手动处理" if automatic else "切换为自动处理"
+            self.processing_mode_button.setToolTip(action + "，立即保存到当前账号。")
+            self.processing_mode_action_hint.setText("点击" + action + " · 立即保存")
+            self.processing_mode_description.setText(
+                "每分钟扫描，自动处理定制订单、标发及客户通知。请保持客户端在线；异常和登录验证需人工处理。"
+                if automatic else
+                "保留定时扫描，由你选择订单执行和审核通知。已开始的任务继续完成，未开始的自动任务撤下。"
+            )
+            snapshot = self._latest_snapshot
+            self.processing_mode_status.setText(
+                ("自动处理已暂停" if snapshot and snapshot.policy.execution_paused else
+                 "自动处理已开启 · 本机负责调度" if snapshot and snapshot.is_scheduler_leader else
+                 "自动处理已开启 · 其他在线客户端负责调度" if snapshot else "自动处理已开启")
+                if automatic else "手动处理已开启"
             )
 
         def _toggle_processing_mode(self) -> None:
@@ -9140,12 +9252,15 @@ if PYSIDE6_AVAILABLE:
             mode = "manual" if self._processing_mode == "automatic" else "automatic"
             self._processing_mode_saving = True
             self.processing_mode_button.setEnabled(False)
+            self.processing_mode_button.setText("正在保存…")
 
             def finish(result: ControlResult) -> None:
                 self._processing_mode_saving = False
                 self.processing_mode_button.setEnabled(True)
                 if result.accepted:
                     self._show_processing_mode(mode)
+                else:
+                    self._show_processing_mode(self._processing_mode)
                 self._result_handler(result)
 
             _run_control_result_responsive(
@@ -9904,6 +10019,7 @@ if PYSIDE6_AVAILABLE:
                 self.processing_mode_button.setEnabled(supported and not self._processing_mode_saving)
                 if not supported:
                     self.processing_mode_button.setText("等待服务器支持自动处理")
+                    self.processing_mode_status.setText("等待服务器升级，自动处理尚不可用")
             if self._dirty and self._hydrated:
                 return
             if self._hydrated and signature == self._last_signature:
@@ -10381,10 +10497,7 @@ if PYSIDE6_AVAILABLE:
                 heading_row.addWidget(button)
             self._page_action_row_layout = heading_row
             layout.addLayout(heading_row)
-            hint = QLabel(
-                "自动扫描只采集联系方式和物流并生成草稿。首次发送、补齐物流后的再次发送，"
-                "都必须在此页人工审核；只有“审核通过并发送”会调用外部 API。"
-            )
+            self.processing_hint = hint = QLabel()
             hint.setObjectName("queueStatusBanner")
             hint.setWordWrap(True)
             layout.addWidget(hint)
@@ -12793,6 +12906,12 @@ if PYSIDE6_AVAILABLE:
                     NOTIFICATION_REVIEW_RESCAN_TRIGGER,
                 }
             ]
+            self.processing_hint.setText(
+                "自动模式：至少一个包裹已出库且物流可用时发送首次通知；其余包裹显示待补充，新增已出库包裹后自动补发。"
+                "发送结果未知、资料冲突和异常仍需人工核对。"
+                if snapshot.settings.processing_mode == "automatic" else
+                "手动模式：扫描生成通知草稿，由你审核后发送。可先通知已出库包裹，后续新增包裹后再次审核补发。"
+            )
             next_data_task_states = {
                 task.task_id: task.status for task in notification_data_tasks
             }
@@ -13953,11 +14072,23 @@ if PYSIDE6_AVAILABLE:
             self.custom_orders_page.update_sync_status()
             self._sync_scheduled_scan_timers(snapshot)
             unchanged = snapshot is self._latest_snapshot
+            automatic = (
+                snapshot.settings.processing_mode == "automatic"
+                and AUTOMATIC_PROCESSING_FEATURE in snapshot.server_features
+            )
+
+            def countdown(key: str, timer: QTimer) -> int:
+                due = snapshot.scheduled_scan_due_at.get(key)
+                if automatic and due:
+                    remaining_seconds = float(due) - datetime.now(timezone.utc).timestamp()
+                    return max(0, int(remaining_seconds * 1000))
+                return timer.remainingTime()
+
             self.custom_orders_page.set_scan_countdown(
-                self._custom_scan_timer.remainingTime()
+                countdown("automatic_custom_scan", self._custom_scan_timer), automatic=automatic,
             )
             self.shipment_page.set_scan_countdown(
-                self._shipment_scan_timer.remainingTime()
+                countdown("automatic_shipment_scan", self._shipment_scan_timer), automatic=automatic,
             )
             self._sync_local_connection_state()
             if unchanged:
@@ -14099,7 +14230,7 @@ if PYSIDE6_AVAILABLE:
                     QTimer.singleShot(0, self.close)
                 return
             self._show_next_interaction()
-            self._show_next_shipment_completion_notice()
+            self._show_next_shipment_completion_notice(snapshot)
 
         def _capture_shipment_completion_notices(
             self,
@@ -14178,7 +14309,8 @@ if PYSIDE6_AVAILABLE:
                     and task.task_id not in self._notified_shipment_task_ids
                 ):
                     self._notified_shipment_task_ids.add(task.task_id)
-                    self._pending_shipment_completion_notices.append((task,))
+                    if snapshot.settings.processing_mode != "automatic" and not is_automatic(task):
+                        self._pending_shipment_completion_notices.append((task,))
 
             for batch_id, task_ids in tuple(self._shipment_batches.items()):
                 if batch_id in self._notified_shipment_batch_ids:
@@ -14192,7 +14324,8 @@ if PYSIDE6_AVAILABLE:
                 )
                 self._notified_shipment_batch_ids.add(batch_id)
                 self._notified_shipment_task_ids.update(task_ids)
-                self._pending_shipment_completion_notices.append(tuple(tasks))
+                if snapshot.settings.processing_mode != "automatic" and not any(is_automatic(task) for task in tasks):
+                    self._pending_shipment_completion_notices.append(tuple(tasks))
                 self._shipment_batches.pop(batch_id, None)
             self._known_task_statuses = current_statuses
 
@@ -14347,7 +14480,10 @@ if PYSIDE6_AVAILABLE:
                     ),
                 )
 
-        def _show_next_shipment_completion_notice(self) -> None:
+        def _show_next_shipment_completion_notice(self, snapshot: DesktopSnapshot) -> None:
+            if snapshot.settings.processing_mode == "automatic":
+                self._pending_shipment_completion_notices.clear()
+                return
             if self._active_interaction_id is not None:
                 return
             if self._controller.pending_interactions():

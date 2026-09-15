@@ -29,6 +29,8 @@ from .errors import (
     LingxingHTTPError,
     LingxingProtocolError,
     LingxingTransportError,
+    is_rate_limited_api_error,
+    is_transient_json_read_error,
     redact_sensitive_text,
 )
 from .signing import LingxingSigner, canonical_json_bytes
@@ -38,8 +40,6 @@ DEFAULT_BASE_URL = "https://openapi.lingxing.com"
 _RETRYABLE_HTTP_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
 _TOKEN_REJECTION_CODES = frozenset({"2001003", "2001005"})
 _SIGN_REJECTION_CODES = frozenset({"2001006", "2001007"})
-_RATE_LIMIT_API_CODES = frozenset({"3001008"})
-_TRANSIENT_JSON_API_CODES = frozenset({"500"})
 _RATE_LIMIT_RETRY_BASE_DELAY_SECONDS = 2.0
 _SERVICE_ERROR_RETRY_BASE_DELAY_SECONDS = 1.0
 LOGGER = logging.getLogger(__name__)
@@ -222,14 +222,6 @@ def _is_transport_exception(exc: BaseException) -> bool:
     except ImportError:
         return False
     return isinstance(exc, httpx.TransportError)
-
-
-def _is_rate_limited_api_error(exc: LingxingAPIError) -> bool:
-    # The FBM detail service also returns code 103 with this message. Unlike
-    # the global 3001008 code, 103 alone does not prove a rate-limit rejection.
-    return exc.code in _RATE_LIMIT_API_CODES or (
-        exc.code == "103" and "请求过于频繁" in exc.server_message
-    )
 
 
 def _json_payload(response: object, operation: str) -> dict[str, Any]:
@@ -477,13 +469,13 @@ class LingxingOpenAPIClient:
                     # accepted. Recreate timestamp/sign exactly once.
                     sign_recovery_used = True
                     continue
-                rate_limited = _is_rate_limited_api_error(exc)
+                rate_limited = is_rate_limited_api_error(exc)
                 # HTTP 200 can carry a service-level 500. Binary download
                 # services reuse 500 for unrelated errors (including signing),
                 # so only JSON endpoints use this transient-code policy.
                 transient_service_error = (
                     policy.response_kind is ResponseKind.JSON
-                    and exc.code in _TRANSIENT_JSON_API_CODES
+                    and is_transient_json_read_error(exc)
                 )
                 if (
                     policy.may_retry_transport

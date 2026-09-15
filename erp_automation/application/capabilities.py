@@ -77,6 +77,10 @@ class CapabilityUnavailable(RuntimeError):
     """当前适配器不支持某项能力。"""
 
 
+class RetryableReadUnavailable(CapabilityUnavailable):
+    """A read failed transiently; callers must still guard any dependent writes."""
+
+
 class ManualReviewRequired(RuntimeError):
     def __init__(self, capability: Capability, message: str, *, result: MutationResult | None = None):
         super().__init__(message)

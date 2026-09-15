@@ -2138,7 +2138,7 @@ def _ready_database(path, *, system_count: int = 5) -> ShipmentNotificationStore
     return store
 
 
-def test_automatic_notification_candidates_require_complete_outbound_and_no_send_evidence(tmp_path):
+def test_automatic_notification_candidates_require_authoritative_outbound_and_no_send_evidence(tmp_path):
     from erp_automation.persistence.automatic_dispatch import AutomaticDispatchStore
 
     store = _ready_database(tmp_path / "automatic-notifications.sqlite3", system_count=1)
@@ -2163,6 +2163,71 @@ def test_automatic_notification_candidates_require_complete_outbound_and_no_send
     with store.connect() as connection:
         connection.execute("UPDATE shipment_notifications SET last_error = '', state = 'CANCELLED'")
     assert dispatch.candidates("notification") == []
+
+
+def test_automatic_candidates_send_first_partial_and_each_new_package_once(tmp_path):
+    from erp_automation.persistence.automatic_dispatch import AutomaticDispatchStore
+
+    store, systems = _outbound_scenario_store(tmp_path, system_count=3)
+    gateway = _OutboundScenarioGateway([], system_order_nos=systems)
+    platform = "112-1234567-1234567"
+    dispatch = AutomaticDispatchStore(store.path)
+    mail = _AcceptedMail()
+    service = ShipmentNotificationService(store, _config(), alimail_client=mail)
+    sent_ids = []
+    for shipped in (1, 2, 3):
+        gateway.rows = [_outbound_scenario_row(system_order_no=f"1000{index}",
+            package_no=f"WO-{index}", status=3 if index <= shipped else 2,
+            tracking_no=f"TRACK-{index}") for index in (1, 2, 3)]
+        asyncio.run(sync_notification_drafts(gateway, store, _config(), platform_order_nos=(platform,)))
+        candidates = dispatch.candidates("notification")
+        assert len(candidates) == 1
+        notification_id = candidates[0]["id"]
+        notification = store.get_notification(notification_id)
+        assert (notification["package_complete"], notification["package_total"]) == (shipped, 3)
+        assert notification_id not in sent_ids
+        sent_ids.append(notification_id)
+        asyncio.run(service.approve_and_send(notification_id, actor="automatic-test"))
+        assert dispatch.candidates("notification") == []
+        asyncio.run(sync_notification_drafts(gateway, store, _config(), platform_order_nos=(platform,)))
+        assert dispatch.candidates("notification") == []
+    assert len(mail.calls) == 3
+    assert "Available soon" in mail.calls[0]["body"]
+    assert "Available soon" not in mail.calls[-1]["body"]
+
+
+@pytest.mark.parametrize("prior_state", ["SENDING", "DELIVERY_UNCONFIRMED", "RETRYABLE", "FAILED"])
+def test_automatic_supplement_cannot_bypass_unknown_prior_send(tmp_path, prior_state):
+    from erp_automation.persistence.automatic_dispatch import AutomaticDispatchStore
+
+    store = _ready_database(tmp_path / "supplement.sqlite3", system_count=2)
+    platform = "112-1234567-1234567"
+    store.upsert_contact(_contact(system_order_nos=("10001", "10002")))
+    store.replace_package_scan(platform, [_package(1), _package(2, complete=False)])
+    first = store.prepare_notification(platform, _config())
+    store.mark_manually_completed([first["id"]], note="first notice")
+    store.replace_package_scan(platform, [_package(1), _package(2)])
+    supplement = store.prepare_notification(platform, _config())
+    dispatch = AutomaticDispatchStore(store.path)
+    assert [row["id"] for row in dispatch.candidates("notification")] == [supplement["id"]]
+    with store.connect() as conn:
+        conn.execute("UPDATE shipment_notifications SET state = ? WHERE id = ?", (prior_state, first["id"]))
+    assert dispatch.candidates("notification") == []
+
+
+def test_automatic_notification_does_not_resend_changed_tracking_for_same_package(tmp_path):
+    from erp_automation.persistence.automatic_dispatch import AutomaticDispatchStore
+
+    store = _ready_database(tmp_path / "same-package.sqlite3", system_count=2)
+    platform = "112-1234567-1234567"
+    store.upsert_contact(_contact(system_order_nos=("10001", "10002")))
+    store.replace_package_scan(platform, [_package(1), _package(2, complete=False)])
+    first = store.prepare_notification(platform, _config())
+    store.mark_manually_completed([first["id"]], note="already notified")
+    store.replace_package_scan(platform, [replace(_package(1), final_tracking_no="CHANGED"), _package(2, complete=False)])
+    reopened = store.reopen_for_review(first["id"], _config(), actor="test", note="correct tracking")
+    assert reopened["id"] != first["id"]
+    assert AutomaticDispatchStore(store.path).candidates("notification") == []
 
 
 def test_notification_read_model_includes_shipment_product_types(tmp_path) -> None:

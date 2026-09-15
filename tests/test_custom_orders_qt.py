@@ -2531,6 +2531,7 @@ def test_main_window_shows_one_prominent_notice_for_newly_completed_shipment(
     monkeypatch,
 ):
     controller = RecordingController()
+    controller.set_processing_mode("manual")
     notices: list[tuple[str, str]] = []
     monkeypatch.setattr(
         QMessageBox,
@@ -2571,6 +2572,7 @@ def test_main_window_shows_one_prominent_notice_for_newly_completed_shipment(
 
 def test_main_window_aggregates_mixed_shipment_batch_into_one_notice(app, monkeypatch):
     controller = RecordingController()
+    controller.set_processing_mode("manual")
     notices: list[tuple[str, str]] = []
     monkeypatch.setattr(
         QMessageBox,
@@ -2643,6 +2645,82 @@ def test_main_window_aggregates_mixed_shipment_batch_into_one_notice(app, monkey
         assert "111-SUCCESS" in notices[0][1]
         assert "112-FAILED" in notices[0][1]
         assert "接口明确失败" in notices[0][1]
+    finally:
+        window.close()
+
+
+@pytest.mark.parametrize("automatic_task", [False, True])
+def test_automatic_mode_never_replays_shipment_completion_popups(app, monkeypatch, automatic_task):
+    controller = RecordingController()
+    notices = []
+    monkeypatch.setattr(QMessageBox, "information", lambda *args: notices.append(args))
+    window = DesktopMainWindow(controller)
+    try:
+        window._timer.stop()
+        window._automatic_dispatch_timer.stop()
+        controller._state.tasks = [TaskRecord(
+            task_id="automatic-completion", name="自动标发", area=TaskArea.SHIPMENT,
+            capability=Capability.OUTBOUND_ORDER, status=TaskStatus.RUNNING,
+            payload={"automatic_processing": automatic_task},
+        )]
+        window.refresh()
+        controller._state.tasks = [replace(controller._state.tasks[0], status=TaskStatus.SUCCEEDED)]
+        window.refresh()
+        controller.set_processing_mode("manual")
+        window.refresh()
+        assert notices == []
+        assert window._pending_shipment_completion_notices == []
+        assert controller._state.tasks[0].status is TaskStatus.SUCCEEDED
+    finally:
+        window.close()
+
+
+def test_switching_to_automatic_discards_completion_popup_waiting_behind_interaction(app, monkeypatch):
+    controller = RecordingController()
+    controller.set_processing_mode("manual")
+    notices = []
+    monkeypatch.setattr(QMessageBox, "information", lambda *args: notices.append(args))
+    window = DesktopMainWindow(controller)
+    try:
+        window._timer.stop()
+        window._automatic_dispatch_timer.stop()
+        window._active_interaction_id = "busy"
+        controller._state.tasks = [TaskRecord(
+            task_id="pending-completion", name="标发", area=TaskArea.SHIPMENT,
+            capability=Capability.OUTBOUND_ORDER, status=TaskStatus.SUCCEEDED,
+        )]
+        window.refresh()
+        assert len(window._pending_shipment_completion_notices) == 1
+        controller.set_processing_mode("automatic")
+        window.refresh()
+        assert window._pending_shipment_completion_notices == []
+        window._active_interaction_id = None
+        controller.set_processing_mode("manual")
+        window.refresh()
+        assert notices == []
+    finally:
+        window._active_interaction_id = None
+        window.close()
+
+
+def test_automatic_task_stays_silent_when_user_switches_to_manual_before_completion(app, monkeypatch):
+    controller = RecordingController()
+    notices = []
+    monkeypatch.setattr(QMessageBox, "information", lambda *args: notices.append(args))
+    window = DesktopMainWindow(controller)
+    try:
+        window._timer.stop()
+        window._automatic_dispatch_timer.stop()
+        controller._state.tasks = [TaskRecord(
+            task_id="automatic-completion", name="自动标发", area=TaskArea.SHIPMENT,
+            capability=Capability.OUTBOUND_ORDER, status=TaskStatus.RUNNING,
+            payload={"automatic_processing": True},
+        )]
+        window.refresh()
+        controller._state.settings = replace(controller._state.settings, processing_mode="manual")
+        controller._state.tasks = [replace(controller._state.tasks[0], status=TaskStatus.SUCCEEDED)]
+        window.refresh()
+        assert notices == []
     finally:
         window.close()
 

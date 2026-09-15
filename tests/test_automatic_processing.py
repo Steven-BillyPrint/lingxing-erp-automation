@@ -288,3 +288,57 @@ def test_legacy_client_saving_other_settings_preserves_manual_mode(tmp_path):
     finally:
         service.close()
         controller.close()
+
+
+def test_new_automatic_client_takes_scheduler_from_legacy_client_during_rollout(tmp_path):
+    from erp_automation.coordination.access import OperatorIdentity
+    from erp_automation.coordination.service import CoordinatedControllerService
+    from erp_automation.coordination.store import CoordinationStore
+    from erp_automation.ui.controller import InMemoryBackgroundTaskController
+
+    service = CoordinatedControllerService(
+        None, CoordinationStore(tmp_path / "coordination.sqlite3"),
+        controller_factory=lambda identity: InMemoryBackgroundTaskController(),
+        required_client_version="2026.09.15.1", rollout_previous_client_version="2026.09.14.2",
+        client_rollout_grace_seconds=3600,
+    )
+    identity = OperatorIdentity("test@billyprint.com", "Test", "test")
+    try:
+        assert service.register("old", "Old", client_version="2026.09.14.2", identity=identity)["scheduler"]["is_leader"]
+        service._controller_for(identity)
+        assert service.register("new", "New", client_version="2026.09.15.1", identity=identity)["scheduler"]["is_leader"]
+        assert not service.heartbeat("old", identity=identity)["scheduler"]["is_leader"]
+        rejected = service.invoke(instance_id="old", request_id="old-auto", method="submit_task",
+            raw_args=[to_jsonable(automatic_scan_commands()[0])], raw_kwargs={}, identity=identity)
+        assert rejected["result"]["details"]["scheduler_rejected"]
+        service.deregister("new", identity=identity)
+        # With only old clients left, ordinary scans can still run during rollout.
+        assert service.heartbeat("old", identity=identity)["scheduler"]["is_leader"]
+    finally:
+        service.close()
+
+
+def test_automatic_scheduler_handoff_is_atomic_and_recovers_after_pause_and_expiry(tmp_path):
+    from erp_automation.application.automatic_processing import AUTOMATIC_PROCESSING_MIN_CLIENT_VERSION
+    from erp_automation.coordination.store import CoordinationStore
+
+    now = [100.0]
+    store = CoordinationStore(tmp_path / "coordination.sqlite3", clock=lambda: now[0])
+    def elect(instance):
+        return store.elect_scheduler(instance, ttl_seconds=10,
+            automatic_client_min_version=AUTOMATIC_PROCESSING_MIN_CLIENT_VERSION)
+    store.register_instance("old", "Old", ttl_seconds=60, client_version="2026.09.14.2")
+    assert elect("old")["is_leader"]
+    for instance in ("new-a", "new-b"):
+        store.register_instance(instance, instance, ttl_seconds=60, client_version="2026.09.15.1")
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(elect, ("new-a", "new-b")))
+    assert sum(item["is_leader"] for item in results) == 1
+    leader = next(item["owner_instance_id"] for item in results if item["is_leader"])
+    follower = "new-b" if leader == "new-a" else "new-a"
+    store.set_instance_execution_paused(leader, enabled=True, state="paused", reason="test")
+    assert elect(follower)["is_leader"]
+    assert not elect("old")["is_leader"]
+    now[0] += 61
+    store.register_instance("replacement", "Replacement", ttl_seconds=60, client_version="2026.09.15.1")
+    assert elect("replacement")["is_leader"]
