@@ -266,3 +266,25 @@ def test_automatic_scan_cadence_is_shared_across_repeated_client_ticks(tmp_path)
         assert len(controller.task_snapshot()) == 1
     finally:
         service.close()
+
+
+def test_legacy_client_saving_other_settings_preserves_manual_mode(tmp_path):
+    from erp_automation.coordination.service import CoordinatedControllerService
+    from erp_automation.coordination.store import CoordinationStore
+
+    controller = controller_at(tmp_path)
+    service = CoordinatedControllerService(controller, CoordinationStore(tmp_path / "coordination.sqlite3"))
+    try:
+        controller.set_processing_mode("manual")
+        service.register("legacy-pc", "Legacy")
+        settings = to_jsonable(controller.snapshot().settings)
+        settings.pop("processing_mode")
+        settings["api_timeout_seconds"] = 45
+        result = service.invoke(instance_id="legacy-pc", request_id="legacy-settings", method="save_settings",
+                                raw_args=[settings], raw_kwargs={})["result"]
+        assert result["accepted"]
+        assert controller.snapshot().settings.processing_mode == "manual"
+        assert controller.snapshot().settings.api_timeout_seconds == 45
+    finally:
+        service.close()
+        controller.close()

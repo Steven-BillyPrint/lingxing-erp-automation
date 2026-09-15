@@ -2966,6 +2966,10 @@ class CoordinatedControllerService:
             current = controller.snapshot().settings
             args[0] = replace(
                 submitted,
+                processing_mode=(
+                    submitted.processing_mode if "processing_mode" in raw_args[0]
+                    else current.processing_mode
+                ),
                 **{
                     name: getattr(current, name)
                     for name in SENSITIVE_SETTINGS_FIELDS
