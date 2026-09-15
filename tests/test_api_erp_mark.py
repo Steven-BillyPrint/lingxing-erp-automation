@@ -18,15 +18,24 @@ from erp_automation.application.api_erp_mark import (
 )
 from erp_automation.application.capabilities import (
     Capability,
+    CapabilityRouter,
     ManualReviewRequired,
     MutationResult,
     MutationState,
+    RetryableReadUnavailable,
 )
 from erp_automation.application.lingxing_gateway import (
     FAST_OUTBOUND_FAILED,
     FAST_OUTBOUND_RESULT_STATE_KEY,
     FAST_OUTBOUND_SUCCEEDED,
+    LingxingGateway,
     PageResult,
+)
+from erp_automation.integrations.lingxing import (
+    LingxingAPIError,
+    LingxingHTTPError,
+    LingxingProtocolError,
+    LingxingTransportError,
 )
 from shipment_automation.erp_mark_ship import (
     ErpMarkEmergencyStopped,
@@ -713,6 +722,74 @@ def test_emergency_stop_after_waybill_approval_prevents_tracking_request() -> No
             "set_shipping_channel",
             "review_orders",
             "list_wms_orders",
+        ]
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(("error", "retryable"), [
+    (LingxingAPIError("list_wms_orders", 3001008, "requests too frequently"), True),
+    (LingxingAPIError("list_wms_orders", 103, "请求过于频繁"), True),
+    (LingxingAPIError("list_wms_orders", 500, "service unavailable"), True),
+    (LingxingHTTPError("list_wms_orders", 429, retryable=True), True),
+    (LingxingHTTPError("list_wms_orders", 503, retryable=True), True),
+    (LingxingTransportError("list_wms_orders"), True),
+    (LingxingTransportError("list_wms_orders", retryable=False), False),
+    (LingxingHTTPError("list_wms_orders", 403), False),
+    (LingxingAPIError("list_wms_orders", 103, "invalid order"), False),
+    (LingxingAPIError("list_wms_orders", 10001, "permission denied"), False),
+    (LingxingProtocolError("invalid response"), False),
+])
+def test_preflight_preserves_transient_read_classification(error, retryable) -> None:
+    class ReadFailureClient:
+        calls = 0
+
+        async def list_wms_orders(self, **_kwargs):
+            self.calls += 1
+            raise error
+
+    async def run():
+        client = ReadFailureClient()
+        gateway = LingxingGateway(client, CapabilityRouter())
+        adapter = _adapter(gateway)
+
+        async def forbidden(_prompt):
+            pytest.fail("A failed preflight must stop before any write confirmation")
+
+        expected = RetryableReadUnavailable if retryable else ErpMarkManualReview
+        with pytest.raises(expected) as captured:
+            await adapter(None, _item(), forbidden)
+        assert client.calls == 1
+        assert ("将延迟重试" in str(captured.value)) is retryable
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("ambiguous_review", [False, True])
+def test_post_write_rate_limit_still_requires_manual_review(ambiguous_review) -> None:
+    class ReviewGateway(FakeGateway):
+        async def review_orders(self, orders, **kwargs):
+            if ambiguous_review:
+                self.calls.append(("review_orders", (orders, kwargs)))
+                raise ManualReviewRequired(
+                    Capability.REVIEW_ORDER, "transport timeout",
+                    result=_mutation(state=MutationState.UNKNOWN),
+                )
+            return await super().review_orders(orders, **kwargs)
+
+    async def run():
+        gateway = ReviewGateway()
+        gateway.wms_pages = [
+            [],
+            RetryableReadUnavailable("code=3001008"),
+            RetryableReadUnavailable("code=3001008"),
+        ]
+        adapter = _adapter(gateway, readback_delays_seconds=[0, 3])
+        with pytest.raises(ErpMarkManualReview):
+            await adapter(None, _item(), _always_confirm)
+        assert [name for name, _ in gateway.calls] == [
+            "list_wms_orders", "set_shipping_channel", "review_orders",
+            "list_wms_orders", "list_wms_orders",
         ]
 
     asyncio.run(run())

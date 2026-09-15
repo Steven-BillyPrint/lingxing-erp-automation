@@ -1,10 +1,16 @@
 import asyncio
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import ANY
 
 import pytest
 
 from shipment_automation import erp_mark_ship as mark_module
+from shipment_automation import queue_store as queue_store_module
+from erp_automation.application.api_erp_mark import ApiErpMarkAdapter, ErpLogisticsRoute
+from erp_automation.application.capabilities import CapabilityRouter
+from erp_automation.application.lingxing_gateway import LingxingGateway
+from erp_automation.integrations.lingxing import APIResponse, LingxingAPIError
 from shipment_automation.erp_mark_ship import (
     ErpMarkEmergencyStopped,
     ErpMarkManualReview,
@@ -897,6 +903,79 @@ def test_erp_failure_preserves_logistics_and_checkpoint_for_retry(tmp_path):
     assert report.retryable_count == 1
     assert row["logistics_state"] == LOGISTICS_READY
     assert row["erp_state"] == ERP_RETRYABLE
+
+
+@pytest.mark.parametrize("checkpoint", ["NONE", ERP_CHECKPOINT_LOGISTICS_SAVED])
+def test_preflight_rate_limit_defers_and_rechecks_without_replaying_writes(
+    tmp_path, monkeypatch, checkpoint,
+):
+    queue_path = tmp_path / "shipment_queue.sqlite3"
+    store = ShipmentWorkflowStore(queue_path)
+    candidate = _candidate()
+    store.upsert_candidate(candidate)
+    _make_ready(store)
+    with store.connect() as conn:
+        conn.execute("UPDATE shipment_erp SET checkpoint = ?", (checkpoint,))
+
+    class Client:
+        def __init__(self):
+            self.calls = []
+
+        async def list_wms_orders(self, **filters):
+            self.calls.append(filters)
+            if len(self.calls) == 1:
+                raise LingxingAPIError(
+                    "list_wms_orders", 3001008,
+                    "new requests too frequently. please request later.",
+                )
+            return APIResponse(
+                code="0", message="success", request_id="readback-1",
+                response_time=None, raw={},
+                data={"list": [{
+                    "order_number": candidate.system_order_no,
+                    "platform_order_no": [candidate.platform_order_no],
+                    "wo_number": "WO-EXISTING", "status": 3,
+                }], "total": 1},
+            )
+
+    client = Client()
+    gateway = LingxingGateway(client, CapabilityRouter())
+    adapter = ApiErpMarkAdapter(
+        gateway, {"UPS": ErpLogisticsRoute(warehouse_id=50, logistics_type_id=825)},
+    )
+
+    async def forbidden_confirmation(_prompt):
+        pytest.fail("A failed preflight or an already outbounded order must not write")
+
+    args = SimpleNamespace(
+        queue_path=str(queue_path), limit=1, dry_run=False,
+        logistics_no=candidate.logistics_no, mark_item_func=adapter,
+        confirm_func=forbidden_confirmation,
+    )
+    started_at = datetime.now(timezone.utc)
+    report = asyncio.run(mark_module.run_erp_mark_worker(args))
+    row = store.get_by_logistics_no(candidate.logistics_no)
+    assert report["retryable_count"] == 1
+    assert report["blocked_count"] == 0
+    assert row["erp_state"] == ERP_RETRYABLE
+    assert row["erp_checkpoint"] == checkpoint
+    assert row["logistics_state"] == LOGISTICS_READY
+    assert row["outbounded_at"] is None
+    assert row["lease_owner"] is None
+    assert "3001008" in row["erp_last_error"]
+    assert datetime.fromisoformat(row["erp_next_attempt_at"]) > started_at
+
+    asyncio.run(mark_module.run_erp_mark_worker(args))
+    assert len(client.calls) == 1  # The cooling-off period is enforced.
+    monkeypatch.setattr(queue_store_module, "utc_now", lambda: row["erp_next_attempt_at"])
+    recovered = asyncio.run(mark_module.run_erp_mark_worker(args))
+    assert recovered["done_count"] == 1
+    assert len(client.calls) == 2
+    assert client.calls[1]["order_number_arr"] == [candidate.system_order_no]
+    final = store.get_by_logistics_no(candidate.logistics_no)
+    assert final["erp_state"] == ERP_DONE
+    assert final["erp_checkpoint"] == ERP_CHECKPOINT_OUTBOUNDED
+    assert store.claimed_erp_items("after-completion") == []
 
 
 def test_erp_page_mismatch_becomes_blocked(tmp_path):

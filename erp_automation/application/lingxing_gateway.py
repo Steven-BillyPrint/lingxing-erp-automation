@@ -30,11 +30,13 @@ from erp_automation.integrations.lingxing import (
     LingxingProtocolError,
     LingxingTransportError,
 )
+from erp_automation.integrations.lingxing.errors import is_transient_json_read_error
 
 from .capabilities import (
     Capability,
     CapabilityRouter,
     CapabilityUnavailable,
+    RetryableReadUnavailable,
     MaybeAsync,
     MutationResult,
     MutationState,
@@ -805,6 +807,8 @@ class LingxingGateway:
         try:
             response = await call()
         except LingxingError as exc:
+            if is_transient_json_read_error(exc):
+                raise RetryableReadUnavailable(self._read_error(operation, exc)) from None
             raise CapabilityUnavailable(self._read_error(operation, exc)) from None
         if not isinstance(response, APIResponse):
             raise CapabilityUnavailable(f"领星 API 的{operation}响应格式不符合预期。")

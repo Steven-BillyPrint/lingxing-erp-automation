@@ -52,6 +52,7 @@ from shipment_automation.models import (
 
 from .capabilities import (
     CapabilityUnavailable,
+    RetryableReadUnavailable,
     ManualReviewRequired,
     MutationResult,
     MutationState,
@@ -1426,6 +1427,14 @@ class ApiErpMarkAdapter:
             matches = await self._read_wms_rows(item)
         except ErpMarkManualReview:
             raise
+        except RetryableReadUnavailable as exc:
+            # No write in this attempt has started. Let the queue defer the
+            # attempt while preserving its checkpoint; every retry must pass
+            # this same read-before-write guard again. Post-write readbacks
+            # deliberately retain their manual-review/ambiguous-write handling.
+            raise RetryableReadUnavailable(
+                f"写入前查询销售出库单暂时失败，已暂停写入，将延迟重试：{exc}"
+            ) from None
         except Exception as exc:
             raise ErpMarkManualReview(
                 f"写入前无法检查既有销售出库单，禁止冒险重放操作：{exc}"

@@ -97,6 +97,28 @@ class LingxingAuthError(LingxingAPIError):
     """The token endpoint rejected the request."""
 
 
+def is_rate_limited_api_error(exc: LingxingAPIError) -> bool:
+    # Code 103 alone is not proof of throttling; FBM detail uses it for
+    # rate limiting only with this specific message.
+    return exc.code == "3001008" or (
+        exc.code == "103" and "请求过于频繁" in exc.server_message
+    )
+
+
+def is_transient_json_read_error(exc: LingxingError) -> bool:
+    """Classify read failures only; this never authorizes replaying a write.
+
+    Binary endpoints reuse code 500 for permanent errors such as bad signing,
+    so callers must restrict this helper to JSON reads.
+    """
+
+    if isinstance(exc, (LingxingTransportError, LingxingHTTPError)):
+        return exc.retryable
+    if isinstance(exc, LingxingAPIError):
+        return is_rate_limited_api_error(exc) or exc.code == "500"
+    return False
+
+
 class LingxingAmbiguousWriteError(LingxingError):
     """A write may have reached Lingxing and therefore must not be retried blindly."""
 
