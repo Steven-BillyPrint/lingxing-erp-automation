@@ -42,7 +42,7 @@ from erp_automation.application.queue_queries import (
     sqlite_dataset_revision,
 )
 from erp_automation.application.automatic_processing import (
-    AUTOMATIC_PROCESSING_FEATURE, AUTOMATIC_SCAN_INTERVAL_SECONDS,
+    AUTOMATIC_PROCESSING_FEATURE, AUTOMATIC_SCAN_INTERVALS,
     automatic_scan_commands, automatic_schedule_key, automatic_write_command,
     command_document, dispatch_identity, is_automatic,
 )
@@ -3225,7 +3225,13 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                 ) == lane]
                 if any(not task.status.terminal for task in lane_tasks):
                     continue
-                if any((now - task.created_at).total_seconds() < AUTOMATIC_SCAN_INTERVAL_SECONDS for task in lane_tasks):
+                interval_seconds = AUTOMATIC_SCAN_INTERVALS[
+                    automatic_schedule_key(command)
+                ]
+                if any(
+                    (now - task.created_at).total_seconds() < interval_seconds
+                    for task in lane_tasks
+                ):
                     continue
                 commands.append(command)
             return [command_document(command) for command in commands]

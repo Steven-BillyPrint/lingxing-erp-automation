@@ -15,7 +15,8 @@ from erp_automation.contracts.models import (
 
 AUTOMATIC_PROCESSING_FEATURE = "automatic_processing_v1"
 AUTOMATIC_PROCESSING_MIN_CLIENT_VERSION = "2026.09.15.1"
-AUTOMATIC_SCAN_INTERVAL_SECONDS = 60.0
+AUTOMATIC_CUSTOM_SCAN_INTERVAL_SECONDS = 5 * 60.0
+AUTOMATIC_SHIPMENT_SCAN_INTERVAL_SECONDS = 3 * 60 * 60.0
 
 
 def is_automatic(command: TaskCommand | TaskRecord) -> bool:
@@ -67,8 +68,10 @@ def automatic_scan_commands() -> tuple[TaskCommand, ...]:
 
 
 AUTOMATIC_SCAN_INTERVALS = {
-    automatic_schedule_key(command): AUTOMATIC_SCAN_INTERVAL_SECONDS
-    for command in automatic_scan_commands()
+    "automatic_custom_scan": AUTOMATIC_CUSTOM_SCAN_INTERVAL_SECONDS,
+    "automatic_shipment_scan": AUTOMATIC_SHIPMENT_SCAN_INTERVAL_SECONDS,
+    "automatic_notification_scan": AUTOMATIC_SHIPMENT_SCAN_INTERVAL_SECONDS,
+    "automatic_logistics": AUTOMATIC_SHIPMENT_SCAN_INTERVAL_SECONDS,
 }
 
 

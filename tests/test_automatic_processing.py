@@ -8,8 +8,8 @@ import time
 import pytest
 
 from erp_automation.application.automatic_processing import (
-    automatic_scan_commands, automatic_write_command, dispatch_identity,
-    run_automatic_processing,
+    AUTOMATIC_SCAN_INTERVALS, automatic_scan_commands, automatic_write_command,
+    automatic_schedule_key, dispatch_identity, run_automatic_processing,
 )
 from erp_automation.configuration import EncryptedConfigurationStore, HostKeyAesGcmBackend
 from erp_automation.contracts.models import (
@@ -74,6 +74,18 @@ def test_mode_roundtrip_and_invalid_value(tmp_path):
         assert not reopened.automatic_processing_enabled()
     finally:
         reopened.close()
+
+
+def test_automatic_scan_intervals_preserve_business_schedule():
+    assert AUTOMATIC_SCAN_INTERVALS == {
+        "automatic_custom_scan": 5 * 60.0,
+        "automatic_shipment_scan": 3 * 60 * 60.0,
+        "automatic_notification_scan": 3 * 60 * 60.0,
+        "automatic_logistics": 3 * 60 * 60.0,
+    }
+    assert {
+        automatic_schedule_key(command) for command in automatic_scan_commands()
+    } == set(AUTOMATIC_SCAN_INTERVALS)
 
 
 def test_candidates_skip_terminal_and_identity_review_before_limiting(tmp_path):

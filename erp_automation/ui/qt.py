@@ -79,6 +79,7 @@ _COMPLETE_ALL_STATE = "__ALL_COMPLETED__"
 _CANCEL_WORKFLOW_STATE = "__CANCEL_WORKFLOW__"
 _CUSTOM_AUTO_SCAN_INTERVAL_MS = 5 * 60 * 1000
 _SHIPMENT_AUTO_SCAN_INTERVAL_MS = 3 * 60 * 60 * 1000
+_AUTOMATIC_DISPATCH_RECOVERY_INTERVAL_MS = 60 * 1000
 _NOTIFICATION_RECEIPT_UI_REFRESH_INTERVAL_MS = 15 * 1000
 _SERVER_PAGE_RETRY_INITIAL_MS = 1_000
 _SERVER_PAGE_RETRY_MAX_MS = 30_000
@@ -101,6 +102,49 @@ def _task_belongs_to_controller_instance(
         str(task.payload.get(DESKTOP_INSTANCE_ID_PAYLOAD_KEY) or "").strip()
         == instance_id
     )
+
+
+def _automatic_dispatch_event(
+    previous: DesktopSnapshot | None,
+    current: DesktopSnapshot,
+) -> bool:
+    """Wake dispatch for queue changes; periodic polling is recovery only."""
+
+    def eligible(snapshot: DesktopSnapshot) -> bool:
+        return (
+            snapshot.settings.processing_mode == "automatic"
+            and AUTOMATIC_PROCESSING_FEATURE in snapshot.server_features
+            and snapshot.is_scheduler_leader
+            and not snapshot.policy.execution_paused
+        )
+
+    if not eligible(current):
+        return False
+    if previous is None or not eligible(previous):
+        return True
+    previous_revisions = (
+        previous.custom_orders_summary.revision,
+        previous.shipments_summary.revision,
+        previous.notifications_summary.revision,
+    )
+    current_revisions = (
+        current.custom_orders_summary.revision,
+        current.shipments_summary.revision,
+        current.notifications_summary.revision,
+    )
+    if current_revisions != previous_revisions:
+        return True
+    previous_active = {
+        task.task_id
+        for task in (*previous.tasks, *previous.today_tasks)
+        if not task.status.terminal
+    }
+    current_active = {
+        task.task_id
+        for task in (*current.tasks, *current.today_tasks)
+        if not task.status.terminal
+    }
+    return bool(previous_active - current_active)
 
 
 def _format_local_transport_health(
@@ -3813,7 +3857,7 @@ if PYSIDE6_AVAILABLE:
 
         def set_scan_countdown(self, milliseconds: int, *, automatic: bool = False) -> None:
             mode_note = (
-                "自动模式：每分钟扫描，可处理订单自动执行 · " if automatic else
+                "自动模式：每 5 分钟扫描，可处理订单自动执行 · " if automatic else
                 "手动模式：每 5 分钟扫描，由你选择订单执行 · "
             )
             self.scan_schedule_label.setText(
@@ -6423,7 +6467,7 @@ if PYSIDE6_AVAILABLE:
 
         def set_scan_countdown(self, milliseconds: int, *, automatic: bool = False) -> None:
             mode_note = (
-                "自动模式：每分钟扫描，物流就绪后自动标发 · " if automatic else
+                "自动模式：每 3 小时扫描，物流就绪后自动标发 · " if automatic else
                 "手动模式：每 3 小时扫描，由你选择订单标发 · "
             )
             self.scan_schedule_label.setText(
@@ -9234,7 +9278,7 @@ if PYSIDE6_AVAILABLE:
             self.processing_mode_button.setToolTip(action + "，立即保存到当前账号。")
             self.processing_mode_action_hint.setText("点击" + action + " · 立即保存")
             self.processing_mode_description.setText(
-                "每分钟扫描，自动处理定制订单、标发及客户通知。请保持客户端在线；异常和登录验证需人工处理。"
+                "定制订单每 5 分钟、标发及通知每 3 小时扫描；订单进入可处理队列后立即接手。请保持客户端在线。"
                 if automatic else
                 "保留定时扫描，由你选择订单执行和审核通知。已开始的任务继续完成，未开始的自动任务撤下。"
             )
@@ -12907,7 +12951,7 @@ if PYSIDE6_AVAILABLE:
                 }
             ]
             self.processing_hint.setText(
-                "自动模式：至少一个包裹已出库且物流可用时发送首次通知；其余包裹显示待补充，新增已出库包裹后自动补发。"
+                "自动模式：每 3 小时同步订单和物流；至少一个包裹可通知时发送首次通知，新增包裹后自动补发。"
                 "发送结果未知、资料冲突和异常仍需人工核对。"
                 if snapshot.settings.processing_mode == "automatic" else
                 "手动模式：扫描生成通知草稿，由你审核后发送。可先通知已出库包裹，后续新增包裹后再次审核补发。"
@@ -13669,9 +13713,14 @@ if PYSIDE6_AVAILABLE:
             self._shipment_scan_timer.setSingleShot(True)
             self._shipment_scan_timer.timeout.connect(self._run_automatic_shipment_scan)
             self._automatic_dispatch_running = False
+            self._automatic_dispatch_pending = False
             self._automatic_dispatch_timer = QTimer(self)
-            self._automatic_dispatch_timer.setInterval(5000)
-            self._automatic_dispatch_timer.timeout.connect(self._run_automatic_processing)
+            self._automatic_dispatch_timer.setInterval(
+                _AUTOMATIC_DISPATCH_RECOVERY_INTERVAL_MS
+            )
+            self._automatic_dispatch_timer.timeout.connect(
+                self._request_automatic_processing
+            )
             self._automatic_dispatch_timer.start()
             take_startup_snapshot = getattr(
                 self._controller,
@@ -14065,6 +14114,7 @@ if PYSIDE6_AVAILABLE:
                 QTimer.singleShot(0, self.refresh)
 
         def _apply_snapshot(self, snapshot: DesktopSnapshot) -> None:
+            previous_snapshot = self._latest_snapshot
             take_rejections = getattr(self._controller, "take_operation_rejections", None)
             if callable(take_rejections):
                 for result in take_rejections():
@@ -14150,6 +14200,8 @@ if PYSIDE6_AVAILABLE:
                 f"{snapshot.shipments_summary.total if 'snapshot_summary_v1' in snapshot.server_features else len(snapshot.shipments)}"
                 f"  ·  后台任务 {len(snapshot.tasks)}"
             )
+            if _automatic_dispatch_event(previous_snapshot, snapshot):
+                self._request_automatic_processing()
 
         def _sync_api_wait_notice(self, snapshot: DesktopSnapshot) -> None:
             active_api_scans = [
@@ -14532,6 +14584,12 @@ if PYSIDE6_AVAILABLE:
                 "\n\n".join(sections),
             )
 
+        def _request_automatic_processing(self) -> None:
+            if self._automatic_dispatch_running:
+                self._automatic_dispatch_pending = True
+                return
+            self._run_automatic_processing()
+
         def _run_automatic_processing(self) -> None:
             snapshot = self._latest_snapshot
             if (self._close_pending or self._automatic_dispatch_running or snapshot is None
@@ -14545,6 +14603,9 @@ if PYSIDE6_AVAILABLE:
                 self._automatic_dispatch_running = False
                 if result.message:
                     self.statusBar().showMessage(result.message, 8000)
+                if self._automatic_dispatch_pending:
+                    self._automatic_dispatch_pending = False
+                    QTimer.singleShot(0, self._request_automatic_processing)
 
             _run_control_result_responsive(
                 self, self._controller,

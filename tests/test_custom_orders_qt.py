@@ -2999,6 +2999,7 @@ def test_main_window_schedules_custom_and_shipment_scans_with_clear_scope(app):
         window._shipment_scan_timer.stop()
         assert window._custom_scan_timer.interval() == 5 * 60 * 1000
         assert window._shipment_scan_timer.interval() == 3 * 60 * 60 * 1000
+        assert window._automatic_dispatch_timer.interval() == 60 * 1000
         assert "每 5 分钟" in window.custom_orders_page.scan_schedule_label.text()
         assert "自定义标签仅展示" in window.custom_orders_page.scan_schedule_label.text()
         assert "无错误订单存在文件夹则完成、不存在则待处理" in (
@@ -3024,6 +3025,48 @@ def test_main_window_schedules_custom_and_shipment_scans_with_clear_scope(app):
         ]
     finally:
         window.close()
+
+
+def test_automatic_dispatch_wakes_on_queue_or_task_change_and_uses_recovery_polling():
+    baseline = DesktopSnapshot(
+        server_features=(qt_module.AUTOMATIC_PROCESSING_FEATURE,),
+        settings=DesktopSettings(processing_mode="automatic"),
+        is_scheduler_leader=True,
+        custom_orders_summary=DatasetSummary(0, "custom-1"),
+        shipments_summary=DatasetSummary(0, "shipment-1"),
+        notifications_summary=DatasetSummary(0, "notification-1"),
+    )
+    assert qt_module._automatic_dispatch_event(None, baseline)
+    assert not qt_module._automatic_dispatch_event(baseline, replace(baseline))
+    assert qt_module._automatic_dispatch_event(
+        baseline,
+        replace(
+            baseline,
+            custom_orders_summary=DatasetSummary(1, "custom-2"),
+        ),
+    )
+
+    running = TaskRecord(
+        "scan-1",
+        "扫描",
+        TaskArea.CUSTOMIZATION,
+        Capability.LIST_ORDERS,
+        status=TaskStatus.RUNNING,
+    )
+    before_completion = replace(baseline, tasks=[running])
+    after_completion = replace(
+        baseline,
+        tasks=[replace(running, status=TaskStatus.SUCCEEDED)],
+    )
+    assert qt_module._automatic_dispatch_event(
+        before_completion,
+        after_completion,
+    )
+    assert not qt_module._automatic_dispatch_event(
+        baseline,
+        replace(baseline, is_scheduler_leader=False),
+    )
+    assert qt_module._AUTOMATIC_DISPATCH_RECOVERY_INTERVAL_MS == 60 * 1000
 
 
 def test_shipment_page_scan_registers_local_visible_logistics_followup(app):
