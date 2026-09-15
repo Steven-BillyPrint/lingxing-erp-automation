@@ -898,6 +898,7 @@ class CoordinationStore:
         *,
         ttl_seconds: float,
         slot: str = "automatic_scans",
+        eligible_instance_ids: set[str] | None = None,
     ) -> dict[str, Any]:
         """Atomically renew or elect one online client as scheduler leader."""
 
@@ -928,6 +929,7 @@ class CoordinationStore:
             )
             previous_valid = bool(
                 previous is not None
+                and (eligible_instance_ids is None or previous_owner in eligible_instance_ids)
                 and float(previous["expires_at"]) > now
                 and previous["instance_expires_at"] is not None
                 and float(previous["instance_expires_at"]) > now
@@ -943,6 +945,7 @@ class CoordinationStore:
             ).fetchone()
             candidate_valid = bool(
                 candidate is not None
+                and (eligible_instance_ids is None or instance in eligible_instance_ids)
                 and float(candidate["expires_at"]) > now
                 and not bool(int(candidate["execution_paused"] or 0))
             )

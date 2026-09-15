@@ -234,6 +234,21 @@ class InMemoryBackgroundTaskController:
             dataset_revision=self._shipment_review_revision(revision, locks),
         )
 
+    def automatic_processing_enabled(self) -> bool:
+        with self._lock:
+            return self._state.settings.processing_mode == "automatic"
+
+    def get_automatic_processing_tasks(self) -> list[dict[str, Any]]:
+        return []
+
+    def set_processing_mode(self, mode: str) -> ControlResult:
+        with self._lock:
+            result = self.save_settings(replace(self._state.settings, processing_mode=mode))
+            if not result.accepted:
+                return result
+            return ControlResult(True, "已切换自动模式，可处理订单将自动排队。" if mode == "automatic"
+                                 else "已切换手动模式，不再启动自动任务；已开始的订单继续完成。")
+
     def submit_task(self, command: TaskCommand) -> ControlResult:
         with self._lock:
             trigger = str(command.payload.get("trigger") or "")

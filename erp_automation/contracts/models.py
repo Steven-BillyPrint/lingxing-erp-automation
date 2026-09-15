@@ -197,6 +197,7 @@ NOTIFICATION_RECEIPT_REFRESH_TRIGGER = "notification_receipt_refresh"
 NOTIFICATION_PROVIDER_TEST_TRIGGER = "notification_provider_test"
 SHIPMENT_NOTIFICATION_COMPENSATION_TRIGGER = "shipment_notification_compensation"
 SHIPMENT_NOTIFICATION_SEND_TRIGGER = "shipment_notification_send"
+AUTOMATIC_PROCESSING_PAYLOAD_KEY = "automatic_processing"
 LINGXING_BROWSER_LOGIN_TRIGGER = "lingxing_browser_login"
 NOTIFICATION_SYNC_INCLUDE_DEFERRED_RETRIES_KEY = (
     "_runtime_notification_include_deferred_retries"
@@ -309,7 +310,7 @@ class DesktopWriteConfirmation:
         if parsed_at.tzinfo is None:
             raise ValueError("桌面写入确认时间必须包含时区。")
         source = str(raw.get("source") or "").strip()
-        if source not in {"qt_message_box", "qt_checked_action"}:
+        if source not in {"qt_message_box", "qt_checked_action", "automatic_mode"}:
             raise ValueError("桌面写入确认来源无效。")
         return cls(
             confirmation_id=confirmation_id,
@@ -686,6 +687,7 @@ class DesktopSettings:
     high_value_split_weight_kg: int = 4
     high_value_split_longest_side_cm: int = 55
     shipment_tag_name: str = "标发"
+    processing_mode: str = "automatic"
     custom_order_review_enabled: bool = False
     shipment_review_enabled: bool = False
     log_retention_days: int = 90
@@ -694,6 +696,8 @@ class DesktopSettings:
 
     def validate(self) -> tuple[str, ...]:
         errors: list[str] = []
+        if self.processing_mode not in {"manual", "automatic"}:
+            errors.append("处理模式必须为手动或自动。")
         if not self.folder_root.strip():
             errors.append("订单文件夹根目录不能为空。")
         if not self.queue_path.strip():

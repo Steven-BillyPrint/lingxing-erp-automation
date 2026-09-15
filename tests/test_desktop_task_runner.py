@@ -3083,10 +3083,12 @@ def test_re_mark_owns_a_dedicated_chrome_page_without_touching_custom_order(
         "",
     ],
 )
+@pytest.mark.parametrize("automatic_mode", [False, True])
 def test_disabled_shipment_review_auto_approves_all_normal_stage_prompts(
     monkeypatch,
     tmp_path,
     product_type,
+    automatic_mode,
 ) -> None:
     prompts = [
         "即将发送的设置仓库物流参数：\nglobal_order_no（系统单号）：SYS-1",
@@ -3107,7 +3109,7 @@ def test_disabled_shipment_review_auto_approves_all_normal_stage_prompts(
         return {"status": "completed", "message": "ok", "done_count": 1}
 
     monkeypatch.setattr(erp_mark_ship, "run_erp_mark_worker", fake_worker)
-    settings = _settings(tmp_path)
+    settings = replace(_settings(tmp_path), shipment_review_enabled=automatic_mode)
     _seed_shipment_job(
         settings,
         "ALS-NO-STAGE-REVIEW",
@@ -3118,7 +3120,7 @@ def test_disabled_shipment_review_auto_approves_all_normal_stage_prompts(
         PLATFORM_ORDER_NO,
         system_order_no=SYSTEM_ORDER_NO,
         logistics_no="ALS-NO-STAGE-REVIEW",
-        source="qt_checked_action",
+        source="automatic_mode" if automatic_mode else "qt_checked_action",
     )
     runner = DesktopTaskRunner(
         tmp_path,

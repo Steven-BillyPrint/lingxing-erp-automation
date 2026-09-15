@@ -69,6 +69,10 @@ class QueueQueryController(Protocol):
 class BackgroundTaskController(QueueQueryController, Protocol):
     """Boundary between the desktop shell and a real background worker."""
 
+    def get_automatic_processing_tasks(self) -> list[dict[str, Any]]: ...
+
+    def set_processing_mode(self, mode: str) -> ControlResult: ...
+
     def snapshot(self) -> DesktopSnapshot: ...
 
     # Repeated explicitly because the RPC audit enumerates this protocol's own

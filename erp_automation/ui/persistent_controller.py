@@ -41,6 +41,12 @@ from erp_automation.application.queue_queries import (
     shipment_row_from_mapping,
     sqlite_dataset_revision,
 )
+from erp_automation.application.automatic_processing import (
+    AUTOMATIC_PROCESSING_FEATURE, AUTOMATIC_SCAN_INTERVAL_SECONDS,
+    automatic_scan_commands, automatic_schedule_key, automatic_write_command,
+    command_document, dispatch_identity, is_automatic,
+)
+from erp_automation.persistence.automatic_dispatch import AutomaticDispatchStore
 from erp_automation.operations import cleanup_expired_logs
 from erp_automation.operations.product_identity_report import (
     classify_product_identity_evidence,
@@ -360,6 +366,7 @@ def _settings_from_values(values: dict[str, Any]) -> DesktopSettings:
         custom_order_review_enabled=bool(
             normalized.get("automation.custom_order_review_enabled")
         ),
+        processing_mode=str(normalized.get("automation.processing_mode") or "manual"),
         shipment_review_enabled=bool(
             normalized.get("automation.shipment_review_enabled")
         ),
@@ -419,6 +426,7 @@ def _settings_values(settings: DesktopSettings) -> dict[str, Any]:
             settings.high_value_split_longest_side_cm
         ),
         "automation.shipment_tag_name": settings.shipment_tag_name.strip(),
+        "automation.processing_mode": settings.processing_mode,
         "automation.custom_order_review_enabled": (
             settings.custom_order_review_enabled
         ),
@@ -1527,6 +1535,10 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
 
     def submit_task(self, command: TaskCommand) -> ControlResult:
         with self._lock:
+            if is_automatic(command):
+                rejection = self._automatic_gate(command)
+                if rejection:
+                    return ControlResult(False, rejection, details={"non_modal": True})
             if self._closing_requested:
                 return ControlResult(False, "程序正在安全关闭，不再接受新任务。")
             if self._task_runner is None:
@@ -1616,17 +1628,21 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
             if gate_message:
                 return ControlResult(False, gate_message)
 
+            automatic_identity = dispatch_identity(command) if is_automatic(command) else ""
+            dispatch_store = self._automatic_dispatch_store(command) if automatic_identity else None
+            if dispatch_store is not None and not dispatch_store.claim(automatic_identity):
+                return ControlResult(False, "该订单已自动提交过；异常或未知结果请人工核对后继续。", details={"non_modal": True})
             result = super().submit_task(command)
             if not result.accepted or not result.task_id:
+                if dispatch_store is not None:
+                    dispatch_store.release_unstarted(automatic_identity)
                 return result
             created = self._find_task(result.task_id)
             if created is not None:
                 self._write_task_snapshot(created[1])
             if confirmation is not None:
-                source_label = (
-                    "勾选执行按钮"
-                    if confirmation.source == "qt_checked_action"
-                    else "桌面确认弹窗"
+                source_label = {"automatic_mode": "设置中的自动模式", "qt_checked_action": "勾选执行按钮"}.get(
+                    confirmation.source, "桌面确认弹窗"
                 )
                 self._append_log(
                     LogLevel.INFO,
@@ -1765,6 +1781,8 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                     == NOTIFICATION_CONTACT_REFRESH_TRIGGER
                 )
                 gate_message = self._custom_workflow_gate_message_locked(command)
+                if is_automatic(command):
+                    gate_message = self._automatic_gate(command, include_claimed=True) or gate_message
                 cancelled_before_start = bool(
                     gate_message and "不需要处理" in gate_message
                 )
@@ -1772,6 +1790,8 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                     gate_message = f"“{command.capability.label}”已被急停或禁用；排队任务未执行。"
                     cancelled_before_start = True
                 if gate_message:
+                    if is_automatic(command) and dispatch_identity(command):
+                        self._automatic_dispatch_store(command).release_unstarted(dispatch_identity(command))
                     self.set_task_status(
                         task_id,
                         TaskStatus.CANCELLED if cancelled_before_start else TaskStatus.BLOCKED,
@@ -3102,7 +3122,7 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                 snapshot.logs[0].created_at.isoformat() if snapshot.logs else ""
             ),
         )
-        snapshot.server_features = QUEUE_PAGINATION_FEATURES
+        snapshot.server_features = (*QUEUE_PAGINATION_FEATURES, AUTOMATIC_PROCESSING_FEATURE)
         return snapshot
 
     def coordination_state_token(self) -> object:
@@ -3133,6 +3153,118 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
 
         return self._snapshot_projection(include_queue_rows=True)
 
+    def _automatic_dispatch_store(self, command: TaskCommand) -> AutomaticDispatchStore:
+        return AutomaticDispatchStore(
+            self._custom_state_path() if command.area is TaskArea.CUSTOMIZATION
+            else self._shipment_state_path()
+        )
+
+    def _automatic_gate(self, command: TaskCommand, *, include_claimed: bool = False) -> str:
+        if self._state.settings.processing_mode != "automatic":
+            return "已切换手动模式，自动任务未执行。"
+        if self._state.policy.execution_paused or self._state.policy.effective_mode_for(command.capability) is CapabilityMode.DISABLED:
+            return "自动处理已被暂停、急停或禁用。"
+        if not command.capability.is_write:
+            return "" if automatic_schedule_key(command) else "不支持该自动任务。"
+        identity = dispatch_identity(command)
+        if not identity:
+            return "自动任务必须对应单个可处理订单。"
+        kind = identity.split(":", 1)[0]
+        rows = self._automatic_dispatch_store(command).candidates(
+            kind, identity=identity, include_claimed=include_claimed,
+        )
+        if not rows:
+            return "订单已处理、已暂停或不再满足自动处理条件，请刷新后人工核对。"
+        row = rows[0]
+        if kind != "notification" and (
+            row["platform_order_no"] != command.order_no
+            or row["system_order_no"] != command.payload.get("system_order_no")
+        ):
+            return "订单身份已变化，自动任务未执行。"
+        return ""
+
+    def get_automatic_processing_tasks(self) -> list[dict[str, Any]]:
+        """Bounded authoritative candidates, independent of the visible UI page."""
+        with self._lock:
+            if self._closing_requested or self._state.settings.processing_mode != "automatic" or self._state.policy.execution_paused:
+                return []
+            self._get_custom_store().initialize()
+            from shipment_automation.queue_store import ShipmentQueueStore
+            ShipmentQueueStore(self._shipment_state_path()).initialize()
+            self._shipment_notification_context()[0].initialize()
+            active = tuple(task for task in self._state.tasks if not task.status.terminal)
+            excluded_orders = tuple({
+                *self._shipment_review_context(),
+                *(str(task.order_no or "").casefold() for task in self._state.tasks
+                  if task.payload.get(_MANUAL_REVIEW_LOCK_PAYLOAD_KEY)),
+            })
+            commands: list[TaskCommand] = []
+            for kind, area, capability in (
+                ("custom", TaskArea.CUSTOMIZATION, Capability.UPDATE_CONTACT),
+                ("shipment", TaskArea.SHIPMENT, Capability.OUTBOUND_ORDER),
+                ("notification", TaskArea.SHIPMENT, Capability.SEND_NOTIFICATION),
+            ):
+                if self._state.policy.effective_mode_for(capability) is CapabilityMode.DISABLED:
+                    continue
+                if any(task.area is area and task.capability.is_write for task in active
+                       if (task.capability is Capability.SEND_NOTIFICATION) == (kind == "notification")):
+                    continue
+                probe = TaskCommand("", area, capability)
+                rows = self._automatic_dispatch_store(probe).candidates(kind, excluded_orders=excluded_orders)
+                if rows:
+                    command = automatic_write_command(kind, rows[0])
+                    if not any(task.order_no == command.order_no for task in active):
+                        commands.append(command)
+            now = utc_now()
+            for command in automatic_scan_commands():
+                lane = self._executor_attr_for_command(command)
+                if self._state.policy.effective_mode_for(command.capability) is CapabilityMode.DISABLED:
+                    continue
+                lane_tasks = [task for task in self._state.tasks if self._executor_attr_for_command(
+                    TaskCommand(task.name, task.area, task.capability, payload=task.payload)
+                ) == lane]
+                if any(not task.status.terminal for task in lane_tasks):
+                    continue
+                if any((now - task.created_at).total_seconds() < AUTOMATIC_SCAN_INTERVAL_SECONDS for task in lane_tasks):
+                    continue
+                commands.append(command)
+            return [command_document(command) for command in commands]
+
+    def _cancel_unstarted_automatic_tasks_locked(self) -> None:
+        for task in tuple(self._state.tasks):
+            command = TaskCommand(task.name, task.area, task.capability,
+                                  payload=task.payload, order_no=task.order_no)
+            if task.status is not TaskStatus.QUEUED or not is_automatic(command):
+                continue
+            future = self._futures.get(task.task_id)
+            if future is not None:
+                future.cancel()
+            # The state lock also guards the QUEUED -> RUNNING transition.
+            self.set_task_status(task.task_id, TaskStatus.CANCELLED,
+                                 message="切换手动模式，尚未开始的自动任务已撤下。", progress_percent=100)
+            identity = dispatch_identity(command)
+            if identity:
+                self._automatic_dispatch_store(command).release_unstarted(identity)
+
+    def set_processing_mode(self, mode: str) -> ControlResult:
+        if mode not in {"manual", "automatic"}:
+            return ControlResult(False, "处理模式必须为手动或自动。")
+        with self._lock:
+            values = {**self._configuration_values, "automation.processing_mode": mode}
+            document = ConfigurationDocument(values=with_configuration_defaults(values))
+            try:
+                self.config_store.save(document)
+            except Exception as exc:
+                return ControlResult(False, f"处理模式保存失败：{type(exc).__name__}，原模式未改变。")
+            self._configuration_values = document.values
+            self._state.settings = replace(self._state.settings, processing_mode=mode)
+            if mode == "manual":
+                self._cancel_unstarted_automatic_tasks_locked()
+            message = ("已切换自动模式，可处理订单将自动排队。" if mode == "automatic"
+                       else "已切换手动模式，未开始的自动任务已撤下；已开始的订单继续完成。")
+            self._append_log(LogLevel.INFO, "configuration", message)
+            return ControlResult(True, message)
+
     def save_settings(self, settings: DesktopSettings) -> ControlResult:
         errors = settings.validate()
         if errors:
@@ -3154,6 +3286,8 @@ class PersistentBackgroundTaskController(InMemoryBackgroundTaskController):
                 return ControlResult(False, message)
             self._configuration_values = document.values
             self._state.settings = settings
+            if settings.processing_mode == "manual":
+                self._cancel_unstarted_automatic_tasks_locked()
             if settings.custom_state_path != previous_custom_path:
                 self._custom_store = None
                 self._custom_rows_signature = None
