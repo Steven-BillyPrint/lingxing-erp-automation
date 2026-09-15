@@ -1880,22 +1880,18 @@ class CoordinatedControllerService:
         return max(0, int(self._client_rollout_grace_deadline_epoch))
 
     def _scheduler_status(self, instance_id: str) -> dict[str, Any]:
-        def enabled(candidate: str) -> bool:
-            identity = self.store.instance_identity(candidate)
-            with self._controller_lock:
-                controller = (self.controller if self._controller_factory is None else
-                              self._operator_controllers.get(identity.email) if identity is not None else None)
-            # Registration must stay cheap; the first business snapshot loads settings.
-            return controller is None or controller.automatic_processing_enabled()
-
-        automatic_instances = {
-            candidate for candidate in self.store.active_instance_ids()
-            if enabled(candidate)
+        # Use already-loaded settings. Registration must not recover controllers
+        # or recursively observe the monitor's instance inventory.
+        with self._controller_lock:
+            controllers = tuple(self._operator_controllers.items())
+        manual_accounts = {
+            email for email, controller in controllers
+            if not controller.automatic_processing_enabled()
         }
         status = self.store.elect_scheduler(
             instance_id,
             ttl_seconds=self.settings.scheduler_lease_seconds,
-            eligible_instance_ids=automatic_instances or None,
+            manual_operator_emails=manual_accounts,
         )
         if bool(status.get("changed")):
             self.store.publish_event(

@@ -1344,6 +1344,10 @@ def test_service_rejects_scheduled_scan_from_follower_or_before_due(
         service.register("follower-pc", "Follower")
         initial = service.snapshot_payload("leader-pc")
         assert initial["snapshot"]["scheduled_scan_due_at"] == {
+            "automatic_custom_scan": 1060.0,
+            "automatic_shipment_scan": 1060.0,
+            "automatic_notification_scan": 1060.0,
+            "automatic_logistics": 1060.0,
             "five_minute_timer": 1300.0,
             "three_hour_timer": 11800.0,
         }
